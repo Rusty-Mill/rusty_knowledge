@@ -21,9 +21,13 @@
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), or hybrid
-//! vector retrieval in the tool surface itself (RK-004's vec0 table exists
-//! in the store but isn't queried by this tool yet, rusty_knowledge#18). A
-//! candidate for a later slice, not silently dropped.
+//! vector retrieval in the tool surface itself. `rusty_knowledge#18`'s
+//! store-level half is now wired in (`store::embed_all_rules`,
+//! `store::nearest_rule_vectors`, backed by `rusty_embedder`) and runs at
+//! startup below, but `search_knowledge` doesn't query `rule_vectors` yet
+//! -- fusing it into that tool's response, and picking a real (non-null)
+//! embedder, are separate follow-up work per that issue's own acceptance
+//! criteria. A candidate for a later slice, not silently dropped.
 
 mod store;
 
@@ -31,6 +35,7 @@ use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
 };
 use rusqlite::Connection;
+use rusty_embedder_core::Embedder;
 use std::sync::{Arc, Mutex};
 use store::{AuthorityLayer, RuleType, ValidationOutcome};
 
@@ -1066,6 +1071,23 @@ async fn main() -> anyhow::Result<()> {
     // RK-001 sanity check, kept from the previous slice's proof: this
     // still only compiles because AuthorityLayer has no "unknown" variant.
     let _: AuthorityLayer = AuthorityLayer::Standard;
+
+    // No real embedder is selected yet (rusty_knowledge#18 wires the
+    // storage/query path; picking a non-null `rusty_embedder` backend is
+    // separate follow-up work) -- `NullEmbedder` makes that omission
+    // discoverable at startup rather than silently leaving `rule_vectors`
+    // empty with no signal either way.
+    let embedder = rusty_embedder_core::NullEmbedder::new();
+    let vector_outcomes = store::embed_all_rules(&conn, &embedder)?;
+    let vectors_stored = vector_outcomes
+        .iter()
+        .filter(|o| **o == store::EmbeddingOutcome::Stored)
+        .count();
+    eprintln!(
+        "rule_vectors: {vectors_stored}/{} rule(s) embedded (embedder: {})",
+        vector_outcomes.len(),
+        embedder.model_name()
+    );
 
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \

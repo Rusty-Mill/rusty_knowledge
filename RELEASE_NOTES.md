@@ -5,6 +5,42 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #35 — Wire vec0 insert/query for embeddings (rusty_knowledge#18, store-level)
+**2026-08-12** · [#35](https://github.com/Rusty-Mill/rusty_knowledge/pull/35)
+
+- **Added:** `rusty-embedder-core` dependency (git, pinned to a commit SHA
+  on `baileyrd/rusty_embedder`'s `claude/rusty-embedder-crate-6yd354`
+  branch — that repo isn't merged to its own `main` yet, so pinned to a
+  commit rather than the branch tip) — the `Embedder` trait,
+  `NullEmbedder`, and `serialize_f32`/`deserialize_f32`, matching exactly
+  what the existing (until now, unused) `rule_vectors` `vec0` table
+  expects on disk.
+- **Added, `store.rs`:** `insert_rule_vector` (embed and store one rule's
+  vector, keyed to its `rules_fts` `rowid`) and `embed_all_rules` (the
+  batched seed/ingest-time bulk entry point — one `embed` call for every
+  rule, not one call per rule, per `Embedder`'s own batching contract);
+  `nearest_rule_vectors` (the KNN query path over `rule_vectors`);
+  `EmbeddingOutcome` (`Stored`/`Unavailable` — vector unavailability is
+  reported, never silently substituted, per `RM-KNOWLEDGE-MODEL-0005`);
+  `VectorError` (distinguishes an embedding-backend failure from a
+  `rule_vectors` store failure, so a caller can react to each
+  differently).
+- **Wired into `main()`:** the server now calls `embed_all_rules` right
+  after `seed`, using `NullEmbedder` (no real backend is chosen yet) and
+  logs how many rules got a vector — `0/4` today, discoverably, not
+  silently.
+- **Deliberately out of scope for this slice**, per rusty_knowledge#18's
+  own acceptance criteria: exposing this through `search_knowledge`'s
+  response (declaring a hybrid `RetrievalMode`) and picking a real
+  (non-null) embedder backend (`rusty-embedder-local`/`-http`).
+  `nearest_rule_vectors` exists and is exercised directly by tests, not
+  yet called from `search_scoped`.
+- 9 new tests (happy path: seeded rules embedded and found by KNN search
+  for the closest match; boundary: `NullEmbedder` reports every rule
+  `Unavailable` rather than silently storing nothing; a failing backend
+  propagates as `VectorError::Embed` rather than being swallowed; empty
+  store and empty `rule_vectors` both return empty results, not an error).
+
 ## PR #34 — Implement meta.list_domains
 **2026-08-12** · [#34](https://github.com/Rusty-Mill/rusty_knowledge/pull/34)
 

@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 rmcp = { version = "3.1.2", features = ["macros", "server", "transport-io"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusty-embedder-core = { git = "https://github.com/baileyrd/rusty_embedder", rev = "628c97c042f1b42fe338a64fe699a0015bb0e5d3" }
 rusty_regx = { git = "https://github.com/baileyrd/rusty_regx", rev = "93c5541d6713750141476c87d6cd774629e1ae3a" }
 serde = { version = "1.0.229", features = ["derive"] }
 sqlite-vec = "0.1.9"

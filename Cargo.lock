@@ -491,12 +491,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty-embedder-core"
+version = "0.1.0"
+source = "git+https://github.com/baileyrd/rusty_embedder?rev=628c97c042f1b42fe338a64fe699a0015bb0e5d3#628c97c042f1b42fe338a64fe699a0015bb0e5d3"
+
+[[package]]
 name = "rusty-knowledge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "rmcp",
  "rusqlite",
+ "rusty-embedder-core",
  "rusty_regx",
  "serde",
  "sqlite-vec",

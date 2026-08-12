@@ -4,6 +4,7 @@
 //! See `main.rs`'s module doc for what this slice tests and why.
 
 use rusqlite::Connection;
+use rusty_embedder_core::Embedder;
 
 /// The four-layer authority model from ADR-0165. Not `Option<Layer>` —
 /// per RK-001, an unlabeled rule must be structurally unrepresentable.
@@ -1102,6 +1103,184 @@ pub fn search_scoped(
     ))
 }
 
+/// What happened when a rule's text was run through an [`Embedder`] and the
+/// result offered to `rule_vectors`. `RM-KNOWLEDGE-MODEL-0005` requires
+/// vector unavailability to be discoverable, not silently treated as
+/// success -- so every ingest-time embedding call reports which of these
+/// happened per rule, rather than only a `Result<(), _>` that can't tell
+/// "no vector, on purpose" apart from "stored".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingOutcome {
+    /// A vector was produced by the embedder and stored in `rule_vectors`.
+    Stored,
+    /// The embedder produced no vector for this rule -- e.g. `NullEmbedder`
+    /// (which always returns an empty batch) or any embedder whose batch
+    /// response didn't come back with one vector per input text. No row was
+    /// written for this rule.
+    Unavailable,
+}
+
+/// Everything that can go wrong producing or storing a rule's vector.
+/// Either half of the pipeline -- the embedding backend
+/// (`rusty_embedder_core`), or the `rule_vectors` `vec0` table itself --
+/// can fail independently, and a caller needs to tell which one happened
+/// (e.g. retry the backend vs. treat the store as broken) rather than
+/// getting one opaque error type for both.
+#[derive(Debug)]
+pub enum VectorError {
+    Embed(rusty_embedder_core::EmbedError),
+    Store(rusqlite::Error),
+}
+
+impl std::fmt::Display for VectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VectorError::Embed(err) => write!(f, "embedding failed: {err}"),
+            VectorError::Store(err) => write!(f, "vector store failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for VectorError {}
+
+impl From<rusty_embedder_core::EmbedError> for VectorError {
+    fn from(err: rusty_embedder_core::EmbedError) -> Self {
+        VectorError::Embed(err)
+    }
+}
+
+impl From<rusqlite::Error> for VectorError {
+    fn from(err: rusqlite::Error) -> Self {
+        VectorError::Store(err)
+    }
+}
+
+/// Packs and inserts an already-produced vector into `rule_vectors`, keyed
+/// to `rule_rowid`. Not `pub`: every caller goes through
+/// [`insert_rule_vector`] or [`embed_all_rules`], which decide *whether*
+/// there's a vector to store in the first place.
+fn store_rule_vector(conn: &Connection, rule_rowid: i64, vector: &[f32]) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO rule_vectors (rowid, embedding) VALUES (?1, ?2)",
+        (rule_rowid, rusty_embedder_core::serialize_f32(vector)),
+    )?;
+    Ok(())
+}
+
+/// Embeds one rule's text and, if the embedder actually produced a vector,
+/// stores it in `rule_vectors` keyed to `rule_rowid` -- the same `rowid`
+/// [`insert_rule`] returns, so a caller can attach a vector right after
+/// inserting a rule, the same way [`insert_machine_check`] already attaches
+/// a machine check to it. Correlating a vector back to a rule's row id is
+/// this crate's job, not `rusty_embedder`'s -- that crate only produces
+/// vectors, by design (see its ADR-0002).
+// Exercised by tests today; by a real per-rule ingest pipeline once one
+// exists (seed-time bulk backfill goes through `embed_all_rules` instead).
+#[allow(dead_code)]
+pub fn insert_rule_vector(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    rule_rowid: i64,
+    text: &str,
+) -> Result<EmbeddingOutcome, VectorError> {
+    let vectors = embedder.embed(&[text.to_string()])?;
+    match vectors.into_iter().next() {
+        Some(vector) => {
+            store_rule_vector(conn, rule_rowid, &vector)?;
+            Ok(EmbeddingOutcome::Stored)
+        }
+        None => Ok(EmbeddingOutcome::Unavailable),
+    }
+}
+
+/// Embeds and stores a vector for every rule already in `rules_fts` -- the
+/// seed/ingest-time bulk entry point for populating `rule_vectors`, e.g.
+/// called right after [`seed`]. Issues one batched `embed` call for every
+/// rule's text (per [`Embedder::embed`]'s own batching contract), not one
+/// call per rule.
+///
+/// Returns one [`EmbeddingOutcome`] per rule, in the same order `rules_fts`
+/// iterates -- so a caller can tell exactly which rules got a vector,
+/// rather than only a pass/fail count. If the embedder's batch response
+/// doesn't come back with one vector per rule (as `NullEmbedder` never
+/// does -- it always returns an empty `Vec` regardless of input length),
+/// every rule in the batch is reported `Unavailable` rather than zipping a
+/// too-short response against the wrong rules.
+pub fn embed_all_rules(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+) -> Result<Vec<EmbeddingOutcome>, VectorError> {
+    let mut stmt = conn.prepare("SELECT rowid, text FROM rules_fts")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let texts: Vec<String> = rows.iter().map(|(_, text)| text.clone()).collect();
+    let vectors = embedder.embed(&texts)?;
+
+    if vectors.len() != rows.len() {
+        return Ok(vec![EmbeddingOutcome::Unavailable; rows.len()]);
+    }
+
+    let mut outcomes = Vec::with_capacity(rows.len());
+    for ((rowid, _text), vector) in rows.into_iter().zip(vectors) {
+        store_rule_vector(conn, rowid, &vector)?;
+        outcomes.push(EmbeddingOutcome::Stored);
+    }
+    Ok(outcomes)
+}
+
+/// One nearest-neighbor hit from [`nearest_rule_vectors`]: the matching
+/// rule's `rules_fts` `rowid` (join back through it for the rule's actual
+/// text/construct/layer) and its distance from the query vector -- smaller
+/// is closer, `sqlite-vec`'s own KNN convention.
+// Exercised by tests today; by `search_knowledge`'s hybrid retrieval mode
+// once that follow-up work (fusing this with `search_scoped`) lands.
+#[allow(dead_code)]
+pub struct VectorHit {
+    pub rule_rowid: i64,
+    pub distance: f64,
+}
+
+/// K-nearest-neighbor search over `rule_vectors` -- the query-side half of
+/// rusty_knowledge#18's "wire vec0 into search". Deliberately not wired
+/// into `search_scoped`/`RetrievalMode` yet, per that issue's own
+/// acceptance criteria: a caller that fuses this with lexical results is
+/// the one that has to declare a hybrid retrieval mode, not this function
+/// silently claiming one on its behalf.
+///
+/// Empty if `rule_vectors` has no rows yet -- the same "obviously nothing,
+/// not a wrong answer" behavior `search_scoped` already gives on an empty
+/// `rules_fts`.
+// Exercised by tests today; by `search_knowledge`'s hybrid retrieval mode
+// once that follow-up work lands.
+#[allow(dead_code)]
+pub fn nearest_rule_vectors(
+    conn: &Connection,
+    query_vector: &[f32],
+    limit: usize,
+) -> rusqlite::Result<Vec<VectorHit>> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, distance FROM rule_vectors
+         WHERE embedding MATCH ?1
+         ORDER BY distance
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(
+        (
+            rusty_embedder_core::serialize_f32(query_vector),
+            limit as i64,
+        ),
+        |row| {
+            Ok(VectorHit {
+                rule_rowid: row.get(0)?,
+                distance: row.get(1)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
 /// Constructs belonging to exactly one domain — proves `RM-KNOWLEDGE-MODEL-0001`
 /// (no cross-domain leakage) at the store level, ahead of the `meta.list_domains`
 /// and `search.constructs` tools that will eventually wrap this query.
@@ -1882,5 +2061,170 @@ mod tests {
             cross_domain_relationships_from(&conn, "data-mesh", "data-mesh:DataProduct", None)
                 .unwrap();
         assert!(rels.is_empty());
+    }
+
+    /// A tiny in-test [`Embedder`] that always produces a vector, matching
+    /// `rule_vectors`' declared `float[4]` dimension -- exercises the happy
+    /// path without pulling in a real backend crate (`rusty-embedder-local`/
+    /// `-http`), which stays out of scope for this store-level wiring slice.
+    struct StubEmbedder;
+
+    impl Embedder for StubEmbedder {
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+
+        fn embed(&self, texts: &[String]) -> rusty_embedder_core::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let seed = text.len() as f32;
+                    vec![seed, seed + 1.0, seed + 2.0, seed + 3.0]
+                })
+                .collect())
+        }
+    }
+
+    /// An [`Embedder`] whose backend always fails -- proves a backend error
+    /// propagates as `VectorError::Embed` rather than being swallowed into a
+    /// false `Unavailable`.
+    struct FailingEmbedder;
+
+    impl Embedder for FailingEmbedder {
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn model_name(&self) -> &str {
+            "failing"
+        }
+
+        fn embed(&self, _texts: &[String]) -> rusty_embedder_core::Result<Vec<Vec<f32>>> {
+            Err(rusty_embedder_core::EmbedError::Backend(
+                "embedding backend unreachable".into(),
+            ))
+        }
+    }
+
+    fn rule_vector_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM rule_vectors", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn embed_all_rules_stores_a_vector_per_seeded_rule() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let outcomes = embed_all_rules(&conn, &StubEmbedder).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        assert!(outcomes.iter().all(|o| *o == EmbeddingOutcome::Stored));
+        assert_eq!(rule_vector_count(&conn), 4);
+    }
+
+    #[test]
+    fn embed_all_rules_with_null_embedder_is_discoverably_unavailable() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // NullEmbedder always returns an empty batch regardless of input --
+        // every rule must come back Unavailable, not silently skipped with
+        // no signal and not misaligned against the wrong rowids.
+        let outcomes = embed_all_rules(&conn, &rusty_embedder_core::NullEmbedder::new()).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        assert!(outcomes.iter().all(|o| *o == EmbeddingOutcome::Unavailable));
+        assert_eq!(rule_vector_count(&conn), 0);
+    }
+
+    #[test]
+    fn embed_all_rules_on_empty_store_is_empty_not_an_error() {
+        let conn = open_store().unwrap();
+        let outcomes = embed_all_rules(&conn, &StubEmbedder).unwrap();
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn insert_rule_vector_happy_path_stores_one_row() {
+        let conn = open_store().unwrap();
+        let rule_id = insert_rule(
+            &conn,
+            &Rule {
+                domain_id: "uaf-1.3".into(),
+                construct_id: "uaf-1.3:AuthorityGrant".into(),
+                construct: "AuthorityGrant".into(),
+                text: "A new rule added at ingest time.".into(),
+                layer: AuthorityLayer::Standard,
+                rule_type: RuleType::Must,
+            },
+        )
+        .unwrap();
+
+        let outcome = insert_rule_vector(
+            &conn,
+            &StubEmbedder,
+            rule_id,
+            "A new rule added at ingest time.",
+        )
+        .unwrap();
+        assert_eq!(outcome, EmbeddingOutcome::Stored);
+        assert_eq!(rule_vector_count(&conn), 1);
+    }
+
+    #[test]
+    fn insert_rule_vector_null_embedder_reports_unavailable_not_a_wrong_vector() {
+        let conn = open_store().unwrap();
+        let outcome = insert_rule_vector(
+            &conn,
+            &rusty_embedder_core::NullEmbedder::new(),
+            1,
+            "anything",
+        )
+        .unwrap();
+        assert_eq!(outcome, EmbeddingOutcome::Unavailable);
+        assert_eq!(rule_vector_count(&conn), 0);
+    }
+
+    #[test]
+    fn insert_rule_vector_propagates_backend_failure_rather_than_silently_skipping() {
+        let conn = open_store().unwrap();
+        let err = insert_rule_vector(&conn, &FailingEmbedder, 1, "anything").unwrap_err();
+        assert!(matches!(err, VectorError::Embed(_)));
+        assert_eq!(rule_vector_count(&conn), 0);
+    }
+
+    #[test]
+    fn nearest_rule_vectors_finds_the_closest_stored_vector() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+        embed_all_rules(&conn, &StubEmbedder).unwrap();
+
+        // Every seeded rule text has a distinct length, so StubEmbedder gives
+        // each a distinct vector -- querying with the exact vector for one
+        // rule's text should return that rule first, at distance 0.
+        let target_rowid = 1i64;
+        let target_text: String = conn
+            .query_row(
+                "SELECT text FROM rules_fts WHERE rowid = ?1",
+                [target_rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let query_vector = StubEmbedder.embed(&[target_text]).unwrap().remove(0);
+
+        let hits = nearest_rule_vectors(&conn, &query_vector, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rule_rowid, target_rowid);
+        assert!(hits[0].distance < 0.0001);
+    }
+
+    #[test]
+    fn nearest_rule_vectors_on_empty_table_is_empty_not_an_error() {
+        let conn = open_store().unwrap();
+        let hits = nearest_rule_vectors(&conn, &[0.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert!(hits.is_empty());
     }
 }
