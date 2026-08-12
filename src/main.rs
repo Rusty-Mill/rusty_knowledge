@@ -90,7 +90,8 @@ fn parse_layer_filter(layer: &Option<String>) -> Result<Option<AuthorityLayer>, 
 fn parse_rule_type_filter(rule_type: &Option<String>) -> Result<Option<RuleType>, String> {
     match rule_type.as_deref().map(RuleType::parse) {
         Some(None) => Err(format!(
-            "{:?} is not a known rule type (expected one of MUST, SHALL, SHOULD, MAY, MUST_NOT).",
+            "{:?} is not a known rule type (expected one of MUST, SHALL, SHOULD, MAY, MUST_NOT, \
+             RECOMMENDED, FORBIDDEN).",
             rule_type.as_ref().unwrap()
         )),
         Some(Some(parsed)) => Ok(Some(parsed)),
