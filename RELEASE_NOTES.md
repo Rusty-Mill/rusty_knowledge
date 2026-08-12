@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement lookup.domain_summary
-**2026-08-12**
+## PR #26 — Implement lookup.domain_summary
+**2026-08-12** · [#26](https://github.com/Rusty-Mill/rusty_knowledge/pull/26)
 
 - **Added:** `lookup_domain_summary` MCP tool (closes
   [rusty_knowledge#8](https://github.com/Rusty-Mill/rusty_knowledge/issues/8)) —
