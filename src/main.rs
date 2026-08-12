@@ -13,8 +13,8 @@
 //! `lookup_relationships`, `lookup_valid_relationships`,
 //! `lookup_domain_summary`, `validate_element` (required-property,
 //! enum-value, range, and pattern machine checks -- pattern matching via
-//! `rusty_regx`, a zero-dependency in-ecosystem regex engine), and
-//! `validate_relationship`.
+//! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
+//! `validate_relationship`, and `validate_completeness`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -159,6 +159,17 @@ struct ValidateRelationshipParams {
     to_construct_ref: String,
     /// The relationship type to validate, e.g. "records".
     relationship_type: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateCompletenessParams {
+    /// Domain the construct belongs to, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The container/viewpoint construct's short name or ID.
+    construct_ref: String,
+    /// Element type IDs actually present in the model being checked.
+    #[serde(default)]
+    present_element_types: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -375,6 +386,7 @@ impl KnowledgeServer {
             &from_construct.id,
             to_id.as_deref(),
             relationship_type.as_deref(),
+            None,
         ) {
             Ok(rels) => rels,
             Err(err) => return format!("Lookup failed: {err}"),
@@ -623,6 +635,7 @@ impl KnowledgeServer {
             &from_construct.id,
             Some(&to_construct.id),
             Some(&relationship_type),
+            None,
         ) {
             Ok(rels) => rels,
             Err(err) => return format!("Validation failed: {err}"),
@@ -655,6 +668,58 @@ impl KnowledgeServer {
             to_construct.short_name
         )
     }
+
+    #[tool(
+        description = "Given a container/viewpoint construct and the element types present in a model, evaluate what's required, optional, and missing. Required element types come from MUST-typed relationships originating at the construct."
+    )]
+    fn validate_completeness(
+        &self,
+        Parameters(ValidateCompletenessParams {
+            domain_id,
+            construct_ref,
+            present_element_types,
+        }): Parameters<ValidateCompletenessParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let construct = match store::resolve_construct(&conn, &domain_id, &construct_ref) {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!("Construct {construct_ref:?} not found in domain {domain_id:?}.");
+            }
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        let report =
+            match store::evaluate_completeness(&conn, &construct.id, &present_element_types) {
+                Ok(report) => report,
+                Err(err) => return format!("Validation failed: {err}"),
+            };
+
+        let list_or_none = |items: &[String]| {
+            if items.is_empty() {
+                "(none)".to_string()
+            } else {
+                items.join(", ")
+            }
+        };
+
+        format!(
+            "{} ({}) -- {}\nRequired element types: {}\nPresent: {}\nMissing required: {}\nExtra present (not required): {}\nRequired rules: {}\nRecommended rules: {}",
+            construct.short_name,
+            construct.id,
+            if report.is_complete {
+                "COMPLETE"
+            } else {
+                "INCOMPLETE"
+            },
+            list_or_none(&report.required_element_types),
+            list_or_none(&report.present_element_types),
+            list_or_none(&report.missing_required),
+            list_or_none(&report.extra_present),
+            list_or_none(&report.required_rule_texts),
+            list_or_none(&report.recommended_rule_texts),
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -685,7 +750,7 @@ async fn main() -> anyhow::Result<()> {
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
-         validate_relationship)"
+         validate_relationship, validate_completeness)"
     );
 
     let server = KnowledgeServer {
@@ -1136,6 +1201,57 @@ mod tests {
             from_construct_ref: "DoesNotExist".into(),
             to_construct_ref: "ConflictRegistryEntry".into(),
             relationship_type: "records".into(),
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn validate_completeness_reports_complete_when_required_present() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            present_element_types: vec!["uaf-1.3:ConflictRegistryEntry".into()],
+        }));
+        assert!(response.contains("COMPLETE"));
+        assert!(!response.contains("INCOMPLETE"));
+        assert!(response.contains("scope and expiry"));
+    }
+
+    #[test]
+    fn validate_completeness_reports_missing_required() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            present_element_types: vec![],
+        }));
+        assert!(response.contains("INCOMPLETE"));
+        assert!(response.contains("Missing required: uaf-1.3:ConflictRegistryEntry"));
+    }
+
+    #[test]
+    fn validate_completeness_reports_extra_present_without_affecting_completeness() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            present_element_types: vec![
+                "uaf-1.3:ConflictRegistryEntry".into(),
+                "something-unexpected".into(),
+            ],
+        }));
+        assert!(response.contains("COMPLETE"));
+        assert!(response.contains("Extra present (not required): something-unexpected"));
+    }
+
+    #[test]
+    fn validate_completeness_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "DoesNotExist".into(),
+            present_element_types: vec![],
         }));
         assert!(response.contains("not found"));
     }
