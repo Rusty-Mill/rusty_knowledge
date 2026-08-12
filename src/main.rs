@@ -7,23 +7,29 @@
 //! backend, or authority/crypto primitives, so implementation proceeds
 //! without TRIAL-0003's full entry-gate process.
 //!
-//! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
-//! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
-//! `meta_routing_guide`, `lookup_construct`, `lookup_rules`,
-//! `lookup_relationships`, `lookup_valid_relationships`,
-//! `lookup_domain_summary`, `validate_element` (required-property,
-//! enum-value, range, and pattern machine checks -- pattern matching via
-//! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
-//! `validate_relationship`, `validate_completeness`, `search_constructs`,
-//! `crosscut_traceability`, `crosscut_conflicts` (the layered-authority
-//! conflict registry, RK-002), `crosscut_cross_domain`, and
-//! `meta_list_domains` -- the full 15-tool surface.
+//! Tools implemented: `search_knowledge` (domain/layer-scoped, ranked,
+//! always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005 --
+//! `lexical-only` or `hybrid`, see below), `meta_routing_guide`,
+//! `lookup_construct`, `lookup_rules`, `lookup_relationships`,
+//! `lookup_valid_relationships`, `lookup_domain_summary`, `validate_element`
+//! (required-property, enum-value, range, and pattern machine checks --
+//! pattern matching via `rusty_regx`, a zero-dependency in-ecosystem regex
+//! engine), `validate_relationship`, `validate_completeness`,
+//! `search_constructs`, `crosscut_traceability`, `crosscut_conflicts` (the
+//! layered-authority conflict registry, RK-002), `crosscut_cross_domain`,
+//! and `meta_list_domains` -- the full 15-tool surface.
+//!
+//! `search_knowledge` fuses FTS5 with `sqlite-vec` cosine-similarity search
+//! over construct descriptions (RK-004) via Reciprocal Rank Fusion, same as
+//! `knowledge-mcp`'s `hybrid_search` -- but only when a real
+//! [`rusty_embedder_core::Embedder`] is compiled in (the `local-embeddings`
+//! / `http-embeddings` Cargo features) *and* selected via `EMBEDDING_BACKEND`
+//! at startup. The default is `NullEmbedder` (dimension 0): search stays
+//! `lexical-only`, byte-for-byte the pre-#18 behavior, until both are true.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
-//! since that's rmcp's simplest documented starting point), or hybrid
-//! vector retrieval in the tool surface itself (RK-004's vec0 table exists
-//! in the store but isn't queried by this tool yet, rusty_knowledge#18). A
-//! candidate for a later slice, not silently dropped.
+//! since that's rmcp's simplest documented starting point). A candidate for
+//! a later slice, not silently dropped.
 
 mod store;
 
@@ -31,8 +37,16 @@ use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
 };
 use rusqlite::Connection;
+use rusty_embedder_core::{Embedder, NullEmbedder};
 use std::sync::{Arc, Mutex};
 use store::{AuthorityLayer, RuleType, ValidationOutcome};
+
+/// Maximum results `hybrid_search` returns once it actually fuses FTS with
+/// vector search -- matches `knowledge-mcp`'s own `hybrid_search` default.
+/// Has no effect on lexical-only results, which stay unbounded (unchanged
+/// from this crate's pre-#18 behavior) since they never reach the fused,
+/// truncated path.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
 
 /// Shared by every tool that accepts an optional authority-layer filter
 /// string: `Ok(None)` for "no filter", `Ok(Some(_))` for a recognized layer,
@@ -222,12 +236,17 @@ struct CrossDomainParams {
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
+    /// The search embedder -- `NullEmbedder` (dimension 0, no vectors) by
+    /// default, so `search_knowledge` stays lexical-only exactly as before
+    /// #18, unless a real backend is compiled in (`local-embeddings` /
+    /// `http-embeddings`) and selected via `EMBEDDING_BACKEND`.
+    embedder: Arc<dyn Embedder>,
 }
 
 #[tool_router(server_handler)]
 impl KnowledgeServer {
     #[tool(
-        description = "Search knowledge-base rules by full-text query, optionally scoped to a domain and/or authority layer. Every result carries its authority layer (Standard / Tool Implementation / Conventions / Process), a rank, and the response always declares its retrieval mode (lexical-only today) per RM-KNOWLEDGE-MODEL-0002 and RM-KNOWLEDGE-MODEL-0005."
+        description = "Search knowledge-base rules by full-text query, optionally scoped to a domain and/or authority layer. Every result carries its authority layer (Standard / Tool Implementation / Conventions / Process) when it has one, a rank/score, and the response always declares its retrieval mode (lexical-only, or hybrid when a real embedder is configured) per RM-KNOWLEDGE-MODEL-0002 and RM-KNOWLEDGE-MODEL-0005."
     )]
     fn search_knowledge(
         &self,
@@ -243,7 +262,14 @@ impl KnowledgeServer {
         };
 
         let conn = self.conn.lock().expect("store mutex poisoned");
-        match store::search_scoped(&conn, &query, domain_id.as_deref(), layer_filter) {
+        match store::hybrid_search(
+            &conn,
+            self.embedder.as_ref(),
+            &query,
+            domain_id.as_deref(),
+            layer_filter,
+            DEFAULT_SEARCH_LIMIT,
+        ) {
             Ok((hits, mode)) if hits.is_empty() => {
                 format!(
                     "Retrieval mode: {}\nNo rules matched {query:?}.",
@@ -251,15 +277,27 @@ impl KnowledgeServer {
                 )
             }
             Ok((hits, mode)) => {
+                // Lexical hits keep the pre-#18 "rank" label (raw FTS5
+                // bm25-derived rank, more negative = better); fused hybrid
+                // results use "score" (RRF fused score, higher = better) --
+                // different scales, so labeled differently rather than
+                // presented as the same number under one name.
+                let label = match mode {
+                    store::RetrievalMode::LexicalOnly => "rank",
+                    store::RetrievalMode::Hybrid => "score",
+                };
                 let results = hits
                     .iter()
                     .map(|h| {
+                        let layer_str = h.layer.map(AuthorityLayer::as_str).unwrap_or("semantic");
+                        let note = if h.is_vector_match {
+                            " (semantic match, no keyword hit)"
+                        } else {
+                            ""
+                        };
                         format!(
-                            "[rank={:.3}] [{}] {}: {}",
-                            h.rank,
-                            h.rule.layer.as_str(),
-                            h.rule.construct,
-                            h.rule.text
+                            "[{label}={:.3}] [{layer_str}] {} ({}, domain={}): {}{note}",
+                            h.score, h.construct_name, h.construct_id, h.domain_id, h.text
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1058,6 +1096,64 @@ fn routing_guide() -> String {
         .to_string()
 }
 
+/// Chooses the search embedder at startup from the `EMBEDDING_BACKEND`
+/// environment variable, mirroring `knowledge-mcp`'s own `EMBEDDING_BACKEND`
+/// config (default `"null"`, i.e. lexical-only). A real backend only exists
+/// in this binary at all if its Cargo feature was compiled in
+/// (`local-embeddings` / `http-embeddings`); requesting one that wasn't --
+/// or one that fails to initialize (e.g. a missing `OPENAI_API_KEY`) --
+/// logs a warning to stderr and falls back to `NullEmbedder` rather than
+/// refusing to start. A misconfigured embedder should degrade search to
+/// lexical-only, not take the whole server down.
+fn embedder_from_env() -> Arc<dyn Embedder> {
+    let backend = std::env::var("EMBEDDING_BACKEND").unwrap_or_default();
+    match backend.as_str() {
+        "local" => {
+            #[cfg(feature = "local-embeddings")]
+            {
+                match rusty_embedder_local::LocalEmbedder::new() {
+                    Ok(embedder) => return Arc::new(embedder),
+                    Err(err) => eprintln!(
+                        "EMBEDDING_BACKEND=local failed to load ({err}); \
+                         falling back to lexical-only search."
+                    ),
+                }
+            }
+            #[cfg(not(feature = "local-embeddings"))]
+            eprintln!(
+                "EMBEDDING_BACKEND=local requested, but this binary wasn't built with \
+                 the `local-embeddings` feature; falling back to lexical-only search."
+            );
+            Arc::new(NullEmbedder::new())
+        }
+        "http" | "openai" => {
+            #[cfg(feature = "http-embeddings")]
+            {
+                let model = std::env::var("EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                let dimension = std::env::var("EMBEDDING_DIMENSION")
+                    .ok()
+                    .and_then(|d| d.parse::<usize>().ok())
+                    .unwrap_or(1536);
+                match rusty_embedder_http::HttpEmbedder::openai(model, dimension) {
+                    Ok(embedder) => return Arc::new(embedder),
+                    Err(err) => eprintln!(
+                        "EMBEDDING_BACKEND={backend} failed to load ({err}); \
+                         falling back to lexical-only search."
+                    ),
+                }
+            }
+            #[cfg(not(feature = "http-embeddings"))]
+            eprintln!(
+                "EMBEDDING_BACKEND={backend} requested, but this binary wasn't built with \
+                 the `http-embeddings` feature; falling back to lexical-only search."
+            );
+            Arc::new(NullEmbedder::new())
+        }
+        _ => Arc::new(NullEmbedder::new()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let conn = store::open_store()?;
@@ -1067,17 +1163,24 @@ async fn main() -> anyhow::Result<()> {
     // still only compiles because AuthorityLayer has no "unknown" variant.
     let _: AuthorityLayer = AuthorityLayer::Standard;
 
+    let embedder = embedder_from_env();
+    if let Err(err) = store::build_construct_embeddings(&conn, embedder.as_ref()) {
+        eprintln!("Failed to build construct embeddings ({err}); search will stay lexical-only.");
+    }
+
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
          validate_relationship, validate_completeness, search_constructs, \
          crosscut_traceability, crosscut_conflicts, crosscut_cross_domain, \
-         meta_list_domains)"
+         meta_list_domains; retrieval mode: {})",
+        embedder.model_name()
     );
 
     let server = KnowledgeServer {
         conn: Arc::new(Mutex::new(conn)),
+        embedder,
     };
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
@@ -1109,6 +1212,7 @@ mod tests {
         store::seed(&conn).unwrap();
         KnowledgeServer {
             conn: Arc::new(Mutex::new(conn)),
+            embedder: Arc::new(NullEmbedder::new()),
         }
     }
 
@@ -1847,5 +1951,112 @@ mod tests {
         assert!(response.contains("2 domain(s)"));
         assert!(response.contains("UAF 1.3"));
         assert!(response.contains("Data Mesh"));
+    }
+
+    /// A deterministic test double for [`Embedder`], mirroring
+    /// `store::tests::FakeEmbedder` -- maps each exact input text to a
+    /// hand-picked vector, so `search_knowledge`'s hybrid-mode formatting
+    /// can be tested without a real model.
+    struct FakeEmbedder {
+        vectors: std::collections::HashMap<String, Vec<f32>>,
+    }
+
+    impl FakeEmbedder {
+        fn new() -> Self {
+            Self {
+                vectors: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with_vector(mut self, text: &str, vector: Vec<f32>) -> Self {
+            self.vectors.insert(text.to_string(), vector);
+            self
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn model_name(&self) -> &str {
+            "fake-test-embedder"
+        }
+
+        fn embed(&self, texts: &[String]) -> rusty_embedder_core::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    self.vectors
+                        .get(t)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0, 0.0])
+                })
+                .collect())
+        }
+    }
+
+    /// The three seeded constructs' descriptions, each placed on a
+    /// distinct, non-zero axis so cosine distance is well-defined and
+    /// nearest-neighbor is unambiguous (a zero vector has no cosine
+    /// similarity to anything -- leaving a construct's description
+    /// unmapped would silently break vector search, not just leave it
+    /// unhelpfully ranked).
+    fn fake_embedder_for_seed_descriptions() -> FakeEmbedder {
+        FakeEmbedder::new()
+            .with_vector(
+                "A scoped, time-bounded grant of authority to act within a domain.",
+                vec![1.0, 0.0],
+            )
+            .with_vector(
+                "A recorded contradiction between two rules across authority layers.",
+                vec![0.0, 1.0],
+            )
+            .with_vector(
+                "A discoverable, owned unit of data published by a domain team.",
+                vec![-1.0, 0.0],
+            )
+    }
+
+    #[test]
+    fn search_knowledge_with_real_embedder_reports_hybrid_mode() {
+        let conn = store::open_store().unwrap();
+        store::seed(&conn).unwrap();
+        let embedder =
+            fake_embedder_for_seed_descriptions().with_vector("AuthorityGrant", vec![1.0, 0.0]);
+        store::build_construct_embeddings(&conn, &embedder).unwrap();
+        let server = KnowledgeServer {
+            conn: Arc::new(Mutex::new(conn)),
+            embedder: Arc::new(embedder),
+        };
+
+        let response = server.search_knowledge(Parameters(SearchParams {
+            query: "AuthorityGrant".into(),
+            domain_id: None,
+            layer: None,
+        }));
+        assert!(response.starts_with("Retrieval mode: hybrid"));
+        assert!(response.contains("uaf-1.3:AuthorityGrant"));
+    }
+
+    #[test]
+    fn search_knowledge_notes_vector_only_matches() {
+        let conn = store::open_store().unwrap();
+        store::seed(&conn).unwrap();
+        let embedder = fake_embedder_for_seed_descriptions()
+            .with_vector("zzznotinanyrule zzzalsomissing", vec![0.1, 0.9]);
+        store::build_construct_embeddings(&conn, &embedder).unwrap();
+        let server = KnowledgeServer {
+            conn: Arc::new(Mutex::new(conn)),
+            embedder: Arc::new(embedder),
+        };
+
+        let response = server.search_knowledge(Parameters(SearchParams {
+            query: "zzznotinanyrule zzzalsomissing".into(),
+            domain_id: None,
+            layer: None,
+        }));
+        assert!(response.starts_with("Retrieval mode: hybrid"));
+        assert!(response.contains("semantic match, no keyword hit"));
     }
 }
