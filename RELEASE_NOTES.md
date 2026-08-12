@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement crosscut.conflicts
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #32 — Implement crosscut.conflicts
+**2026-08-12** · [#32](https://github.com/Rusty-Mill/rusty_knowledge/pull/32)
 
 - **Added:** `crosscut_conflicts` MCP tool (closes
   [rusty_knowledge#14](https://github.com/Rusty-Mill/rusty_knowledge/issues/14),
