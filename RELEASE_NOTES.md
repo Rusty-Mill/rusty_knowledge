@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Suggest candidate valid-relationship rules
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #44 — Suggest candidate valid-relationship rules
+**2026-08-12** · [#44](https://github.com/Rusty-Mill/rusty_knowledge/pull/44)
 
 - **Added:** `crosscut_valid_relationship_candidates` MCP tool (closes
   [rusty_knowledge#43](https://github.com/Rusty-Mill/rusty_knowledge/issues/43))
