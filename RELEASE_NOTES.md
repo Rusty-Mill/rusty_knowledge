@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement validate.relationship
-**2026-08-12**
+## PR #28 — Implement validate.relationship
+**2026-08-12** · [#28](https://github.com/Rusty-Mill/rusty_knowledge/pull/28)
 
 - **Added:** `validate_relationship` MCP tool (closes
   [rusty_knowledge#10](https://github.com/Rusty-Mill/rusty_knowledge/issues/10)) —
