@@ -2691,6 +2691,7 @@ dependencies = [
  "rusty-embedder-local",
  "rusty_regx",
  "serde",
+ "serde_json",
  "sqlite-vec",
  "tokio",
 ]
