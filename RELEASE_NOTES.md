@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Wire sqlite-vec vec0 table into search
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #36 — Wire sqlite-vec vec0 table into search
+**2026-08-12** · [#36](https://github.com/Rusty-Mill/rusty_knowledge/pull/36)
 
 - **Added:** hybrid search (closes
   [rusty_knowledge#18](https://github.com/Rusty-Mill/rusty_knowledge/issues/18))
