@@ -5,6 +5,28 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #29 — Implement validate.completeness
+**2026-08-12** · [#29](https://github.com/Rusty-Mill/rusty_knowledge/pull/29)
+
+- **Added:** `validate_completeness` MCP tool (closes
+  [rusty_knowledge#11](https://github.com/Rusty-Mill/rusty_knowledge/issues/11)) —
+  given a container/viewpoint construct and the element types present in a
+  model, reports required/present/missing/extra element types plus the
+  construct's required (MUST/SHALL) and recommended (SHOULD) rule texts, and
+  an overall complete/incomplete verdict.
+- **Added:** `rule_type` field on `Relationship` (mirrors `Rule`'s) — a
+  `MUST`-typed relationship is what "required child element type" means here,
+  matching `knowledge-mcp`'s own `evaluate_completeness`, which filters its
+  relationship store the same way `validate.relationship` does. `relationships_from`
+  gained a matching optional `rule_type` filter parameter (existing call
+  sites pass `None`, unchanged behavior). Seed data's existing relationship
+  now carries `rule_type: RuleType::Must`.
+- **Added:** `CompletenessReport` and `evaluate_completeness` in `store.rs`.
+- 8 new tests (4 tool-level: complete when required present, missing required
+  reported, extra-present doesn't block completeness, unknown construct; 4
+  store-level: same coverage plus a construct with no required relationships
+  at all, and the new `relationships_from` rule_type filter).
+
 ## PR #28 — Implement validate.relationship
 **2026-08-12** · [#28](https://github.com/Rusty-Mill/rusty_knowledge/pull/28)
 

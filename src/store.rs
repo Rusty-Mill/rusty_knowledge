@@ -136,6 +136,11 @@ pub struct Rule {
 /// A typed, directional link between two constructs in the same domain.
 /// Queried by `lookup_relationships`; `crosscut.traceability`
 /// (rusty_knowledge#13) lands in a later issue.
+///
+/// `rule_type` mirrors `Rule`'s: `knowledge-mcp`'s completeness check
+/// (`validate.completeness`) treats a `MUST`/`SHALL` relationship as a
+/// required child element type, everything else as optional -- the same
+/// distinction `Rule::rule_type` already draws for free-text rules.
 pub struct Relationship {
     pub id: String,
     pub domain_id: String,
@@ -144,6 +149,7 @@ pub struct Relationship {
     pub relationship_type: String,
     pub cardinality: String,
     pub layer: AuthorityLayer,
+    pub rule_type: RuleType,
 }
 
 /// A *declared* rule about which relationship types are valid between two
@@ -347,7 +353,8 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              to_construct_id   TEXT NOT NULL REFERENCES constructs(id),
              relationship_type TEXT NOT NULL,
              cardinality       TEXT NOT NULL,
-             layer             TEXT NOT NULL
+             layer             TEXT NOT NULL,
+             rule_type         TEXT NOT NULL
          );
          CREATE TABLE valid_relationships (
              domain_id         TEXT NOT NULL REFERENCES domains(id),
@@ -651,8 +658,8 @@ pub fn rules_with_checks_for_construct(
 pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO relationships
-             (id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             &rel.id,
             &rel.domain_id,
@@ -661,6 +668,7 @@ pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::R
             &rel.relationship_type,
             &rel.cardinality,
             rel.layer.as_str(),
+            rel.rule_type.as_str(),
         ),
     )?;
     Ok(())
@@ -677,18 +685,27 @@ pub fn relationships_from(
     from_construct_id: &str,
     to_construct_id: Option<&str>,
     relationship_type: Option<&str>,
+    rule_type: Option<RuleType>,
 ) -> rusqlite::Result<Vec<Relationship>> {
+    let rule_type_str = rule_type.map(RuleType::as_str);
     let mut stmt = conn.prepare(
-        "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer
+        "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type
          FROM relationships
          WHERE from_construct_id = ?1
            AND (?2 IS NULL OR to_construct_id = ?2)
-           AND (?3 IS NULL OR relationship_type = ?3)",
+           AND (?3 IS NULL OR relationship_type = ?3)
+           AND (?4 IS NULL OR rule_type = ?4)",
     )?;
     let rows = stmt.query_map(
-        (from_construct_id, to_construct_id, relationship_type),
+        (
+            from_construct_id,
+            to_construct_id,
+            relationship_type,
+            rule_type_str,
+        ),
         |row| {
             let layer_text: String = row.get(6)?;
+            let rule_type_text: String = row.get(7)?;
             Ok(Relationship {
                 id: row.get(0)?,
                 domain_id: row.get(1)?,
@@ -697,10 +714,66 @@ pub fn relationships_from(
                 relationship_type: row.get(4)?,
                 cardinality: row.get(5)?,
                 layer: AuthorityLayer::from_str(&layer_text),
+                rule_type: RuleType::from_str(&rule_type_text),
             })
         },
     )?;
     rows.collect()
+}
+
+/// `validate.completeness`'s result: given a construct (e.g. a viewpoint)
+/// and the element types actually present, what's required, what's missing,
+/// and what's present but not required.
+pub struct CompletenessReport {
+    pub required_element_types: Vec<String>,
+    pub present_element_types: Vec<String>,
+    pub missing_required: Vec<String>,
+    pub extra_present: Vec<String>,
+    pub required_rule_texts: Vec<String>,
+    pub recommended_rule_texts: Vec<String>,
+    pub is_complete: bool,
+}
+
+/// "Required" element types come from `MUST`-typed relationships originating
+/// at `construct_id` -- matching `knowledge-mcp`'s `evaluate_completeness`,
+/// which reuses its relationship store the same way `validate.relationship`
+/// does, filtered to `rule_type="MUST"`.
+pub fn evaluate_completeness(
+    conn: &Connection,
+    construct_id: &str,
+    present_element_types: &[String],
+) -> rusqlite::Result<CompletenessReport> {
+    let rules = rules_for_construct(conn, construct_id, None, None)?;
+    let required_rule_texts: Vec<String> = rules
+        .iter()
+        .filter(|r| matches!(r.rule_type, RuleType::Must | RuleType::Shall))
+        .map(|r| r.text.clone())
+        .collect();
+    let recommended_rule_texts: Vec<String> = rules
+        .iter()
+        .filter(|r| r.rule_type == RuleType::Should)
+        .map(|r| r.text.clone())
+        .collect();
+
+    let rels = relationships_from(conn, construct_id, None, None, Some(RuleType::Must))?;
+    let required_types: std::collections::BTreeSet<String> =
+        rels.iter().map(|r| r.to_construct_id.clone()).collect();
+    let present_set: std::collections::BTreeSet<String> =
+        present_element_types.iter().cloned().collect();
+
+    let missing_required: Vec<String> = required_types.difference(&present_set).cloned().collect();
+    let extra_present: Vec<String> = present_set.difference(&required_types).cloned().collect();
+    let is_complete = missing_required.is_empty();
+
+    Ok(CompletenessReport {
+        required_element_types: required_types.into_iter().collect(),
+        present_element_types: present_element_types.to_vec(),
+        missing_required,
+        extra_present,
+        required_rule_texts,
+        recommended_rule_texts,
+        is_complete,
+    })
 }
 
 pub fn insert_valid_relationship(
@@ -946,6 +1019,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             relationship_type: "records".into(),
             cardinality: "0..*".into(),
             layer: AuthorityLayer::Standard,
+            rule_type: RuleType::Must,
         },
     )?;
 
@@ -998,7 +1072,7 @@ mod tests {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        let rels = relationships_from(&conn, "uaf-1.3:AuthorityGrant", None, None).unwrap();
+        let rels = relationships_from(&conn, "uaf-1.3:AuthorityGrant", None, None, None).unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].to_construct_id, "uaf-1.3:ConflictRegistryEntry");
         assert_eq!(rels[0].relationship_type, "records");
@@ -1014,6 +1088,7 @@ mod tests {
             "uaf-1.3:AuthorityGrant",
             Some("uaf-1.3:ConflictRegistryEntry"),
             Some("records"),
+            None,
         )
         .unwrap();
         assert_eq!(rels.len(), 1);
@@ -1023,9 +1098,36 @@ mod tests {
             "uaf-1.3:AuthorityGrant",
             None,
             Some("does-not-exist"),
+            None,
         )
         .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn relationships_from_filters_by_rule_type() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let must_only = relationships_from(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            None,
+            None,
+            Some(RuleType::Must),
+        )
+        .unwrap();
+        assert_eq!(must_only.len(), 1);
+
+        let should_only = relationships_from(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            None,
+            None,
+            Some(RuleType::Should),
+        )
+        .unwrap();
+        assert!(should_only.is_empty());
     }
 
     #[test]
@@ -1033,7 +1135,7 @@ mod tests {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        let rels = relationships_from(&conn, "data-mesh:DataProduct", None, None).unwrap();
+        let rels = relationships_from(&conn, "data-mesh:DataProduct", None, None, None).unwrap();
         assert!(rels.is_empty());
     }
 
@@ -1054,6 +1156,67 @@ mod tests {
 
         let rules = valid_relationships_between(&conn, "uaf-1.3", "entity", "viewpoint").unwrap();
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn evaluate_completeness_missing_vs_present() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let complete = evaluate_completeness(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            &["uaf-1.3:ConflictRegistryEntry".to_string()],
+        )
+        .unwrap();
+        assert!(complete.is_complete);
+        assert!(complete.missing_required.is_empty());
+        assert!(
+            complete
+                .required_rule_texts
+                .iter()
+                .any(|t| t.contains("scope and expiry"))
+        );
+
+        let incomplete = evaluate_completeness(&conn, "uaf-1.3:AuthorityGrant", &[]).unwrap();
+        assert!(!incomplete.is_complete);
+        assert_eq!(
+            incomplete.missing_required,
+            vec!["uaf-1.3:ConflictRegistryEntry".to_string()]
+        );
+    }
+
+    #[test]
+    fn evaluate_completeness_extra_present_does_not_block_completeness() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let report = evaluate_completeness(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            &[
+                "uaf-1.3:ConflictRegistryEntry".to_string(),
+                "something-unexpected".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(report.is_complete);
+        assert_eq!(
+            report.extra_present,
+            vec!["something-unexpected".to_string()]
+        );
+    }
+
+    #[test]
+    fn evaluate_completeness_construct_with_no_required_relationships() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // ConflictRegistryEntry has no outgoing MUST relationships seeded --
+        // trivially complete regardless of what's present.
+        let report = evaluate_completeness(&conn, "uaf-1.3:ConflictRegistryEntry", &[]).unwrap();
+        assert!(report.is_complete);
+        assert!(report.required_element_types.is_empty());
     }
 
     #[test]
