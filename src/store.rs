@@ -454,6 +454,22 @@ pub fn domain_by_id(conn: &Connection, domain_id: &str) -> rusqlite::Result<Opti
     Ok(rows.into_iter().next())
 }
 
+/// All loaded domains, ordered by name. `meta.list_domains`'
+/// per-domain layer counts and coverage summary live in
+/// `lookup_domain_summary` instead -- `knowledge-mcp`'s own
+/// `meta.list_domains` implementation returns bare domain rows despite its
+/// tool description, matching this.
+pub fn list_domains(conn: &Connection) -> rusqlite::Result<Vec<Domain>> {
+    let mut stmt = conn.prepare("SELECT id, name FROM domains ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Domain {
+            id: row.get(0)?,
+            name: row.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Distinct authority layers with at least one rule in a domain --
 /// `lookup.domain_summary`'s "layers" field, derived rather than tracked
 /// separately, since it's fully determined by what's already in `rules_fts`.
@@ -1555,6 +1571,16 @@ mod tests {
         assert_eq!(domain.name, "UAF 1.3");
 
         assert!(domain_by_id(&conn, "does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_domains_returns_all_seeded_domains_ordered_by_name() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let domains = list_domains(&conn).unwrap();
+        let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Data Mesh", "UAF 1.3"]);
     }
 
     #[test]

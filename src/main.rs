@@ -16,13 +16,14 @@
 //! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
 //! `validate_relationship`, `validate_completeness`, `search_constructs`,
 //! `crosscut_traceability`, `crosscut_conflicts` (the layered-authority
-//! conflict registry, RK-002), and `crosscut_cross_domain`.
+//! conflict registry, RK-002), `crosscut_cross_domain`, and
+//! `meta_list_domains` -- the full 15-tool surface.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), or hybrid
 //! vector retrieval in the tool surface itself (RK-004's vec0 table exists
-//! in the store but isn't queried by this tool yet). A candidate for a
-//! later slice, not silently dropped.
+//! in the store but isn't queried by this tool yet, rusty_knowledge#18). A
+//! candidate for a later slice, not silently dropped.
 
 mod store;
 
@@ -1016,16 +1017,34 @@ impl KnowledgeServer {
             rels.len()
         )
     }
+
+    #[tool(
+        description = "List all loaded domains. For per-domain layer/construct counts, use lookup_domain_summary."
+    )]
+    fn meta_list_domains(&self) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let domains = match store::list_domains(&conn) {
+            Ok(domains) => domains,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if domains.is_empty() {
+            return "No domains loaded.".to_string();
+        }
+
+        let domains_block = domains
+            .iter()
+            .map(|d| format!("  {} ({})", d.name, d.id))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!("{} domain(s) loaded:\n{domains_block}", domains.len())
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
-/// Deliberately limited to tools that actually exist in this crate today.
-/// `knowledge-mcp`'s own routing table also covers validate/crosscut question
-/// patterns and a multi-step evaluation workflow; those entries land here as
-/// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
-/// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#16):\n\
+    "Routing guidance:\n\
      - \"I can't find the right construct\" -> search_knowledge, search_constructs\n\
      - \"What does X mean?\" -> lookup_construct\n\
      - \"What should X be named/styled?\" -> lookup_rules (layer=Conventions)\n\
@@ -1034,7 +1053,8 @@ fn routing_guide() -> String {
      - \"Is this model/viewpoint complete?\" -> validate_completeness\n\
      - \"Does X trace to Y?\" -> crosscut_traceability\n\
      - \"Where do layers disagree?\" -> crosscut_conflicts\n\
-     - \"How does X relate to a construct in another domain?\" -> crosscut_cross_domain"
+     - \"How does X relate to a construct in another domain?\" -> crosscut_cross_domain\n\
+     - \"What domains are loaded?\" -> meta_list_domains"
         .to_string()
 }
 
@@ -1052,7 +1072,8 @@ async fn main() -> anyhow::Result<()> {
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
          validate_relationship, validate_completeness, search_constructs, \
-         crosscut_traceability, crosscut_conflicts, crosscut_cross_domain)"
+         crosscut_traceability, crosscut_conflicts, crosscut_cross_domain, \
+         meta_list_domains)"
     );
 
     let server = KnowledgeServer {
@@ -1068,7 +1089,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routing_guide_only_references_existing_tools() {
+    fn routing_guide_references_all_tools() {
         let guide = routing_guide();
         assert!(guide.contains("search_knowledge"));
         assert!(guide.contains("search_constructs"));
@@ -1080,8 +1101,7 @@ mod tests {
         assert!(guide.contains("crosscut_traceability"));
         assert!(guide.contains("crosscut_conflicts"));
         assert!(guide.contains("crosscut_cross_domain"));
-        // This tool doesn't exist yet -- the guide must not claim it does.
-        assert!(!guide.contains("meta_list_domains"));
+        assert!(guide.contains("meta_list_domains"));
     }
 
     fn test_server() -> KnowledgeServer {
@@ -1818,5 +1838,14 @@ mod tests {
             to_domain_id: None,
         }));
         assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn meta_list_domains_lists_both_seeded_domains() {
+        let server = test_server();
+        let response = server.meta_list_domains();
+        assert!(response.contains("2 domain(s)"));
+        assert!(response.contains("UAF 1.3"));
+        assert!(response.contains("Data Mesh"));
     }
 }

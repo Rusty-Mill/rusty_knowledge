@@ -5,6 +5,26 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement meta.list_domains
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `meta_list_domains` MCP tool (closes
+  [rusty_knowledge#16](https://github.com/Rusty-Mill/rusty_knowledge/issues/16))
+  — lists all loaded domains. This is the last of `knowledge-mcp`'s 15
+  tools; the full surface is now implemented.
+- **Matches `knowledge-mcp`'s actual behavior, not its tool description:**
+  the description claims "layer counts and coverage summary," but
+  `knowledge-mcp`'s own implementation just returns bare domain rows (id,
+  name, ...) -- the counts live in a separate tool
+  (`lookup.domain_summary`, our `lookup_domain_summary`, rusty_knowledge#8)
+  instead. This crate's version does the same: per-domain layer/construct
+  counts stay in `lookup_domain_summary`, not duplicated here.
+- **Added:** `store::list_domains`, returning all domains ordered by name.
+- 2 new tests (1 store-level: both seeded domains in name order; 1
+  tool-level: both domains listed by `meta_list_domains`). The existing
+  routing-guide test is updated to assert the now-complete 15-tool surface
+  instead of checking for not-yet-implemented tools.
+
 ## PR #33 — Implement crosscut.cross_domain
 **2026-08-12** · [#33](https://github.com/Rusty-Mill/rusty_knowledge/pull/33)
 
