@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement validate.completeness
-**2026-08-12**
+## PR #29 — Implement validate.completeness
+**2026-08-12** · [#29](https://github.com/Rusty-Mill/rusty_knowledge/pull/29)
 
 - **Added:** `validate_completeness` MCP tool (closes
   [rusty_knowledge#11](https://github.com/Rusty-Mill/rusty_knowledge/issues/11)) —
