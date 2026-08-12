@@ -182,6 +182,21 @@ pub struct Conflict {
     pub review_date: Option<String>,
 }
 
+/// A typed link between constructs in *different* domains -- e.g. a UAF
+/// capability tracing to an RMF control family. Distinct from
+/// `Relationship`, which only ever connects two constructs within the same
+/// domain.
+pub struct CrossDomainRelationship {
+    pub id: String,
+    pub from_domain_id: String,
+    pub from_construct_id: String,
+    pub to_domain_id: String,
+    pub to_construct_id: String,
+    pub relationship_type: String,
+    pub description: Option<String>,
+    pub rationale: Option<String>,
+}
+
 /// A structured, machine-checkable rule attached to a `Rule` row, matching
 /// (a subset of) `knowledge-mcp`'s `machine_rule` schema. Most rules are
 /// free text only (no `MachineRule` attached) -- this exists for the
@@ -391,6 +406,16 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              resolution    TEXT NOT NULL,
              rationale     TEXT,
              review_date   TEXT
+         );
+         CREATE TABLE cross_domain_relationships (
+             id                 TEXT PRIMARY KEY,
+             from_domain_id     TEXT NOT NULL REFERENCES domains(id),
+             from_construct_id  TEXT NOT NULL REFERENCES constructs(id),
+             to_domain_id       TEXT NOT NULL REFERENCES domains(id),
+             to_construct_id    TEXT NOT NULL REFERENCES constructs(id),
+             relationship_type  TEXT NOT NULL,
+             description        TEXT,
+             rationale          TEXT
          );
          CREATE TABLE rule_machine_checks (
              -- No FOREIGN KEY to rules_fts(rowid): SQLite doesn't support FK
@@ -945,6 +970,61 @@ pub fn conflicts_for(
     rows.collect()
 }
 
+pub fn insert_cross_domain_relationship(
+    conn: &Connection,
+    rel: &CrossDomainRelationship,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO cross_domain_relationships
+             (id, from_domain_id, from_construct_id, to_domain_id, to_construct_id, relationship_type, description, rationale)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        (
+            &rel.id,
+            &rel.from_domain_id,
+            &rel.from_construct_id,
+            &rel.to_domain_id,
+            &rel.to_construct_id,
+            &rel.relationship_type,
+            &rel.description,
+            &rel.rationale,
+        ),
+    )?;
+    Ok(())
+}
+
+/// Cross-domain relationships from a specific construct, optionally
+/// narrowed to one target domain. Unlike same-domain `Relationship`s, the
+/// target construct is never resolved against a live `constructs` row here
+/// -- `knowledge-mcp`'s own `crosscut.cross_domain` doesn't do so either,
+/// since the target domain (e.g. an external framework like RMF) may not be
+/// loaded at all.
+pub fn cross_domain_relationships_from(
+    conn: &Connection,
+    from_domain_id: &str,
+    from_construct_id: &str,
+    to_domain_id: Option<&str>,
+) -> rusqlite::Result<Vec<CrossDomainRelationship>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, from_domain_id, from_construct_id, to_domain_id, to_construct_id, relationship_type, description, rationale
+         FROM cross_domain_relationships
+         WHERE from_domain_id = ?1 AND from_construct_id = ?2
+           AND (?3 IS NULL OR to_domain_id = ?3)",
+    )?;
+    let rows = stmt.query_map((from_domain_id, from_construct_id, to_domain_id), |row| {
+        Ok(CrossDomainRelationship {
+            id: row.get(0)?,
+            from_domain_id: row.get(1)?,
+            from_construct_id: row.get(2)?,
+            to_domain_id: row.get(3)?,
+            to_construct_id: row.get(4)?,
+            relationship_type: row.get(5)?,
+            description: row.get(6)?,
+            rationale: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// How a search response was produced. `RM-KNOWLEDGE-MODEL-0005` requires
 /// this be declared on every search response, not silently omitted or
 /// substituted -- there is deliberately no `Default` impl, so a caller can't
@@ -1186,6 +1266,24 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             resolution: "Standard wins: expiry is required regardless of convention.".into(),
             rationale: Some("Ungoverned indefinite grants are a security risk.".into()),
             review_date: Some("2027-01-01".into()),
+        },
+    )?;
+
+    insert_cross_domain_relationship(
+        conn,
+        &CrossDomainRelationship {
+            id: "uaf-1.3:AuthorityGrant-governs-data-mesh:DataProduct".into(),
+            from_domain_id: "uaf-1.3".into(),
+            from_construct_id: "uaf-1.3:AuthorityGrant".into(),
+            to_domain_id: "data-mesh".into(),
+            to_construct_id: "data-mesh:DataProduct".into(),
+            relationship_type: "governs".into(),
+            description: Some(
+                "The scoped authority an AuthorityGrant confers is what permits a team to \
+                 publish a DataProduct in the first place."
+                    .into(),
+            ),
+            rationale: Some("Cross-domain compliance link between UAF and Data Mesh.".into()),
         },
     )?;
 
@@ -1709,5 +1807,54 @@ mod tests {
 
         let none = conflicts_for(&conn, "data-mesh", None).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn cross_domain_relationships_from_returns_seeded_relationship() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rels =
+            cross_domain_relationships_from(&conn, "uaf-1.3", "uaf-1.3:AuthorityGrant", None)
+                .unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].to_domain_id, "data-mesh");
+        assert_eq!(rels[0].to_construct_id, "data-mesh:DataProduct");
+        assert_eq!(rels[0].relationship_type, "governs");
+    }
+
+    #[test]
+    fn cross_domain_relationships_from_filters_by_to_domain() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let matching = cross_domain_relationships_from(
+            &conn,
+            "uaf-1.3",
+            "uaf-1.3:AuthorityGrant",
+            Some("data-mesh"),
+        )
+        .unwrap();
+        assert_eq!(matching.len(), 1);
+
+        let none = cross_domain_relationships_from(
+            &conn,
+            "uaf-1.3",
+            "uaf-1.3:AuthorityGrant",
+            Some("does-not-exist"),
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn cross_domain_relationships_from_construct_with_none_is_empty() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rels =
+            cross_domain_relationships_from(&conn, "data-mesh", "data-mesh:DataProduct", None)
+                .unwrap();
+        assert!(rels.is_empty());
     }
 }

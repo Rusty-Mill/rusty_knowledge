@@ -5,6 +5,30 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement crosscut.cross_domain
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `crosscut_cross_domain` MCP tool (closes
+  [rusty_knowledge#15](https://github.com/Rusty-Mill/rusty_knowledge/issues/15))
+  — finds typed relationships from a construct to constructs in *other*
+  domains (e.g. a UAF capability tracing to an RMF control family),
+  optionally narrowed to one target domain.
+- **Added:** `CrossDomainRelationship` struct, `cross_domain_relationships`
+  table, `insert_cross_domain_relationship`, and
+  `cross_domain_relationships_from` in `store.rs`. Distinct from
+  `Relationship`, which only ever connects two constructs in the *same*
+  domain.
+- **Not modeled:** the target construct is never resolved against a live
+  `constructs` row, matching `knowledge-mcp`'s own behavior — the target
+  domain (an external framework) may not be loaded at all.
+- **Seed data:** one real cross-domain relationship linking the existing
+  `uaf-1.3:AuthorityGrant` and `data-mesh:DataProduct` seed constructs
+  (`governs`), reusing the two domains already present rather than adding
+  new seed constructs just for this table.
+- 7 new tests (3 store-level: seeded relationship, `to_domain_id` filter,
+  a construct with none; 4 tool-level: seeded relationship reported,
+  `to_domain_id` filter, construct with none, unknown construct).
+
 ## PR #32 — Implement crosscut.conflicts
 **2026-08-12** · [#32](https://github.com/Rusty-Mill/rusty_knowledge/pull/32)
 

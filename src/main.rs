@@ -15,8 +15,8 @@
 //! enum-value, range, and pattern machine checks -- pattern matching via
 //! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
 //! `validate_relationship`, `validate_completeness`, `search_constructs`,
-//! `crosscut_traceability`, and `crosscut_conflicts` (the layered-authority
-//! conflict registry, RK-002).
+//! `crosscut_traceability`, `crosscut_conflicts` (the layered-authority
+//! conflict registry, RK-002), and `crosscut_cross_domain`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), or hybrid
@@ -204,6 +204,18 @@ struct ConflictsParams {
     /// silently dropped filter.
     #[serde(default)]
     construct_ref: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CrossDomainParams {
+    /// The source construct's domain, e.g. "uaf-1.3".
+    from_domain_id: String,
+    /// The source construct's short name or ID.
+    from_construct_ref: String,
+    /// Restrict to relationships targeting this domain (e.g. "data-mesh").
+    /// Omit for all target domains.
+    #[serde(default)]
+    to_domain_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -935,6 +947,75 @@ impl KnowledgeServer {
             conflicts.len()
         )
     }
+
+    #[tool(
+        description = "Find cross-domain relationships from a construct -- e.g. how a UAF construct relates to an RMF control. Optionally narrowed to a target domain."
+    )]
+    fn crosscut_cross_domain(
+        &self,
+        Parameters(CrossDomainParams {
+            from_domain_id,
+            from_construct_ref,
+            to_domain_id,
+        }): Parameters<CrossDomainParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let from_construct =
+            match store::resolve_construct(&conn, &from_domain_id, &from_construct_ref) {
+                Ok(Some(construct)) => construct,
+                Ok(None) => {
+                    return format!(
+                        "Construct {from_construct_ref:?} not found in domain {from_domain_id:?}."
+                    );
+                }
+                Err(err) => return format!("Lookup failed: {err}"),
+            };
+
+        let rels = match store::cross_domain_relationships_from(
+            &conn,
+            &from_domain_id,
+            &from_construct.id,
+            to_domain_id.as_deref(),
+        ) {
+            Ok(rels) => rels,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if rels.is_empty() {
+            return format!(
+                "No cross-domain relationships found from {} ({}).",
+                from_construct.short_name, from_construct.id
+            );
+        }
+
+        let rels_block = rels
+            .iter()
+            .map(|r| {
+                let description = r
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" -- {d}"))
+                    .unwrap_or_default();
+                let rationale = r
+                    .rationale
+                    .as_deref()
+                    .map(|ra| format!(" (rationale: {ra})"))
+                    .unwrap_or_default();
+                format!(
+                    "  [{}] --{}--> {}:{}{description}{rationale}",
+                    r.id, r.relationship_type, r.to_domain_id, r.to_construct_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} ({}) -- {} cross-domain relationship(s):\n{rels_block}",
+            from_construct.short_name,
+            from_construct.id,
+            rels.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -944,7 +1025,7 @@ impl KnowledgeServer {
 /// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
 /// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#15-#16):\n\
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#16):\n\
      - \"I can't find the right construct\" -> search_knowledge, search_constructs\n\
      - \"What does X mean?\" -> lookup_construct\n\
      - \"What should X be named/styled?\" -> lookup_rules (layer=Conventions)\n\
@@ -952,7 +1033,8 @@ fn routing_guide() -> String {
      - \"Is X valid/conformant?\" -> validate_element, validate_relationship\n\
      - \"Is this model/viewpoint complete?\" -> validate_completeness\n\
      - \"Does X trace to Y?\" -> crosscut_traceability\n\
-     - \"Where do layers disagree?\" -> crosscut_conflicts"
+     - \"Where do layers disagree?\" -> crosscut_conflicts\n\
+     - \"How does X relate to a construct in another domain?\" -> crosscut_cross_domain"
         .to_string()
 }
 
@@ -970,7 +1052,7 @@ async fn main() -> anyhow::Result<()> {
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
          validate_relationship, validate_completeness, search_constructs, \
-         crosscut_traceability, crosscut_conflicts)"
+         crosscut_traceability, crosscut_conflicts, crosscut_cross_domain)"
     );
 
     let server = KnowledgeServer {
@@ -997,10 +1079,9 @@ mod tests {
         assert!(guide.contains("validate_completeness"));
         assert!(guide.contains("crosscut_traceability"));
         assert!(guide.contains("crosscut_conflicts"));
-        // These tools don't exist yet -- the guide must not claim they do.
-        for not_yet_implemented in ["crosscut_cross_domain", "meta_list_domains"] {
-            assert!(!guide.contains(not_yet_implemented));
-        }
+        assert!(guide.contains("crosscut_cross_domain"));
+        // This tool doesn't exist yet -- the guide must not claim it does.
+        assert!(!guide.contains("meta_list_domains"));
     }
 
     fn test_server() -> KnowledgeServer {
@@ -1682,6 +1763,59 @@ mod tests {
         let response = server.crosscut_conflicts(Parameters(ConflictsParams {
             domain_id: "uaf-1.3".into(),
             construct_ref: Some("DoesNotExist".into()),
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn crosscut_cross_domain_reports_seeded_relationship() {
+        let server = test_server();
+        let response = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            from_domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_domain_id: None,
+        }));
+        assert!(response.contains("1 cross-domain relationship(s)"));
+        assert!(response.contains("data-mesh:DataProduct"));
+        assert!(response.contains("governs"));
+    }
+
+    #[test]
+    fn crosscut_cross_domain_filters_by_to_domain() {
+        let server = test_server();
+        let matching = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            from_domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_domain_id: Some("data-mesh".into()),
+        }));
+        assert!(matching.contains("1 cross-domain relationship(s)"));
+
+        let none = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            from_domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_domain_id: Some("does-not-exist".into()),
+        }));
+        assert!(none.contains("No cross-domain relationships found"));
+    }
+
+    #[test]
+    fn crosscut_cross_domain_construct_with_none_reports_empty() {
+        let server = test_server();
+        let response = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            from_domain_id: "data-mesh".into(),
+            from_construct_ref: "DataProduct".into(),
+            to_domain_id: None,
+        }));
+        assert!(response.contains("No cross-domain relationships found"));
+    }
+
+    #[test]
+    fn crosscut_cross_domain_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            from_domain_id: "uaf-1.3".into(),
+            from_construct_ref: "DoesNotExist".into(),
+            to_domain_id: None,
         }));
         assert!(response.contains("not found"));
     }
