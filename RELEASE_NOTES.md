@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement validate.element
-**2026-08-12**
+## PR #27 — Implement validate.element
+**2026-08-12** · [#27](https://github.com/Rusty-Mill/rusty_knowledge/pull/27)
 
 - **Added:** `validate_element` MCP tool (closes
   [rusty_knowledge#9](https://github.com/Rusty-Mill/rusty_knowledge/issues/9)) —
