@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — search_knowledge: domain/layer filtering, rank, retrieval-mode
-**2026-08-12**
+## PR #21 — search_knowledge: domain/layer filtering, rank, retrieval-mode
+**2026-08-12** · [#21](https://github.com/Rusty-Mill/rusty_knowledge/pull/21)
 
 - **Changed (breaking, explicitly signed off):** `search_knowledge`'s response
   now always declares its retrieval mode (`lexical-only` until
