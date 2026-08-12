@@ -166,13 +166,12 @@ pub struct ValidRelationshipRule {
 /// minority whose normative text can be checked programmatically against an
 /// element's properties.
 ///
-/// **Deliberately missing `Pattern`** (Python's regex-match check): matching
-/// it would need a `regex` crate dependency, and adding a new third-party
-/// dependency is its own stop-and-ask gate, same as a breaking change, per
-/// this skill's own rule -- not something to add silently mid-issue.
-/// `evaluate_machine_rule` reports a clear "not supported" `Warning` for a
-/// stored `Pattern` check rather than silently skipping or crashing on one,
-/// but no seed data or code path constructs a `Pattern` variant yet.
+/// `Pattern` (regex-match) is checked via `rusty_regx` -- a zero-dependency
+/// POSIX-ERE engine from this same GitHub account, added as a dependency
+/// only after explicit sign-off, per this skill's stop-and-ask rule for new
+/// third-party dependencies (a bare `regex` crate dependency was considered
+/// and deliberately not used, to avoid pulling in its several transitive
+/// dependencies when a zero-dependency in-ecosystem alternative exists).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MachineRule {
     RequiredProperty {
@@ -245,13 +244,28 @@ pub fn evaluate_machine_rule(
                 format!("Property '{property}' is absent"),
             ),
         },
-        MachineRule::Pattern { property, .. } => (
-            ValidationOutcome::Warning,
-            format!(
-                "Pattern check on '{property}' is not supported yet (would need a regex \
-                 dependency -- see MachineRule's doc comment)"
-            ),
-        ),
+        MachineRule::Pattern { property, pattern } => {
+            let val = properties.get(property).map(String::as_str).unwrap_or("");
+            match rusty_regx::Regex::new(pattern) {
+                // `find` is an unanchored search; requiring the match to
+                // start at 0 replicates Python's `re.match` semantics
+                // (anchored at the start, not necessarily the whole string).
+                Ok(re) => match re.find(val) {
+                    Some(m) if m.start() == 0 => (
+                        ValidationOutcome::Pass,
+                        format!("'{property}' matches required pattern '{pattern}'"),
+                    ),
+                    _ => (
+                        ValidationOutcome::Warning,
+                        format!("'{property}' = '{val}' does not match pattern '{pattern}'"),
+                    ),
+                },
+                Err(err) => (
+                    ValidationOutcome::Warning,
+                    format!("Pattern '{pattern}' for '{property}' is invalid: {err}"),
+                ),
+            }
+        }
         MachineRule::Range { property, min, max } => {
             let Some(val) = properties.get(property).and_then(|v| v.parse::<f64>().ok()) else {
                 return (
@@ -902,7 +916,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             rule_type: RuleType::Must,
         },
     )?;
-    insert_rule(
+    let data_product_owning_team_rule_id = insert_rule(
         conn,
         &Rule {
             domain_id: "data-mesh".into(),
@@ -911,6 +925,14 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             text: "A DataProduct MUST declare an owning domain team.".into(),
             layer: AuthorityLayer::Standard,
             rule_type: RuleType::Must,
+        },
+    )?;
+    insert_machine_check(
+        conn,
+        data_product_owning_team_rule_id,
+        &MachineRule::Pattern {
+            property: "owning_team".into(),
+            pattern: "[a-z][a-z0-9-]*".into(),
         },
     )?;
 
@@ -1138,14 +1160,48 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_machine_rule_pattern_reports_unsupported_not_a_pass() {
+    fn evaluate_machine_rule_pattern_matches() {
         let check = MachineRule::Pattern {
             property: "id".into(),
-            pattern: "^[A-Z]+$".into(),
+            pattern: "[A-Z]+".into(),
+        };
+        let matching = std::collections::HashMap::from([("id".to_string(), "ABC".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &matching).0,
+            ValidationOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_pattern_mismatch_is_warning_not_fail() {
+        let check = MachineRule::Pattern {
+            property: "id".into(),
+            pattern: "[A-Z]+".into(),
+        };
+        // Doesn't match at position 0 -- rusty_regx's unanchored `find` would
+        // otherwise find "ABC" mid-string; requiring start()==0 replicates
+        // Python's re.match (anchored-at-start) semantics.
+        let mismatch = std::collections::HashMap::from([("id".to_string(), "1ABC".to_string())]);
+        let (outcome, message) = evaluate_machine_rule(&check, &mismatch);
+        assert_eq!(outcome, ValidationOutcome::Warning);
+        assert!(message.contains("does not match"));
+
+        let absent = std::collections::HashMap::new();
+        assert_eq!(
+            evaluate_machine_rule(&check, &absent).0,
+            ValidationOutcome::Warning
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_invalid_pattern_is_warning_not_a_panic() {
+        let check = MachineRule::Pattern {
+            property: "id".into(),
+            pattern: "[unclosed".into(),
         };
         let (outcome, message) = evaluate_machine_rule(&check, &std::collections::HashMap::new());
         assert_eq!(outcome, ValidationOutcome::Warning);
-        assert!(message.contains("not supported"));
+        assert!(message.contains("invalid"));
     }
 
     #[test]

@@ -11,9 +11,9 @@
 //! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
 //! `meta_routing_guide`, `lookup_construct`, `lookup_rules`,
 //! `lookup_relationships`, `lookup_valid_relationships`,
-//! `lookup_domain_summary`, and `validate_element` (machine-checkable rules
-//! only -- pattern checks are a disclosed gap pending a `regex` dependency
-//! decision; see `store::MachineRule`'s doc comment).
+//! `lookup_domain_summary`, and `validate_element` (required-property,
+//! enum-value, range, and pattern machine checks -- pattern matching via
+//! `rusty_regx`, a zero-dependency in-ecosystem regex engine).
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -972,5 +972,35 @@ mod tests {
             properties: std::collections::HashMap::new(),
         }));
         assert!(response.contains("no machine-checkable rules"));
+    }
+
+    #[test]
+    fn validate_element_pattern_check_passes_on_valid_team_slug() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "data-mesh".into(),
+            construct_ref: "DataProduct".into(),
+            layer: None,
+            properties: std::collections::HashMap::from([(
+                "owning_team".to_string(),
+                "checkout-platform".to_string(),
+            )]),
+        }));
+        assert!(response.contains("overall: PASS"));
+    }
+
+    #[test]
+    fn validate_element_pattern_check_warns_on_invalid_team_slug() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "data-mesh".into(),
+            construct_ref: "DataProduct".into(),
+            layer: None,
+            properties: std::collections::HashMap::from([(
+                "owning_team".to_string(),
+                "Checkout Platform!".to_string(),
+            )]),
+        }));
+        assert!(response.contains("overall: WARNING"));
     }
 }
