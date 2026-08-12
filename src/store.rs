@@ -158,6 +158,7 @@ pub struct Relationship {
 /// `RM-KNOWLEDGE-MODEL-0004` requires validation to check against this
 /// declared set rather than inferring validity from whatever relationship
 /// instances happen to already exist.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValidRelationshipRule {
     pub domain_id: String,
     pub from_type: String,
@@ -978,6 +979,97 @@ pub fn valid_relationships_between(
         })
     })?;
     rows.collect()
+}
+
+/// A *candidate* declared valid-relationship rule, derived from a domain's
+/// existing `relationships` instances rather than authored by a human --
+/// see [`candidate_valid_relationships`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidRelationshipCandidate {
+    pub rule: ValidRelationshipRule,
+    /// How many relationship instances support this candidate.
+    pub instance_count: usize,
+    /// Other cardinality values seen among instances of this same
+    /// `(from_type, to_type, relationship_type)` triple, sorted, when they
+    /// weren't unanimous. `rule.cardinality` is whichever value appeared
+    /// most often; this field exists so a reviewer sees the disagreement
+    /// rather than it being silently resolved. Empty when every instance
+    /// agreed.
+    pub other_cardinalities_seen: Vec<String>,
+}
+
+/// Derives *candidate* declared valid-relationship rules from a domain's
+/// existing `relationships` instances, grouped by `(from_type, to_type,
+/// relationship_type)` via each endpoint's `construct_type`.
+///
+/// Read-only: never writes to `valid_relationships` itself. Each candidate
+/// still needs an explicit [`insert_valid_relationship`] call from a human
+/// reviewer to become a *declared* rule -- silently promoting inferred
+/// candidates straight into `valid_relationships` would reintroduce the
+/// exact anti-pattern `RM-KNOWLEDGE-MODEL-0004` exists to avoid, the same
+/// reasoning already applied when the `knowledge-mcp` importer
+/// (rusty_knowledge#38/#39) chose to leave `valid_relationships` empty
+/// rather than infer it from imported instances.
+pub fn candidate_valid_relationships(
+    conn: &Connection,
+    domain_id: &str,
+) -> rusqlite::Result<Vec<ValidRelationshipCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT fc.construct_type, tc.construct_type, r.relationship_type, r.cardinality
+         FROM relationships r
+         JOIN constructs fc ON fc.id = r.from_construct_id
+         JOIN constructs tc ON tc.id = r.to_construct_id
+         WHERE r.domain_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map([domain_id], |row| {
+            let from_type: String = row.get(0)?;
+            let to_type: String = row.get(1)?;
+            let relationship_type: String = row.get(2)?;
+            let cardinality: String = row.get(3)?;
+            Ok((from_type, to_type, relationship_type, cardinality))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut groups: std::collections::BTreeMap<
+        (String, String, String),
+        std::collections::HashMap<String, usize>,
+    > = std::collections::BTreeMap::new();
+    for (from_type, to_type, relationship_type, cardinality) in rows {
+        *groups
+            .entry((from_type, to_type, relationship_type))
+            .or_default()
+            .entry(cardinality)
+            .or_insert(0) += 1;
+    }
+
+    let mut candidates = Vec::with_capacity(groups.len());
+    for ((from_type, to_type, relationship_type), cardinality_counts) in groups {
+        let instance_count = cardinality_counts.values().sum();
+        let chosen_cardinality = cardinality_counts
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+            .map(|(cardinality, _)| cardinality.clone())
+            .expect("group is non-empty by construction (only built from at least one row)");
+        let mut other_cardinalities_seen: Vec<String> = cardinality_counts
+            .into_keys()
+            .filter(|cardinality| *cardinality != chosen_cardinality)
+            .collect();
+        other_cardinalities_seen.sort();
+
+        candidates.push(ValidRelationshipCandidate {
+            rule: ValidRelationshipRule {
+                domain_id: domain_id.to_string(),
+                from_type,
+                to_type,
+                relationship_type,
+                cardinality: chosen_cardinality,
+            },
+            instance_count,
+            other_cardinalities_seen,
+        });
+    }
+    Ok(candidates)
 }
 
 pub fn insert_conflict(conn: &Connection, conflict: &Conflict) -> rusqlite::Result<()> {
@@ -2519,5 +2611,111 @@ mod tests {
         assert!(is_fresh);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn candidate_valid_relationships_reports_seeded_relationship() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let candidates = candidate_valid_relationships(&conn, "uaf-1.3").unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.rule.from_type, "entity");
+        assert_eq!(candidate.rule.to_type, "entity");
+        assert_eq!(candidate.rule.relationship_type, "records");
+        assert_eq!(candidate.rule.cardinality, "0..*");
+        assert_eq!(candidate.instance_count, 1);
+        assert!(candidate.other_cardinalities_seen.is_empty());
+    }
+
+    #[test]
+    fn candidate_valid_relationships_picks_majority_cardinality_and_discloses_others() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // Two more "records" instances between the same two construct
+        // types, both with a different cardinality than the seeded one --
+        // makes "1..1" the majority (2 vs 1) and "0..*" the disclosed
+        // disagreement.
+        insert_relationship(
+            &conn,
+            &Relationship {
+                id: "extra-records-1".into(),
+                domain_id: "uaf-1.3".into(),
+                from_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
+                to_construct_id: "uaf-1.3:AuthorityGrant".into(),
+                relationship_type: "records".into(),
+                cardinality: "1..1".into(),
+                layer: AuthorityLayer::Standard,
+                rule_type: RuleType::Must,
+            },
+        )
+        .unwrap();
+        insert_relationship(
+            &conn,
+            &Relationship {
+                id: "extra-records-2".into(),
+                domain_id: "uaf-1.3".into(),
+                from_construct_id: "uaf-1.3:AuthorityGrant".into(),
+                to_construct_id: "uaf-1.3:AuthorityGrant".into(),
+                relationship_type: "records".into(),
+                cardinality: "1..1".into(),
+                layer: AuthorityLayer::Standard,
+                rule_type: RuleType::Must,
+            },
+        )
+        .unwrap();
+
+        let candidates = candidate_valid_relationships(&conn, "uaf-1.3").unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.instance_count, 3);
+        assert_eq!(candidate.rule.cardinality, "1..1");
+        assert_eq!(candidate.other_cardinalities_seen, vec!["0..*".to_string()]);
+    }
+
+    #[test]
+    fn candidate_valid_relationships_distinguishes_relationship_types() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        insert_relationship(
+            &conn,
+            &Relationship {
+                id: "extra-governs".into(),
+                domain_id: "uaf-1.3".into(),
+                from_construct_id: "uaf-1.3:AuthorityGrant".into(),
+                to_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
+                relationship_type: "governs".into(),
+                cardinality: "0..1".into(),
+                layer: AuthorityLayer::Standard,
+                rule_type: RuleType::May,
+            },
+        )
+        .unwrap();
+
+        let candidates = candidate_valid_relationships(&conn, "uaf-1.3").unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.rule.relationship_type == "records")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.rule.relationship_type == "governs")
+        );
+    }
+
+    #[test]
+    fn candidate_valid_relationships_domain_with_no_relationships_is_empty() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // data-mesh has no seeded relationships.
+        let candidates = candidate_valid_relationships(&conn, "data-mesh").unwrap();
+        assert!(candidates.is_empty());
     }
 }

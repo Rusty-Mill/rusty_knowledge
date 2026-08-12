@@ -5,6 +5,35 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Suggest candidate valid-relationship rules
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `crosscut_valid_relationship_candidates` MCP tool (closes
+  [rusty_knowledge#43](https://github.com/Rusty-Mill/rusty_knowledge/issues/43))
+  — derives *candidate* declared valid-relationship rules from a domain's
+  existing `relationships` instances, grouped by `(from_type, to_type,
+  relationship_type)` via each endpoint's `construct_type`. Read-only:
+  never writes to `valid_relationships` itself.
+- **Has no `knowledge-mcp` equivalent** — the first tool in this crate
+  that doesn't. Follows on from the decision on rusty_knowledge#38 (the
+  importer leaves `valid_relationships` empty rather than inferring it,
+  per `RM-KNOWLEDGE-MODEL-0004`): this tool exists so a human still has a
+  way to populate that table afterward, without the crate ever silently
+  promoting an inferred candidate into the declared set itself. Turning a
+  candidate into a real rule is a separate, explicit
+  `insert_valid_relationship` call outside this tool.
+- **Added:** `store::candidate_valid_relationships` and
+  `ValidRelationshipCandidate` (`rule`, `instance_count`,
+  `other_cardinalities_seen`). When multiple instances of the same type
+  triple disagree on cardinality, the most common one is chosen and the
+  rest are disclosed via `other_cardinalities_seen` rather than silently
+  resolved.
+- 6 new tests (4 store-level: seeded relationship produces one candidate,
+  majority-cardinality selection with disagreement disclosed, distinct
+  relationship types produce distinct candidates, a domain with no
+  relationships is empty; 2 tool-level: seeded candidate reported,
+  no-relationships domain reports none).
+
 ## PR #42 — Make the store's database path configurable
 **2026-08-12** · [#42](https://github.com/Rusty-Mill/rusty_knowledge/pull/42)
 

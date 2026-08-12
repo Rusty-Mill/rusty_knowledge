@@ -17,7 +17,12 @@
 //! engine), `validate_relationship`, `validate_completeness`,
 //! `search_constructs`, `crosscut_traceability`, `crosscut_conflicts` (the
 //! layered-authority conflict registry, RK-002), `crosscut_cross_domain`,
-//! and `meta_list_domains` -- the full 15-tool surface.
+//! `meta_list_domains` -- the full 15-tool `knowledge-mcp` parity surface
+//! -- plus `crosscut_valid_relationship_candidates` (rusty_knowledge#43),
+//! which has no `knowledge-mcp` equivalent: it suggests declared
+//! valid-relationship rules from existing relationship instances for a
+//! human to review, rather than ever auto-populating `valid_relationships`
+//! (see its own doc comment for why).
 //!
 //! `search_knowledge` fuses FTS5 with `sqlite-vec` cosine-similarity search
 //! over construct descriptions (RK-004) via Reciprocal Rank Fusion, same as
@@ -249,6 +254,12 @@ struct CrossDomainParams {
     /// Omit for all target domains.
     #[serde(default)]
     to_domain_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidRelationshipCandidatesParams {
+    /// Domain to derive candidates for, e.g. "uaf-1.3".
+    domain_id: String,
 }
 
 #[derive(Clone)]
@@ -1075,6 +1086,57 @@ impl KnowledgeServer {
     }
 
     #[tool(
+        description = "Suggest candidate declared valid-relationship rules for a domain, derived from its existing relationship instances (grouped by source/target construct type and relationship type). These are suggestions only -- rusty_knowledge deliberately never auto-promotes an inferred candidate into the declared valid_relationships set (that would defeat the point of keeping a declared set at all); turning one into a real rule takes a separate, explicit step outside this tool."
+    )]
+    fn crosscut_valid_relationship_candidates(
+        &self,
+        Parameters(ValidRelationshipCandidatesParams { domain_id }): Parameters<
+            ValidRelationshipCandidatesParams,
+        >,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let candidates = match store::candidate_valid_relationships(&conn, &domain_id) {
+            Ok(candidates) => candidates,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if candidates.is_empty() {
+            return format!(
+                "No candidate valid-relationship rules for domain {domain_id:?} -- \
+                 no relationship instances to derive them from."
+            );
+        }
+
+        let candidates_block = candidates
+            .iter()
+            .map(|c| {
+                let disagreement = if c.other_cardinalities_seen.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (other cardinalities seen: {})",
+                        c.other_cardinalities_seen.join(", ")
+                    )
+                };
+                format!(
+                    "  {} --{}--> {} (cardinality: {}, from {} instance(s)){disagreement}",
+                    c.rule.from_type,
+                    c.rule.relationship_type,
+                    c.rule.to_type,
+                    c.rule.cardinality,
+                    c.instance_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} candidate(s) for domain {domain_id:?} (suggestions only, not yet declared):\n{candidates_block}",
+            candidates.len()
+        )
+    }
+
+    #[tool(
         description = "List all loaded domains. For per-domain layer/construct counts, use lookup_domain_summary."
     )]
     fn meta_list_domains(&self) -> String {
@@ -1110,7 +1172,9 @@ fn routing_guide() -> String {
      - \"Does X trace to Y?\" -> crosscut_traceability\n\
      - \"Where do layers disagree?\" -> crosscut_conflicts\n\
      - \"How does X relate to a construct in another domain?\" -> crosscut_cross_domain\n\
-     - \"What domains are loaded?\" -> meta_list_domains"
+     - \"What domains are loaded?\" -> meta_list_domains\n\
+     - \"What valid-relationship rules should I declare for this domain?\" -> \
+       crosscut_valid_relationship_candidates"
         .to_string()
 }
 
@@ -1232,7 +1296,7 @@ async fn main() -> anyhow::Result<()> {
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
          validate_relationship, validate_completeness, search_constructs, \
          crosscut_traceability, crosscut_conflicts, crosscut_cross_domain, \
-         meta_list_domains; retrieval mode: {})",
+         crosscut_valid_relationship_candidates, meta_list_domains; retrieval mode: {})",
         embedder.model_name()
     );
 
@@ -1263,6 +1327,7 @@ mod tests {
         assert!(guide.contains("crosscut_conflicts"));
         assert!(guide.contains("crosscut_cross_domain"));
         assert!(guide.contains("meta_list_domains"));
+        assert!(guide.contains("crosscut_valid_relationship_candidates"));
     }
 
     fn test_server() -> KnowledgeServer {
@@ -2116,5 +2181,30 @@ mod tests {
         }));
         assert!(response.starts_with("Retrieval mode: hybrid"));
         assert!(response.contains("semantic match, no keyword hit"));
+    }
+
+    #[test]
+    fn crosscut_valid_relationship_candidates_reports_seeded_candidate() {
+        let server = test_server();
+        let response = server.crosscut_valid_relationship_candidates(Parameters(
+            ValidRelationshipCandidatesParams {
+                domain_id: "uaf-1.3".into(),
+            },
+        ));
+        assert!(response.contains("1 candidate(s)"));
+        assert!(response.contains("records"));
+        assert!(response.contains("suggestions only"));
+    }
+
+    #[test]
+    fn crosscut_valid_relationship_candidates_no_relationships_reports_none() {
+        let server = test_server();
+        // data-mesh has no seeded relationships.
+        let response = server.crosscut_valid_relationship_candidates(Parameters(
+            ValidRelationshipCandidatesParams {
+                domain_id: "data-mesh".into(),
+            },
+        ));
+        assert!(response.contains("No candidate"));
     }
 }
