@@ -22,7 +22,9 @@
 
 mod store;
 
-use rmcp::{ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio};
+use rmcp::{
+    ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
+};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 use store::AuthorityLayer;
@@ -40,7 +42,9 @@ struct KnowledgeServer {
 
 #[tool_router(server_handler)]
 impl KnowledgeServer {
-    #[tool(description = "Search knowledge-base rules by full-text query; every result carries its authority layer (Standard / Tool Implementation / Conventions / Process) — RM-KNOWLEDGE-MODEL-0002.")]
+    #[tool(
+        description = "Search knowledge-base rules by full-text query; every result carries its authority layer (Standard / Tool Implementation / Conventions / Process) — RM-KNOWLEDGE-MODEL-0002."
+    )]
     fn search_knowledge(
         &self,
         Parameters(SearchParams { query }): Parameters<SearchParams>,

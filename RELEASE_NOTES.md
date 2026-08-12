@@ -12,9 +12,16 @@ against `main`, reverse chronological, each linking to its PR.
   ARCHITECTURE, and an ADR log seed, via the `repo-config` skill. ARCHITECTURE's
   overview/boundaries/structure/data-flow sections were hand-written from the
   actual `main.rs`/`store.rs` vertical slice rather than left as scaffold.
-- **Known limitation, disclosed rather than silently worked around:** the installed
-  `repo-config` skill's template payload is missing its entire `.github/` folder
-  (PR templates, issue templates, and the stack-selected CI workflow) — those
-  couldn't be generated from the skill's assets as designed. Flagged to the repo
-  owner as a skill-packaging gap; not fabricated from scratch to avoid diverging
-  from the skill's intended content.
+- **Added:** `.github/PULL_REQUEST_TEMPLATE/` (feature, bug_fix, docs, chore),
+  `.github/ISSUE_TEMPLATE/` (bug_report, feature_request, config.yml), and
+  `.github/workflows/ci-rust.yml` (fmt --check, clippy -D warnings, cargo test).
+- **Fixed:** the two items above were initially missing — this session's locally
+  synced copy of the `repo-config` skill was missing its `.github/` template
+  directory entirely (and had lost the executable bit on `apply.sh`/`audit.sh`).
+  Root-caused against the skill's actual source at `github.com/baileyrd/skill_pack`,
+  which was intact — the gap was in this environment's skill sync, not the skill's
+  content. Fixed the local sync and re-applied; audit score is now 10/10.
+- **Fixed:** `cargo fmt --all` on `src/main.rs`/`src/store.rs` — purely mechanical
+  line-wrapping, no logic changes — required to make the newly-added CI workflow's
+  `fmt --check` step pass; verified `fmt --check`, `clippy -D warnings`, and
+  `cargo test` all pass locally before pushing.
