@@ -5,6 +5,27 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #22 — Implement lookup.construct
+**2026-08-12** · [#22](https://github.com/Rusty-Mill/rusty_knowledge/pull/22)
+
+- **Added:** `lookup_construct` MCP tool (closes
+  [rusty_knowledge#4](https://github.com/Rusty-Mill/rusty_knowledge/issues/4)) —
+  full construct definition (short name, ID, type, description) plus its
+  rules, optionally filtered by authority layer. Resolves `construct_ref` by
+  short name first, falling back to a direct ID match within the domain,
+  matching `knowledge-mcp`'s `_resolve` order.
+- **Added:** `description` field on `Construct`; `resolve_construct` and
+  `rules_for_construct` queries in `store.rs`.
+- **Deliberately not included:** `is_abstract`/`is_deprecated`/`parent_id`/
+  `metadata`, conflict-registry counts, and "properties" — `knowledge-mcp`'s
+  fuller `Construct` model and its conflict/properties concepts aren't
+  modeled in this crate yet (conflicts land with
+  [rusty_knowledge#14](https://github.com/Rusty-Mill/rusty_knowledge/issues/14);
+  properties/metadata aren't filed anywhere yet). Not fabricated to look
+  more complete than it is.
+- 6 new tests (short-name resolution, ID resolution, layer filter, cross-domain
+  isolation, unknown-ref handling, unknown-layer error path).
+
 ## PR #21 — search_knowledge: domain/layer filtering, rank, retrieval-mode
 **2026-08-12** · [#21](https://github.com/Rusty-Mill/rusty_knowledge/pull/21)
 

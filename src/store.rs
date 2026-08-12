@@ -61,11 +61,17 @@ pub struct Domain {
 
 /// A named element within a domain (an entity type, artifact, or modeling
 /// concept) with rules and relationships attached.
+///
+/// A subset of `knowledge-mcp`'s `Construct` model: `name`, `is_abstract`,
+/// `is_deprecated`, `parent_id`, `source_section`, and `metadata` aren't
+/// modeled yet, and aren't invented here -- they land with whichever
+/// parity-gap issue actually needs them, not speculatively.
 pub struct Construct {
     pub id: String,
     pub domain_id: String,
     pub short_name: String,
     pub construct_type: String,
+    pub description: String,
 }
 
 /// A single rule, always carrying its authority layer — RM-KNOWLEDGE-MODEL-0002.
@@ -128,7 +134,8 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              id             TEXT PRIMARY KEY,
              domain_id      TEXT NOT NULL REFERENCES domains(id),
              short_name     TEXT NOT NULL,
-             construct_type TEXT NOT NULL
+             construct_type TEXT NOT NULL,
+             description    TEXT NOT NULL
          );
          CREATE VIRTUAL TABLE rules_fts USING fts5(
              domain_id UNINDEXED,
@@ -161,15 +168,81 @@ pub fn insert_domain(conn: &Connection, domain: &Domain) -> rusqlite::Result<()>
 
 pub fn insert_construct(conn: &Connection, construct: &Construct) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO constructs (id, domain_id, short_name, construct_type) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO constructs (id, domain_id, short_name, construct_type, description)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         (
             &construct.id,
             &construct.domain_id,
             &construct.short_name,
             &construct.construct_type,
+            &construct.description,
         ),
     )?;
     Ok(())
+}
+
+/// Resolve a construct reference within a domain: tries an exact `short_name`
+/// match first, then falls back to a direct ID lookup verified against the
+/// domain (matching `knowledge-mcp`'s `_resolve` fallback order in `server.py`).
+pub fn resolve_construct(
+    conn: &Connection,
+    domain_id: &str,
+    construct_ref: &str,
+) -> rusqlite::Result<Option<Construct>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain_id, short_name, construct_type, description
+         FROM constructs WHERE domain_id = ?1 AND short_name = ?2",
+    )?;
+    let by_name = stmt
+        .query_map((domain_id, construct_ref), construct_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if let Some(construct) = by_name.into_iter().next() {
+        return Ok(Some(construct));
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, domain_id, short_name, construct_type, description
+         FROM constructs WHERE id = ?1 AND domain_id = ?2",
+    )?;
+    let by_id = stmt
+        .query_map((construct_ref, domain_id), construct_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(by_id.into_iter().next())
+}
+
+fn construct_from_row(row: &rusqlite::Row) -> rusqlite::Result<Construct> {
+    Ok(Construct {
+        id: row.get(0)?,
+        domain_id: row.get(1)?,
+        short_name: row.get(2)?,
+        construct_type: row.get(3)?,
+        description: row.get(4)?,
+    })
+}
+
+/// Rules attached to one construct, optionally filtered by authority layer.
+pub fn rules_for_construct(
+    conn: &Connection,
+    construct_id: &str,
+    layer: Option<AuthorityLayer>,
+) -> rusqlite::Result<Vec<Rule>> {
+    let layer_str = layer.map(AuthorityLayer::as_str);
+    let mut stmt = conn.prepare(
+        "SELECT domain_id, construct_id, construct, text, layer
+         FROM rules_fts
+         WHERE construct_id = ?1 AND (?2 IS NULL OR layer = ?2)",
+    )?;
+    let rows = stmt.query_map((construct_id, layer_str), |row| {
+        let layer_text: String = row.get(4)?;
+        Ok(Rule {
+            domain_id: row.get(0)?,
+            construct_id: row.get(1)?,
+            construct: row.get(2)?,
+            text: row.get(3)?,
+            layer: AuthorityLayer::from_str(&layer_text),
+        })
+    })?;
+    rows.collect()
 }
 
 pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
@@ -286,16 +359,10 @@ pub fn constructs_in_domain(
     domain_id: &str,
 ) -> rusqlite::Result<Vec<Construct>> {
     let mut stmt = conn.prepare(
-        "SELECT id, domain_id, short_name, construct_type FROM constructs WHERE domain_id = ?1",
+        "SELECT id, domain_id, short_name, construct_type, description
+         FROM constructs WHERE domain_id = ?1",
     )?;
-    let rows = stmt.query_map([domain_id], |row| {
-        Ok(Construct {
-            id: row.get(0)?,
-            domain_id: row.get(1)?,
-            short_name: row.get(2)?,
-            construct_type: row.get(3)?,
-        })
-    })?;
+    let rows = stmt.query_map([domain_id], construct_from_row)?;
     rows.collect()
 }
 
@@ -325,6 +392,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             domain_id: "uaf-1.3".into(),
             short_name: "AuthorityGrant".into(),
             construct_type: "entity".into(),
+            description: "A scoped, time-bounded grant of authority to act within a domain.".into(),
         },
     )?;
     insert_construct(
@@ -334,6 +402,8 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             domain_id: "uaf-1.3".into(),
             short_name: "ConflictRegistryEntry".into(),
             construct_type: "entity".into(),
+            description: "A recorded contradiction between two rules across authority layers."
+                .into(),
         },
     )?;
     insert_construct(
@@ -343,6 +413,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             domain_id: "data-mesh".into(),
             short_name: "DataProduct".into(),
             construct_type: "entity".into(),
+            description: "A discoverable, owned unit of data published by a domain team.".into(),
         },
     )?;
 
