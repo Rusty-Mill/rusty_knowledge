@@ -5,6 +5,35 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #42 — Make the store's database path configurable
+**2026-08-12** · [#42](https://github.com/Rusty-Mill/rusty_knowledge/pull/42)
+
+- **Added:** `store::open_store_at_path` (closes
+  [rusty_knowledge#41](https://github.com/Rusty-Mill/rusty_knowledge/issues/41))
+  — a file-backed alternative to `open_store`'s in-memory default. Selected
+  at startup via a new `KNOWLEDGE_DB_PATH` env var; unset means unchanged
+  behavior (in-memory, same as before this PR).
+- **Decision:** a brand new or still-empty file gets the schema created
+  and is seeded/imported exactly like the in-memory default. A file a
+  previous run already initialized (its `domains` table already exists)
+  is reused as-is — `seed()` and `KNOWLEDGE_MCP_IMPORT_PATH` are both
+  skipped on that run. Chosen over re-seeding on top of existing data
+  (existing `insert_*` functions use plain `INSERT`, not `INSERT OR
+  REPLACE`, so that would fail on ID collisions) and over erroring out
+  (would make the ordinary "first run against a path that doesn't exist
+  yet" case require an extra opt-in flag for no benefit).
+- **Refactored, not changed:** `open_store`'s own behavior and signature
+  are unchanged — the `CREATE TABLE` batch and the `sqlite-vec`
+  auto-extension registration were factored into shared private helpers
+  (`create_schema`, `register_vec_extension`) so both entry points use the
+  same schema, not duplicated SQL. All 109 pre-existing tests pass
+  unmodified.
+- 3 new tests: a fresh/nonexistent path is fresh and seeds normally;
+  reopening the same path a second time is not fresh and the first run's
+  data is still there (real persistence, not just "didn't error twice");
+  a zero-byte file already at the path (simulating `touch`) is still
+  treated as fresh.
+
 ## PR #39 — Import a knowledge-mcp SQLite database
 **2026-08-12** · [#39](https://github.com/Rusty-Mill/rusty_knowledge/pull/39)
 

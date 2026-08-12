@@ -34,6 +34,16 @@
 //! row-by-row translation, not a raw file open). Omit it and nothing
 //! changes from today's seed-data-only behavior.
 //!
+//! The store itself is in-memory by default -- nothing persists across
+//! restarts. Setting `KNOWLEDGE_DB_PATH` switches to a file-backed store
+//! at that path instead (`store::open_store_at_path`, rusty_knowledge#41).
+//! A brand new or still-empty file gets the schema created and is seeded/
+//! imported exactly like the in-memory default; a file a previous run
+//! already initialized is reused as-is -- `seed()` and
+//! `KNOWLEDGE_MCP_IMPORT_PATH` are both skipped on that run, so restarting
+//! against a populated file doesn't silently re-seed or re-import on top
+//! of it.
+//!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point). A candidate for
 //! a later slice, not silently dropped.
@@ -1164,37 +1174,51 @@ fn embedder_from_env() -> Arc<dyn Embedder> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let conn = store::open_store()?;
-    store::seed(&conn)?;
+    let db_path = std::env::var("KNOWLEDGE_DB_PATH").ok();
+    let (conn, is_fresh) = match &db_path {
+        Some(path) => store::open_store_at_path(std::path::Path::new(path))?,
+        None => (store::open_store()?, true),
+    };
 
     // RK-001 sanity check, kept from the previous slice's proof: this
     // still only compiles because AuthorityLayer has no "unknown" variant.
     let _: AuthorityLayer = AuthorityLayer::Standard;
 
-    if let Ok(path) = std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
-        match knowledge_mcp_import::import_knowledge_mcp_db(&conn, std::path::Path::new(&path)) {
-            Ok(report) => {
-                eprintln!(
-                    "Imported {path:?}: {} domain(s), {} construct(s), {} rule(s), \
-                     {} relationship(s), {} cross-domain relationship(s), {} conflict(s), \
-                     {} embedding(s), {} row(s) skipped.",
-                    report.domains_imported,
-                    report.constructs_imported,
-                    report.rules_imported,
-                    report.relationships_imported,
-                    report.cross_domain_relationships_imported,
-                    report.conflicts_imported,
-                    report.embeddings_imported,
-                    report.rows_skipped,
-                );
-                for disclosure in &report.disclosures {
-                    eprintln!("  {disclosure}");
+    if is_fresh {
+        store::seed(&conn)?;
+
+        if let Ok(path) = std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
+            match knowledge_mcp_import::import_knowledge_mcp_db(&conn, std::path::Path::new(&path))
+            {
+                Ok(report) => {
+                    eprintln!(
+                        "Imported {path:?}: {} domain(s), {} construct(s), {} rule(s), \
+                         {} relationship(s), {} cross-domain relationship(s), {} conflict(s), \
+                         {} embedding(s), {} row(s) skipped.",
+                        report.domains_imported,
+                        report.constructs_imported,
+                        report.rules_imported,
+                        report.relationships_imported,
+                        report.cross_domain_relationships_imported,
+                        report.conflicts_imported,
+                        report.embeddings_imported,
+                        report.rows_skipped,
+                    );
+                    for disclosure in &report.disclosures {
+                        eprintln!("  {disclosure}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Failed to import {path:?} ({err}); continuing with seed data only.")
                 }
             }
-            Err(err) => {
-                eprintln!("Failed to import {path:?} ({err}); continuing with seed data only.")
-            }
         }
+    } else {
+        eprintln!(
+            "Reusing existing store at {:?} -- skipping seed data and KNOWLEDGE_MCP_IMPORT_PATH \
+             (already initialized by a previous run).",
+            db_path.as_deref().unwrap_or_default()
+        );
     }
 
     let embedder = embedder_from_env();
