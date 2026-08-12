@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Apply repo-config governance file set
-**2026-08-12**
+## PR #1 — Apply repo-config governance file set
+**2026-08-12** · [#1](https://github.com/Rusty-Mill/rusty_knowledge/pull/1)
 
 - **Added:** CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, CHANGELOG, RELEASE_NOTES,
   ARCHITECTURE, and an ADR log seed, via the `repo-config` skill. ARCHITECTURE's
@@ -18,4 +18,3 @@ against `main`, reverse chronological, each linking to its PR.
   couldn't be generated from the skill's assets as designed. Flagged to the repo
   owner as a skill-packaging gap; not fabricated from scratch to avoid diverging
   from the skill's intended content.
-- This entry's own PR link will be filled in once the PR is opened.
