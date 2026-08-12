@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement lookup.construct
-**2026-08-12**
+## PR #22 — Implement lookup.construct
+**2026-08-12** · [#22](https://github.com/Rusty-Mill/rusty_knowledge/pull/22)
 
 - **Added:** `lookup_construct` MCP tool (closes
   [rusty_knowledge#4](https://github.com/Rusty-Mill/rusty_knowledge/issues/4)) —
