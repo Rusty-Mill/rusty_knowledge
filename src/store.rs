@@ -1147,6 +1147,28 @@ impl From<rusty_embedder_core::EmbedError> for EmbeddingError {
     }
 }
 
+/// Stores a single pre-existing embedding (raw little-endian f32 bytes,
+/// already `serialize_f32`-shaped) directly into `construct_embeddings` --
+/// the counterpart to [`build_construct_embeddings`] for vectors that
+/// already exist elsewhere (e.g. imported from another store) rather than
+/// ones this crate generates itself via an [`Embedder`]. Does not touch
+/// `vec_constructs`; call [`sync_vector_index`] afterward to pick up new
+/// rows, same as after [`build_construct_embeddings`].
+pub fn insert_construct_embedding(
+    conn: &Connection,
+    construct_id: &str,
+    domain_id: &str,
+    model: &str,
+    embedding: &[u8],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO construct_embeddings (construct_id, domain_id, model, embedding)
+         VALUES (?1, ?2, ?3, ?4)",
+        (construct_id, domain_id, model, embedding),
+    )?;
+    Ok(())
+}
+
 /// Embeds every construct's `description` and stores the result in
 /// `construct_embeddings`, matching `knowledge-mcp`'s ingestion-time
 /// `_build_embeddings` -- one vector per construct (not per rule), skipping

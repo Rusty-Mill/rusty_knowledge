@@ -27,10 +27,18 @@
 //! at startup. The default is `NullEmbedder` (dimension 0): search stays
 //! `lexical-only`, byte-for-byte the pre-#18 behavior, until both are true.
 //!
+//! Setting `KNOWLEDGE_MCP_IMPORT_PATH` at startup imports a `knowledge-mcp`
+//! SQLite file into the store on top of the seeded demo data (see
+//! `knowledge_mcp_import`'s module doc for exactly what does and doesn't
+//! translate -- the two schemas are not on-disk compatible, so this is a
+//! row-by-row translation, not a raw file open). Omit it and nothing
+//! changes from today's seed-data-only behavior.
+//!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point). A candidate for
 //! a later slice, not silently dropped.
 
+mod knowledge_mcp_import;
 mod store;
 
 use rmcp::{
@@ -1162,6 +1170,32 @@ async fn main() -> anyhow::Result<()> {
     // RK-001 sanity check, kept from the previous slice's proof: this
     // still only compiles because AuthorityLayer has no "unknown" variant.
     let _: AuthorityLayer = AuthorityLayer::Standard;
+
+    if let Ok(path) = std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
+        match knowledge_mcp_import::import_knowledge_mcp_db(&conn, std::path::Path::new(&path)) {
+            Ok(report) => {
+                eprintln!(
+                    "Imported {path:?}: {} domain(s), {} construct(s), {} rule(s), \
+                     {} relationship(s), {} cross-domain relationship(s), {} conflict(s), \
+                     {} embedding(s), {} row(s) skipped.",
+                    report.domains_imported,
+                    report.constructs_imported,
+                    report.rules_imported,
+                    report.relationships_imported,
+                    report.cross_domain_relationships_imported,
+                    report.conflicts_imported,
+                    report.embeddings_imported,
+                    report.rows_skipped,
+                );
+                for disclosure in &report.disclosures {
+                    eprintln!("  {disclosure}");
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to import {path:?} ({err}); continuing with seed data only.")
+            }
+        }
+    }
 
     let embedder = embedder_from_env();
     if let Err(err) = store::build_construct_embeddings(&conn, embedder.as_ref()) {

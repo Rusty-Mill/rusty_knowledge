@@ -12,6 +12,7 @@ rusty-embedder-http = { git = "https://github.com/baileyrd/rusty_embedder", rev 
 rusty-embedder-local = { git = "https://github.com/baileyrd/rusty_embedder", rev = "6add27a4c808aa153a5a22fc9d8cc0b81f4961ec", optional = true }
 rusty_regx = { git = "https://github.com/baileyrd/rusty_regx", rev = "93c5541d6713750141476c87d6cd774629e1ae3a" }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
 sqlite-vec = "0.1.9"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 

@@ -5,6 +5,54 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Import a knowledge-mcp SQLite database
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `knowledge_mcp_import::import_knowledge_mcp_db` (closes
+  [rusty_knowledge#38](https://github.com/Rusty-Mill/rusty_knowledge/issues/38))
+  — reads a `knowledge-mcp` (Python) SQLite file and translates its rows
+  into this crate's existing `store::insert_*` functions. The two schemas
+  aren't on-disk compatible (different column sets, `layer_num` INTEGER vs
+  `AuthorityLayer` TEXT, no shared `rules` table design), so this is a
+  row-by-row translation, not a raw file open — see the design discussion
+  on #38 for the full schema comparison.
+- **Added:** an optional `KNOWLEDGE_MCP_IMPORT_PATH` startup env var —
+  when set, imports that file on top of the seeded demo data before the
+  server starts serving. Omit it and nothing changes from today's
+  seed-data-only behavior.
+- **New dependency:** `serde_json`, for parsing `machine_rule`'s JSON
+  column — added after explicit sign-off (this crate previously had no
+  JSON dependency, only `serde` itself).
+- **Deliberately not imported:**
+  - `knowledge_fts` — confirmed redundant by reading `knowledge-mcp`'s own
+    ingestion pipeline: its `"rule"` rows are copies of `rules.rule_text`,
+    its `"definition"` rows are copies of `constructs.description`.
+    `insert_rule` already rebuilds `rules_fts` the normal way.
+  - `valid_relationships` — `knowledge-mcp` has no declared-rule table for
+    this at all; its `lookup.valid_relationships` infers validity from
+    relationship instances, which is exactly what `RM-KNOWLEDGE-MODEL-0004`
+    requires `rusty_knowledge` not to do. Left empty on import, disclosed
+    in the returned `ImportReport`.
+  - `properties`, `domain_layers`, `ingestion_log`, `schema_version` — no
+    `rusty_knowledge` equivalent.
+- **Added:** `store::insert_construct_embedding`, for pre-existing vectors
+  from an import (distinct from `build_construct_embeddings`, which only
+  generates fresh ones via an `Embedder`).
+- **`ImportReport`** carries per-table counts plus every dropped column,
+  unmapped value, or unimportable row as a human-readable disclosure —
+  never a silent partial import. A row that fails to translate at all
+  (e.g. an unrecognized `layer_num`) is skipped and disclosed; a row that
+  imports but loses a field along the way (e.g. a rule whose
+  `machine_rule` didn't parse) still counts as imported, with the drop
+  noted separately.
+- 8 new tests: happy path across every table; a construct's `short_name`
+  falling back to `name` when null; a rule with an unrecognized
+  `layer_num`/`rule_type` (skipped, disclosed); a rule whose `machine_rule`
+  is unparseable JSON or names an unsupported check kind (`"custom"`) --
+  both still import the rule itself, just without a `MachineRule` attached;
+  a relationship with a null `rule_type` (defaults to `MAY`, disclosed); a
+  conflict with an unrecognized `layer_a`/`layer_b`.
+
 ## PR #36 — Wire sqlite-vec vec0 table into search
 **2026-08-12** · [#36](https://github.com/Rusty-Mill/rusty_knowledge/pull/36)
 
