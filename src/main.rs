@@ -11,9 +11,10 @@
 //! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
 //! `meta_routing_guide`, `lookup_construct`, `lookup_rules`,
 //! `lookup_relationships`, `lookup_valid_relationships`,
-//! `lookup_domain_summary`, and `validate_element` (required-property,
+//! `lookup_domain_summary`, `validate_element` (required-property,
 //! enum-value, range, and pattern machine checks -- pattern matching via
-//! `rusty_regx`, a zero-dependency in-ecosystem regex engine).
+//! `rusty_regx`, a zero-dependency in-ecosystem regex engine), and
+//! `validate_relationship`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -146,6 +147,18 @@ struct ValidateElementParams {
     /// The element's properties (name -> value) to validate.
     #[serde(default)]
     properties: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateRelationshipParams {
+    /// Domain both constructs belong to, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The source construct's short name or ID.
+    from_construct_ref: String,
+    /// The target construct's short name or ID.
+    to_construct_ref: String,
+    /// The relationship type to validate, e.g. "records".
+    relationship_type: String,
 }
 
 #[derive(Clone)]
@@ -571,6 +584,77 @@ impl KnowledgeServer {
             findings.len() - fail_count - warning_count,
         )
     }
+
+    #[tool(
+        description = "Validate whether a relationship type between two constructs is permitted, according to the domain's recorded relationships. VALID if at least one matching relationship is recorded; INVALID otherwise."
+    )]
+    fn validate_relationship(
+        &self,
+        Parameters(ValidateRelationshipParams {
+            domain_id,
+            from_construct_ref,
+            to_construct_ref,
+            relationship_type,
+        }): Parameters<ValidateRelationshipParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let from_construct = match store::resolve_construct(&conn, &domain_id, &from_construct_ref)
+        {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!(
+                    "Source construct {from_construct_ref:?} not found in domain {domain_id:?}."
+                );
+            }
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+        let to_construct = match store::resolve_construct(&conn, &domain_id, &to_construct_ref) {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!(
+                    "Target construct {to_construct_ref:?} not found in domain {domain_id:?}."
+                );
+            }
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        let rels = match store::relationships_from(
+            &conn,
+            &from_construct.id,
+            Some(&to_construct.id),
+            Some(&relationship_type),
+        ) {
+            Ok(rels) => rels,
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        if rels.is_empty() {
+            return format!(
+                "INVALID: no recorded rule permits {relationship_type:?} from {} to {}.",
+                from_construct.short_name, to_construct.short_name
+            );
+        }
+
+        let matches_block = rels
+            .iter()
+            .map(|r| {
+                format!(
+                    "  [{}] {} (cardinality: {})",
+                    r.layer.as_str(),
+                    r.relationship_type,
+                    r.cardinality
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "VALID: {} matching rule(s) permit {relationship_type:?} from {} to {}:\n{matches_block}",
+            rels.len(),
+            from_construct.short_name,
+            to_construct.short_name
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -600,7 +684,8 @@ async fn main() -> anyhow::Result<()> {
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
-         lookup_valid_relationships, lookup_domain_summary, validate_element)"
+         lookup_valid_relationships, lookup_domain_summary, validate_element, \
+         validate_relationship)"
     );
 
     let server = KnowledgeServer {
@@ -1002,5 +1087,56 @@ mod tests {
             )]),
         }));
         assert!(response.contains("overall: WARNING"));
+    }
+
+    #[test]
+    fn validate_relationship_recorded_relationship_is_valid() {
+        let server = test_server();
+        let response = server.validate_relationship(Parameters(ValidateRelationshipParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_construct_ref: "ConflictRegistryEntry".into(),
+            relationship_type: "records".into(),
+        }));
+        assert!(response.starts_with("VALID"));
+        assert!(response.contains("records"));
+    }
+
+    #[test]
+    fn validate_relationship_unrecorded_type_is_invalid() {
+        let server = test_server();
+        let response = server.validate_relationship(Parameters(ValidateRelationshipParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_construct_ref: "ConflictRegistryEntry".into(),
+            relationship_type: "supersedes".into(),
+        }));
+        assert!(response.starts_with("INVALID"));
+    }
+
+    #[test]
+    fn validate_relationship_wrong_direction_is_invalid() {
+        let server = test_server();
+        // The seeded relationship is AuthorityGrant -> ConflictRegistryEntry,
+        // not the reverse.
+        let response = server.validate_relationship(Parameters(ValidateRelationshipParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "ConflictRegistryEntry".into(),
+            to_construct_ref: "AuthorityGrant".into(),
+            relationship_type: "records".into(),
+        }));
+        assert!(response.starts_with("INVALID"));
+    }
+
+    #[test]
+    fn validate_relationship_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.validate_relationship(Parameters(ValidateRelationshipParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "DoesNotExist".into(),
+            to_construct_ref: "ConflictRegistryEntry".into(),
+            relationship_type: "records".into(),
+        }));
+        assert!(response.contains("not found"));
     }
 }

@@ -5,6 +5,20 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement validate.relationship
+**2026-08-12**
+
+- **Added:** `validate_relationship` MCP tool (closes
+  [rusty_knowledge#10](https://github.com/Rusty-Mill/rusty_knowledge/issues/10)) —
+  VALID if at least one recorded relationship matches the given source
+  construct, target construct, and relationship type; INVALID otherwise.
+- **No new store schema** — `knowledge-mcp`'s `validate.relationship` calls
+  the exact same store query as its `lookup.relationships` (both keyed by
+  specific construct instances, not types), so this reuses
+  `relationships_from` and `resolve_construct` from #6 as-is.
+- 4 new tests (recorded relationship is valid, unrecorded type is invalid,
+  wrong direction is invalid, unknown construct reports not found).
+
 ## PR #27 — Implement validate.element
 **2026-08-12** · [#27](https://github.com/Rusty-Mill/rusty_knowledge/pull/27)
 
