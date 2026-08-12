@@ -134,12 +134,8 @@ pub struct Rule {
 }
 
 /// A typed, directional link between two constructs in the same domain.
-// Not read from yet outside tests -- the tools that query relationships
-// (lookup.relationships, lookup.valid_relationships, crosscut.traceability;
-// rusty_knowledge#6/#7/#13) land in later, separately-scoped issues. This
-// type and `insert_relationship` exist now so the schema and its round-trip
-// are proven ahead of those tools, not unused/abandoned code.
-#[allow(dead_code)]
+/// Queried by `lookup_relationships`; `lookup.valid_relationships` and
+/// `crosscut.traceability` (rusty_knowledge#7/#13) land in later issues.
 pub struct Relationship {
     pub id: String,
     pub domain_id: String,
@@ -319,9 +315,6 @@ pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
     Ok(())
 }
 
-// See `Relationship`'s doc comment: exercised by tests today, by
-// relationship-querying tools (rusty_knowledge#6/#7/#13) next.
-#[allow(dead_code)]
 pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO relationships
@@ -338,6 +331,43 @@ pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::R
         ),
     )?;
     Ok(())
+}
+
+/// Relationships originating from one construct, optionally narrowed to a
+/// specific target construct and/or relationship type. Unlike
+/// `knowledge-mcp`'s `lookup.relationships` (which silently drops an
+/// unresolvable `to_construct_ref` filter rather than erroring), an
+/// unresolvable `to_construct_id` here is the caller's job to resolve first
+/// -- this function takes an already-resolved ID, not a ref string.
+pub fn relationships_from(
+    conn: &Connection,
+    from_construct_id: &str,
+    to_construct_id: Option<&str>,
+    relationship_type: Option<&str>,
+) -> rusqlite::Result<Vec<Relationship>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer
+         FROM relationships
+         WHERE from_construct_id = ?1
+           AND (?2 IS NULL OR to_construct_id = ?2)
+           AND (?3 IS NULL OR relationship_type = ?3)",
+    )?;
+    let rows = stmt.query_map(
+        (from_construct_id, to_construct_id, relationship_type),
+        |row| {
+            let layer_text: String = row.get(6)?;
+            Ok(Relationship {
+                id: row.get(0)?,
+                domain_id: row.get(1)?,
+                from_construct_id: row.get(2)?,
+                to_construct_id: row.get(3)?,
+                relationship_type: row.get(4)?,
+                cardinality: row.get(5)?,
+                layer: AuthorityLayer::from_str(&layer_text),
+            })
+        },
+    )?;
+    rows.collect()
 }
 
 /// How a search response was produced. `RM-KNOWLEDGE-MODEL-0005` requires
@@ -515,6 +545,19 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    insert_relationship(
+        conn,
+        &Relationship {
+            id: "uaf-1.3:AuthorityGrant-records-ConflictRegistryEntry".into(),
+            domain_id: "uaf-1.3".into(),
+            from_construct_id: "uaf-1.3:AuthorityGrant".into(),
+            to_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
+            relationship_type: "records".into(),
+            cardinality: "0..*".into(),
+            layer: AuthorityLayer::Standard,
+        },
+    )?;
+
     Ok(())
 }
 
@@ -549,28 +592,47 @@ mod tests {
     }
 
     #[test]
-    fn insert_relationship_round_trips() {
+    fn relationships_from_returns_seeded_relationship() {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        insert_relationship(
+        let rels = relationships_from(&conn, "uaf-1.3:AuthorityGrant", None, None).unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].to_construct_id, "uaf-1.3:ConflictRegistryEntry");
+        assert_eq!(rels[0].relationship_type, "records");
+    }
+
+    #[test]
+    fn relationships_from_filters_by_to_construct_and_type() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rels = relationships_from(
             &conn,
-            &Relationship {
-                id: "rel-1".into(),
-                domain_id: "uaf-1.3".into(),
-                from_construct_id: "uaf-1.3:AuthorityGrant".into(),
-                to_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
-                relationship_type: "records".into(),
-                cardinality: "0..*".into(),
-                layer: AuthorityLayer::Standard,
-            },
+            "uaf-1.3:AuthorityGrant",
+            Some("uaf-1.3:ConflictRegistryEntry"),
+            Some("records"),
         )
         .unwrap();
+        assert_eq!(rels.len(), 1);
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM relationships", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
+        let none = relationships_from(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            None,
+            Some("does-not-exist"),
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn relationships_from_construct_with_no_relationships_is_empty() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rels = relationships_from(&conn, "data-mesh:DataProduct", None, None).unwrap();
+        assert!(rels.is_empty());
     }
 
     #[test]

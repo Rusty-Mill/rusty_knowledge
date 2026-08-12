@@ -5,6 +5,28 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement lookup.relationships
+**2026-08-12**
+
+- **Added:** `lookup_relationships` MCP tool (closes
+  [rusty_knowledge#6](https://github.com/Rusty-Mill/rusty_knowledge/issues/6)) —
+  relationships from a construct, with cardinality and layer provenance,
+  optionally narrowed to a target construct and/or relationship type.
+- **Added:** `relationships_from` query in `store.rs`; `insert_relationship`
+  and `Relationship` are no longer `#[allow(dead_code)]` now that a real tool
+  consumes them. Seed data gains one real relationship
+  (`AuthorityGrant --records--> ConflictRegistryEntry`) instead of only the
+  test-only ad hoc row from the previous PR.
+- **Deliberately different from `knowledge-mcp`:** an unresolvable
+  `to_construct_ref` is a tool error here, not a silently dropped filter —
+  `knowledge-mcp`'s Python `lookup.relationships` falls back to unfiltered
+  results if the target ref doesn't resolve, which reads as a bug worth not
+  replicating rather than a behavior to preserve for parity's own sake.
+- 5 new tool-level tests plus 3 new store-level tests (seeded relationship
+  returned, `to_construct_ref`/`relationship_type` filtering, empty result
+  for a construct with none, unresolvable-ref error path, unknown
+  `from_construct_ref` error path).
+
 ## PR #23 — Implement lookup.rules
 **2026-08-12** · [#23](https://github.com/Rusty-Mill/rusty_knowledge/pull/23)
 

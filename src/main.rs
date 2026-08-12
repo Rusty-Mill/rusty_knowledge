@@ -9,7 +9,8 @@
 //!
 //! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
 //! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
-//! `meta_routing_guide`, `lookup_construct`, and `lookup_rules`.
+//! `meta_routing_guide`, `lookup_construct`, `lookup_rules`, and
+//! `lookup_relationships`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -96,6 +97,22 @@ struct RulesLookupParams {
     /// "MUST_NOT"). Omit for all types.
     #[serde(default)]
     rule_type: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RelationshipsLookupParams {
+    /// Domain both constructs belong to, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The source construct's short name or ID.
+    from_construct_ref: String,
+    /// Restrict to relationships targeting this construct (short name or
+    /// ID). Unlike `knowledge-mcp`, an unresolvable reference here is an
+    /// error, not a silently dropped filter.
+    #[serde(default)]
+    to_construct_ref: Option<String>,
+    /// Restrict to one relationship type (e.g. "records"). Omit for all types.
+    #[serde(default)]
+    relationship_type: Option<String>,
 }
 
 #[derive(Clone)]
@@ -269,6 +286,82 @@ impl KnowledgeServer {
             rules.len()
         )
     }
+
+    #[tool(
+        description = "Get relationships from a construct -- what it connects to, with cardinality and layer provenance. Optionally narrowed to a target construct and/or relationship type."
+    )]
+    fn lookup_relationships(
+        &self,
+        Parameters(RelationshipsLookupParams {
+            domain_id,
+            from_construct_ref,
+            to_construct_ref,
+            relationship_type,
+        }): Parameters<RelationshipsLookupParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let from_construct = match store::resolve_construct(&conn, &domain_id, &from_construct_ref)
+        {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!(
+                    "Construct {from_construct_ref:?} not found in domain {domain_id:?}."
+                );
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let to_id = match to_construct_ref {
+            Some(ref to_ref) => match store::resolve_construct(&conn, &domain_id, to_ref) {
+                Ok(Some(construct)) => Some(construct.id),
+                Ok(None) => {
+                    return format!(
+                        "to_construct_ref {to_ref:?} not found in domain {domain_id:?}."
+                    );
+                }
+                Err(err) => return format!("Lookup failed: {err}"),
+            },
+            None => None,
+        };
+
+        let rels = match store::relationships_from(
+            &conn,
+            &from_construct.id,
+            to_id.as_deref(),
+            relationship_type.as_deref(),
+        ) {
+            Ok(rels) => rels,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if rels.is_empty() {
+            return format!(
+                "No relationships found from {} ({}).",
+                from_construct.short_name, from_construct.id
+            );
+        }
+
+        let rels_block = rels
+            .iter()
+            .map(|r| {
+                format!(
+                    "  [{}] --{}--> {} (cardinality: {})",
+                    r.layer.as_str(),
+                    r.relationship_type,
+                    r.to_construct_id,
+                    r.cardinality
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} ({}) -- {} relationship(s):\n{rels_block}",
+            from_construct.short_name,
+            from_construct.id,
+            rels.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -297,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
-         meta_routing_guide, lookup_construct, lookup_rules)"
+         meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships)"
     );
 
     let server = KnowledgeServer {
@@ -483,6 +576,68 @@ mod tests {
             construct_ref: "DoesNotExist".into(),
             layer: None,
             rule_type: None,
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn lookup_relationships_returns_seeded_relationship() {
+        let server = test_server();
+        let response = server.lookup_relationships(Parameters(RelationshipsLookupParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_construct_ref: None,
+            relationship_type: None,
+        }));
+        assert!(response.contains("1 relationship(s)"));
+        assert!(response.contains("records"));
+        assert!(response.contains("ConflictRegistryEntry"));
+    }
+
+    #[test]
+    fn lookup_relationships_filters_by_to_construct_ref() {
+        let server = test_server();
+        let response = server.lookup_relationships(Parameters(RelationshipsLookupParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_construct_ref: Some("ConflictRegistryEntry".into()),
+            relationship_type: None,
+        }));
+        assert!(response.contains("1 relationship(s)"));
+    }
+
+    #[test]
+    fn lookup_relationships_unresolvable_to_ref_is_an_error_not_silently_dropped() {
+        let server = test_server();
+        let response = server.lookup_relationships(Parameters(RelationshipsLookupParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "AuthorityGrant".into(),
+            to_construct_ref: Some("DoesNotExist".into()),
+            relationship_type: None,
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn lookup_relationships_no_relationships_reports_empty() {
+        let server = test_server();
+        let response = server.lookup_relationships(Parameters(RelationshipsLookupParams {
+            domain_id: "data-mesh".into(),
+            from_construct_ref: "DataProduct".into(),
+            to_construct_ref: None,
+            relationship_type: None,
+        }));
+        assert!(response.contains("No relationships found"));
+    }
+
+    #[test]
+    fn lookup_relationships_unknown_from_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.lookup_relationships(Parameters(RelationshipsLookupParams {
+            domain_id: "uaf-1.3".into(),
+            from_construct_ref: "DoesNotExist".into(),
+            to_construct_ref: None,
+            relationship_type: None,
         }));
         assert!(response.contains("not found"));
     }
