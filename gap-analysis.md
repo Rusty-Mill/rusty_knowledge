@@ -7,10 +7,12 @@
 > `baileyrd/rusty_embedder`). This file is kept as the historical record of
 > the original assessment — see the **Status** column added to each row and
 > the notes below rather than treating the narrative prose above each table
-> as still-current. One new gap not covered by the original assessment
-> (`knowledge-mcp` SQLite import, #38) was discovered afterward and remains
-> open; it isn't part of this file's original scope, so it isn't re-added to
-> the table below — track it directly via the issue.
+> as still-current. New gaps not covered by the original assessment surfaced
+> afterward and are tracked directly via their issues, not re-added to the
+> table below: a `knowledge-mcp` SQLite importer (#38), a configurable/
+> persistent store path (#41), and a valid-relationship candidate-suggestion
+> tool (#43) — all closed. `RuleType` still has no equivalent for
+> `knowledge-mcp`'s `RECOMMENDED`/`FORBIDDEN` rule types (#46) — open.
 
 Assessment path: **spec** (path 3 — no `cargo public-api`-diffable surface exists
 because the reference, `baileyrd/knowledge-mcp`, is Python; extracted directly from
