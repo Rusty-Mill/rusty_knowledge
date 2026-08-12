@@ -134,8 +134,7 @@ pub struct Rule {
 }
 
 /// A typed, directional link between two constructs in the same domain.
-/// Queried by `lookup_relationships`; `crosscut.traceability`
-/// (rusty_knowledge#13) lands in a later issue.
+/// Queried by `lookup_relationships` and `crosscut_traceability`.
 ///
 /// `rule_type` mirrors `Rule`'s: `knowledge-mcp`'s completeness check
 /// (`validate.completeness`) treats a `MUST`/`SHALL` relationship as a
@@ -164,6 +163,23 @@ pub struct ValidRelationshipRule {
     pub to_type: String,
     pub relationship_type: String,
     pub cardinality: String,
+}
+
+/// A conflict-registry entry: an explicitly documented place where two
+/// authority layers disagree, and how that disagreement is resolved.
+/// `construct_id: None` marks a domain-level conflict rather than one tied
+/// to a specific construct.
+pub struct Conflict {
+    pub id: String,
+    pub domain_id: String,
+    pub construct_id: Option<String>,
+    pub layer_a: AuthorityLayer,
+    pub layer_b: AuthorityLayer,
+    pub conflict_type: String,
+    pub description: String,
+    pub resolution: String,
+    pub rationale: Option<String>,
+    pub review_date: Option<String>,
 }
 
 /// A structured, machine-checkable rule attached to a `Rule` row, matching
@@ -363,6 +379,18 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              relationship_type TEXT NOT NULL,
              cardinality       TEXT NOT NULL,
              PRIMARY KEY (domain_id, from_type, to_type, relationship_type)
+         );
+         CREATE TABLE conflicts (
+             id            TEXT PRIMARY KEY,
+             domain_id     TEXT NOT NULL REFERENCES domains(id),
+             construct_id  TEXT REFERENCES constructs(id),
+             layer_a       TEXT NOT NULL,
+             layer_b       TEXT NOT NULL,
+             conflict_type TEXT NOT NULL,
+             description   TEXT NOT NULL,
+             resolution    TEXT NOT NULL,
+             rationale     TEXT,
+             review_date   TEXT
          );
          CREATE TABLE rule_machine_checks (
              -- No FOREIGN KEY to rules_fts(rowid): SQLite doesn't support FK
@@ -861,6 +889,62 @@ pub fn valid_relationships_between(
     rows.collect()
 }
 
+pub fn insert_conflict(conn: &Connection, conflict: &Conflict) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO conflicts
+             (id, domain_id, construct_id, layer_a, layer_b, conflict_type, description, resolution, rationale, review_date)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        (
+            &conflict.id,
+            &conflict.domain_id,
+            &conflict.construct_id,
+            conflict.layer_a.as_str(),
+            conflict.layer_b.as_str(),
+            &conflict.conflict_type,
+            &conflict.description,
+            &conflict.resolution,
+            &conflict.rationale,
+            &conflict.review_date,
+        ),
+    )?;
+    Ok(())
+}
+
+/// Conflict-registry entries for a domain, optionally narrowed to one
+/// construct. Matching `knowledge-mcp`'s `get_conflicts`: when a
+/// `construct_id` is given, this returns both that construct's own
+/// conflicts *and* the domain's construct-independent (`construct_id IS
+/// NULL`) ones -- a domain-level conflict is relevant no matter which
+/// construct you asked about.
+pub fn conflicts_for(
+    conn: &Connection,
+    domain_id: &str,
+    construct_id: Option<&str>,
+) -> rusqlite::Result<Vec<Conflict>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain_id, construct_id, layer_a, layer_b, conflict_type, description, resolution, rationale, review_date
+         FROM conflicts
+         WHERE domain_id = ?1 AND (?2 IS NULL OR construct_id = ?2 OR construct_id IS NULL)",
+    )?;
+    let rows = stmt.query_map((domain_id, construct_id), |row| {
+        let layer_a_text: String = row.get(3)?;
+        let layer_b_text: String = row.get(4)?;
+        Ok(Conflict {
+            id: row.get(0)?,
+            domain_id: row.get(1)?,
+            construct_id: row.get(2)?,
+            layer_a: AuthorityLayer::from_str(&layer_a_text),
+            layer_b: AuthorityLayer::from_str(&layer_b_text),
+            conflict_type: row.get(5)?,
+            description: row.get(6)?,
+            resolution: row.get(7)?,
+            rationale: row.get(8)?,
+            review_date: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// How a search response was produced. `RM-KNOWLEDGE-MODEL-0005` requires
 /// this be declared on every search response, not silently omitted or
 /// substituted -- there is deliberately no `Default` impl, so a caller can't
@@ -1080,6 +1164,28 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             to_type: "entity".into(),
             relationship_type: "records".into(),
             cardinality: "0..*".into(),
+        },
+    )?;
+
+    // Documents the exact contradiction the two AuthorityGrant rules above
+    // already imply: Standard requires expiry, Conventions tolerates
+    // omitting it. This is what a ConflictRegistryEntry (the construct these
+    // rules reference) exists to record.
+    insert_conflict(
+        conn,
+        &Conflict {
+            id: "uaf-1.3:AuthorityGrant-standard-vs-conventions-expiry".into(),
+            domain_id: "uaf-1.3".into(),
+            construct_id: Some("uaf-1.3:AuthorityGrant".into()),
+            layer_a: AuthorityLayer::Standard,
+            layer_b: AuthorityLayer::Conventions,
+            conflict_type: "contradiction".into(),
+            description: "Standard requires every AuthorityGrant to declare an explicit expiry; \
+                          convention in practice omits it for internal-only grants."
+                .into(),
+            resolution: "Standard wins: expiry is required regardless of convention.".into(),
+            rationale: Some("Ungoverned indefinite grants are a security risk.".into()),
+            review_date: Some("2027-01-01".into()),
         },
     )?;
 
@@ -1541,5 +1647,67 @@ mod tests {
         // every response is lexical-only, and this test pins that down.
         let (_, mode) = search_scoped(&conn, "AuthorityGrant", None, None).unwrap();
         assert_eq!(mode, RetrievalMode::LexicalOnly);
+    }
+
+    #[test]
+    fn conflicts_for_returns_seeded_conflict() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let conflicts = conflicts_for(&conn, "uaf-1.3", None).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].conflict_type, "contradiction");
+        assert_eq!(
+            conflicts[0].construct_id.as_deref(),
+            Some("uaf-1.3:AuthorityGrant")
+        );
+    }
+
+    #[test]
+    fn conflicts_for_returns_construct_level_and_domain_level() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // A second, domain-level conflict on top of the seeded
+        // construct-level one.
+        insert_conflict(
+            &conn,
+            &Conflict {
+                id: "conflict-domain-wide".into(),
+                domain_id: "uaf-1.3".into(),
+                construct_id: None,
+                layer_a: AuthorityLayer::Standard,
+                layer_b: AuthorityLayer::Process,
+                conflict_type: "gap".into(),
+                description: "Domain-wide gap between spec and process.".into(),
+                resolution: "Process to be updated.".into(),
+                rationale: None,
+                review_date: None,
+            },
+        )
+        .unwrap();
+
+        // Unscoped: both conflicts for the domain.
+        let all = conflicts_for(&conn, "uaf-1.3", None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Scoped to the construct with its own conflict: both apply.
+        let scoped = conflicts_for(&conn, "uaf-1.3", Some("uaf-1.3:AuthorityGrant")).unwrap();
+        assert_eq!(scoped.len(), 2);
+
+        // Scoped to a construct with no conflicts of its own: only the
+        // domain-level one still applies.
+        let other = conflicts_for(&conn, "uaf-1.3", Some("uaf-1.3:ConflictRegistryEntry")).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].id, "conflict-domain-wide");
+    }
+
+    #[test]
+    fn conflicts_for_domain_with_no_conflicts_is_empty() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let none = conflicts_for(&conn, "data-mesh", None).unwrap();
+        assert!(none.is_empty());
     }
 }

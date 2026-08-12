@@ -15,14 +15,14 @@
 //! enum-value, range, and pattern machine checks -- pattern matching via
 //! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
 //! `validate_relationship`, `validate_completeness`, `search_constructs`,
-//! and `crosscut_traceability`.
+//! `crosscut_traceability`, and `crosscut_conflicts` (the layered-authority
+//! conflict registry, RK-002).
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
-//! since that's rmcp's simplest documented starting point), the
-//! layered-authority conflict registry (RK-002), or hybrid vector
-//! retrieval in the tool surface itself (RK-004's vec0 table exists in
-//! the store but isn't queried by this tool yet). Each is a candidate
-//! for a later slice, not silently dropped.
+//! since that's rmcp's simplest documented starting point), or hybrid
+//! vector retrieval in the tool surface itself (RK-004's vec0 table exists
+//! in the store but isn't queried by this tool yet). A candidate for a
+//! later slice, not silently dropped.
 
 mod store;
 
@@ -192,6 +192,18 @@ struct TraceabilityParams {
     /// false (MUST/SHALL only), matching `knowledge-mcp`.
     #[serde(default)]
     include_optional: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ConflictsParams {
+    /// Domain to check, e.g. "uaf-1.3".
+    domain_id: String,
+    /// Narrow to conflicts affecting one construct (its own conflicts plus
+    /// domain-level ones). Omit for all conflicts in the domain. Unlike
+    /// `knowledge-mcp`, an unresolvable reference here is an error, not a
+    /// silently dropped filter.
+    #[serde(default)]
+    construct_ref: Option<String>,
 }
 
 #[derive(Clone)]
@@ -861,6 +873,68 @@ impl KnowledgeServer {
             format_side(&incoming, |r| &r.from_construct_id),
         )
     }
+
+    #[tool(
+        description = "Get conflict registry entries for a domain or specific construct -- where authority layers disagree and how conflicts are resolved."
+    )]
+    fn crosscut_conflicts(
+        &self,
+        Parameters(ConflictsParams {
+            domain_id,
+            construct_ref,
+        }): Parameters<ConflictsParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let construct_id = match construct_ref {
+            Some(ref construct_ref) => {
+                match store::resolve_construct(&conn, &domain_id, construct_ref) {
+                    Ok(Some(construct)) => Some(construct.id),
+                    Ok(None) => {
+                        return format!(
+                            "Construct {construct_ref:?} not found in domain {domain_id:?}."
+                        );
+                    }
+                    Err(err) => return format!("Lookup failed: {err}"),
+                }
+            }
+            None => None,
+        };
+
+        let conflicts = match store::conflicts_for(&conn, &domain_id, construct_id.as_deref()) {
+            Ok(conflicts) => conflicts,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if conflicts.is_empty() {
+            return format!("No conflicts recorded for domain {domain_id:?}.");
+        }
+
+        let conflicts_block = conflicts
+            .iter()
+            .map(|c| {
+                let rationale = c
+                    .rationale
+                    .as_deref()
+                    .map(|r| format!("; rationale: {r}"))
+                    .unwrap_or_default();
+                format!(
+                    "  [{}] {}: {} vs {} -- {} (resolution: {}{rationale})",
+                    c.conflict_type,
+                    c.construct_id.as_deref().unwrap_or("domain-wide"),
+                    c.layer_a.as_str(),
+                    c.layer_b.as_str(),
+                    c.description,
+                    c.resolution,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} conflict(s) for domain {domain_id:?}:\n{conflicts_block}",
+            conflicts.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -870,14 +944,15 @@ impl KnowledgeServer {
 /// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
 /// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#14-#16):\n\
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#15-#16):\n\
      - \"I can't find the right construct\" -> search_knowledge, search_constructs\n\
      - \"What does X mean?\" -> lookup_construct\n\
      - \"What should X be named/styled?\" -> lookup_rules (layer=Conventions)\n\
      - \"Who owns X / when is X due?\" -> lookup_rules (layer=Process)\n\
      - \"Is X valid/conformant?\" -> validate_element, validate_relationship\n\
      - \"Is this model/viewpoint complete?\" -> validate_completeness\n\
-     - \"Does X trace to Y?\" -> crosscut_traceability"
+     - \"Does X trace to Y?\" -> crosscut_traceability\n\
+     - \"Where do layers disagree?\" -> crosscut_conflicts"
         .to_string()
 }
 
@@ -895,7 +970,7 @@ async fn main() -> anyhow::Result<()> {
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
          validate_relationship, validate_completeness, search_constructs, \
-         crosscut_traceability)"
+         crosscut_traceability, crosscut_conflicts)"
     );
 
     let server = KnowledgeServer {
@@ -921,8 +996,9 @@ mod tests {
         assert!(guide.contains("validate_relationship"));
         assert!(guide.contains("validate_completeness"));
         assert!(guide.contains("crosscut_traceability"));
+        assert!(guide.contains("crosscut_conflicts"));
         // These tools don't exist yet -- the guide must not claim they do.
-        for not_yet_implemented in ["crosscut_conflicts", "meta_list_domains"] {
+        for not_yet_implemented in ["crosscut_cross_domain", "meta_list_domains"] {
             assert!(!guide.contains(not_yet_implemented));
         }
     }
@@ -1525,6 +1601,87 @@ mod tests {
             domain_id: "uaf-1.3".into(),
             construct_ref: "DoesNotExist".into(),
             include_optional: false,
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    fn insert_test_conflict(server: &KnowledgeServer, id: &str, construct_id: Option<&str>) {
+        let conn = server.conn.lock().unwrap();
+        store::insert_conflict(
+            &conn,
+            &store::Conflict {
+                id: id.into(),
+                domain_id: "uaf-1.3".into(),
+                construct_id: construct_id.map(String::from),
+                layer_a: AuthorityLayer::Standard,
+                layer_b: AuthorityLayer::Conventions,
+                conflict_type: "contradiction".into(),
+                description: "Standard requires expiry; convention allows omitting it.".into(),
+                resolution: "Standard wins.".into(),
+                rationale: Some("Safety-critical.".into()),
+                review_date: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn crosscut_conflicts_reports_seeded_conflict() {
+        let server = test_server();
+        let response = server.crosscut_conflicts(Parameters(ConflictsParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: None,
+        }));
+        assert!(response.contains("1 conflict(s)"));
+        assert!(response.contains("uaf-1.3:AuthorityGrant"));
+        assert!(response.contains("contradiction"));
+    }
+
+    #[test]
+    fn crosscut_conflicts_lists_construct_and_domain_level() {
+        let server = test_server();
+        insert_test_conflict(&server, "conflict-domain-wide", None);
+
+        let response = server.crosscut_conflicts(Parameters(ConflictsParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: None,
+        }));
+        // Seeded construct-level conflict, plus the new domain-level one.
+        assert!(response.contains("2 conflict(s)"));
+        assert!(response.contains("domain-wide"));
+    }
+
+    #[test]
+    fn crosscut_conflicts_construct_filter_includes_domain_level() {
+        let server = test_server();
+        insert_test_conflict(&server, "conflict-domain-wide", None);
+
+        let response = server.crosscut_conflicts(Parameters(ConflictsParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: Some("ConflictRegistryEntry".into()),
+        }));
+        // No conflict of its own, but the domain-level one still applies.
+        assert!(response.contains("1 conflict(s)"));
+        assert!(response.contains("domain-wide"));
+    }
+
+    #[test]
+    fn crosscut_conflicts_no_conflicts_reports_none() {
+        let server = test_server();
+        // data-mesh has no seeded conflicts, unlike uaf-1.3.
+        let response = server.crosscut_conflicts(Parameters(ConflictsParams {
+            domain_id: "data-mesh".into(),
+            construct_ref: None,
+        }));
+        assert!(response.contains("No conflicts recorded"));
+    }
+
+    #[test]
+    fn crosscut_conflicts_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.crosscut_conflicts(Parameters(ConflictsParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: Some("DoesNotExist".into()),
         }));
         assert!(response.contains("not found"));
     }
