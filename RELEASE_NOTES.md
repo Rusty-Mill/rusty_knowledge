@@ -5,6 +5,25 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #23 — Implement lookup.rules
+**2026-08-12** · [#23](https://github.com/Rusty-Mill/rusty_knowledge/pull/23)
+
+- **Added:** `lookup_rules` MCP tool (closes
+  [rusty_knowledge#5](https://github.com/Rusty-Mill/rusty_knowledge/issues/5)) —
+  rules for a construct, filterable by authority layer and/or rule type
+  (MUST/SHALL/SHOULD/MAY/MUST_NOT).
+- **Added:** `RuleType` enum (mirrors `AuthorityLayer`'s trusted-storage
+  `from_str` / untrusted-input `parse` split) and a `rule_type` field on
+  `Rule`; `rules_fts` gained a `rule_type` UNINDEXED column. Seed data now
+  assigns a rule type to each of the 4 existing rules based on their actual
+  text, not arbitrarily.
+- **Refactored:** the layer-filter-parsing block was duplicated three times
+  across `search_knowledge`, `lookup_construct`, and now `lookup_rules` —
+  factored into shared `parse_layer_filter`/`parse_rule_type_filter`
+  functions rather than copy-pasting a fourth time. No behavior change.
+- 4 new tests (all rules for a construct, combined layer+rule_type filter,
+  unknown rule_type error path, unknown construct).
+
 ## PR #22 — Implement lookup.construct
 **2026-08-12** · [#22](https://github.com/Rusty-Mill/rusty_knowledge/pull/22)
 

@@ -74,6 +74,53 @@ pub struct Construct {
     pub description: String,
 }
 
+/// A rule's normative strength, matching `knowledge-mcp`'s five rule types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleType {
+    Must,
+    Shall,
+    Should,
+    May,
+    MustNot,
+}
+
+impl RuleType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleType::Must => "MUST",
+            RuleType::Shall => "SHALL",
+            RuleType::Should => "SHOULD",
+            RuleType::May => "MAY",
+            RuleType::MustNot => "MUST_NOT",
+        }
+    }
+
+    fn from_str(text: &str) -> Self {
+        match text {
+            "MUST" => RuleType::Must,
+            "SHALL" => RuleType::Shall,
+            "SHOULD" => RuleType::Should,
+            "MAY" => RuleType::May,
+            "MUST_NOT" => RuleType::MustNot,
+            other => panic!("stored rule_type {other:?} is not one of the five known types"),
+        }
+    }
+
+    /// Fallible parse for untrusted input (e.g. an MCP tool caller's
+    /// rule_type filter) -- see `AuthorityLayer::parse`'s doc comment for
+    /// why this is kept separate from the trusted-storage `from_str` above.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "MUST" => Some(RuleType::Must),
+            "SHALL" => Some(RuleType::Shall),
+            "SHOULD" => Some(RuleType::Should),
+            "MAY" => Some(RuleType::May),
+            "MUST_NOT" => Some(RuleType::MustNot),
+            _ => None,
+        }
+    }
+}
+
 /// A single rule, always carrying its authority layer — RM-KNOWLEDGE-MODEL-0002.
 /// Scoped to the domain and construct it belongs to, so a query can be
 /// restricted to one domain without touching another's rules.
@@ -83,6 +130,7 @@ pub struct Rule {
     pub construct: String,
     pub text: String,
     pub layer: AuthorityLayer,
+    pub rule_type: RuleType,
 }
 
 /// A typed, directional link between two constructs in the same domain.
@@ -142,7 +190,8 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              construct_id UNINDEXED,
              construct,
              text,
-             layer UNINDEXED
+             layer UNINDEXED,
+             rule_type UNINDEXED
          );
          CREATE TABLE relationships (
              id                TEXT PRIMARY KEY,
@@ -220,40 +269,51 @@ fn construct_from_row(row: &rusqlite::Row) -> rusqlite::Result<Construct> {
     })
 }
 
-/// Rules attached to one construct, optionally filtered by authority layer.
+fn rule_from_row(row: &rusqlite::Row) -> rusqlite::Result<Rule> {
+    let layer_text: String = row.get(4)?;
+    let rule_type_text: String = row.get(5)?;
+    Ok(Rule {
+        domain_id: row.get(0)?,
+        construct_id: row.get(1)?,
+        construct: row.get(2)?,
+        text: row.get(3)?,
+        layer: AuthorityLayer::from_str(&layer_text),
+        rule_type: RuleType::from_str(&rule_type_text),
+    })
+}
+
+/// Rules attached to one construct, optionally filtered by authority layer
+/// and/or rule type (MUST/SHALL/SHOULD/MAY/MUST_NOT).
 pub fn rules_for_construct(
     conn: &Connection,
     construct_id: &str,
     layer: Option<AuthorityLayer>,
+    rule_type: Option<RuleType>,
 ) -> rusqlite::Result<Vec<Rule>> {
     let layer_str = layer.map(AuthorityLayer::as_str);
+    let rule_type_str = rule_type.map(RuleType::as_str);
     let mut stmt = conn.prepare(
-        "SELECT domain_id, construct_id, construct, text, layer
+        "SELECT domain_id, construct_id, construct, text, layer, rule_type
          FROM rules_fts
-         WHERE construct_id = ?1 AND (?2 IS NULL OR layer = ?2)",
+         WHERE construct_id = ?1
+           AND (?2 IS NULL OR layer = ?2)
+           AND (?3 IS NULL OR rule_type = ?3)",
     )?;
-    let rows = stmt.query_map((construct_id, layer_str), |row| {
-        let layer_text: String = row.get(4)?;
-        Ok(Rule {
-            domain_id: row.get(0)?,
-            construct_id: row.get(1)?,
-            construct: row.get(2)?,
-            text: row.get(3)?,
-            layer: AuthorityLayer::from_str(&layer_text),
-        })
-    })?;
+    let rows = stmt.query_map((construct_id, layer_str, rule_type_str), rule_from_row)?;
     rows.collect()
 }
 
 pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO rules_fts (domain_id, construct_id, construct, text, layer) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO rules_fts (domain_id, construct_id, construct, text, layer, rule_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         (
             &rule.domain_id,
             &rule.construct_id,
             &rule.construct,
             &rule.text,
             rule.layer.as_str(),
+            rule.rule_type.as_str(),
         ),
     )?;
     Ok(())
@@ -322,7 +382,7 @@ pub fn search_scoped(
 ) -> rusqlite::Result<(Vec<SearchHit>, RetrievalMode)> {
     let layer_str = layer.map(AuthorityLayer::as_str);
     let mut stmt = conn.prepare(
-        "SELECT domain_id, construct_id, construct, text, layer, rank
+        "SELECT domain_id, construct_id, construct, text, layer, rule_type, rank
          FROM rules_fts
          WHERE rules_fts MATCH ?1
            AND (?2 IS NULL OR domain_id = ?2)
@@ -330,16 +390,9 @@ pub fn search_scoped(
          ORDER BY rank",
     )?;
     let rows = stmt.query_map((query, domain_id, layer_str), |row| {
-        let layer_text: String = row.get(4)?;
         Ok(SearchHit {
-            rule: Rule {
-                domain_id: row.get(0)?,
-                construct_id: row.get(1)?,
-                construct: row.get(2)?,
-                text: row.get(3)?,
-                layer: AuthorityLayer::from_str(&layer_text),
-            },
-            rank: row.get(5)?,
+            rule: rule_from_row(row)?,
+            rank: row.get(6)?,
         })
     })?;
     Ok((
@@ -425,6 +478,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             construct: "AuthorityGrant".into(),
             text: "An AuthorityGrant MUST declare an explicit scope and expiry.".into(),
             layer: AuthorityLayer::Standard,
+            rule_type: RuleType::Must,
         },
     )?;
     insert_rule(
@@ -435,6 +489,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             construct: "AuthorityGrant".into(),
             text: "In practice, teams often omit expiry for internal-only grants.".into(),
             layer: AuthorityLayer::Conventions,
+            rule_type: RuleType::May,
         },
     )?;
     insert_rule(
@@ -445,6 +500,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             construct: "ConflictRegistryEntry".into(),
             text: "A ConflictRegistryEntry MUST record both contradicting rules' layers.".into(),
             layer: AuthorityLayer::Standard,
+            rule_type: RuleType::Must,
         },
     )?;
     insert_rule(
@@ -455,6 +511,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             construct: "DataProduct".into(),
             text: "A DataProduct MUST declare an owning domain team.".into(),
             layer: AuthorityLayer::Standard,
+            rule_type: RuleType::Must,
         },
     )?;
 
