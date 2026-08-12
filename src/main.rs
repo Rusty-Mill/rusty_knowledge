@@ -43,6 +43,18 @@ struct SearchParams {
     layer: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ConstructLookupParams {
+    /// Domain to look up the construct in, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The construct's short name or ID.
+    construct_ref: String,
+    /// Restrict returned rules to one authority layer ("Standard" / "Tool
+    /// Implementation" / "Conventions" / "Process"). Omit for all layers.
+    #[serde(default)]
+    layer: Option<String>,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -107,17 +119,71 @@ impl KnowledgeServer {
     fn meta_routing_guide(&self) -> String {
         routing_guide()
     }
+
+    #[tool(
+        description = "Get full definition of a construct -- description and metadata -- plus its rules, optionally filtered by authority layer. Resolves construct_ref by short name first, then falls back to a direct ID match within the domain."
+    )]
+    fn lookup_construct(
+        &self,
+        Parameters(ConstructLookupParams {
+            domain_id,
+            construct_ref,
+            layer,
+        }): Parameters<ConstructLookupParams>,
+    ) -> String {
+        let layer_filter = match layer.as_deref().map(AuthorityLayer::parse) {
+            Some(None) => {
+                return format!(
+                    "Lookup failed: {:?} is not a known authority layer (expected one of Standard, \
+                     Tool Implementation, Conventions, Process).",
+                    layer.unwrap()
+                );
+            }
+            Some(Some(parsed)) => Some(parsed),
+            None => None,
+        };
+
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let construct = match store::resolve_construct(&conn, &domain_id, &construct_ref) {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!("Construct {construct_ref:?} not found in domain {domain_id:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let rules = match store::rules_for_construct(&conn, &construct.id, layer_filter) {
+            Ok(rules) => rules,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let rules_block = if rules.is_empty() {
+            "(no rules)".to_string()
+        } else {
+            rules
+                .iter()
+                .map(|r| format!("  [{}] {}", r.layer.as_str(), r.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        format!(
+            "{} ({}) [{}]\n{}\nRules:\n{rules_block}",
+            construct.short_name, construct.id, construct.construct_type, construct.description
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
-/// Deliberately limited to tools that actually exist in this crate today --
-/// `search_knowledge` only. `knowledge-mcp`'s own routing table also covers
-/// lookup/validate/crosscut question patterns and a multi-step evaluation
-/// workflow; those entries land here as their tools are implemented
-/// (rusty_knowledge#4-#16), not advertised ahead of a working tool.
+/// Deliberately limited to tools that actually exist in this crate today.
+/// `knowledge-mcp`'s own routing table also covers validate/crosscut question
+/// patterns and a multi-step evaluation workflow; those entries land here as
+/// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
+/// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#4-#16):\n\
-     - \"I can't find the right construct\" -> search_knowledge"
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#5-#16):\n\
+     - \"I can't find the right construct\" -> search_knowledge\n\
+     - \"What does X mean?\" -> lookup_construct"
         .to_string()
 }
 
@@ -150,8 +216,9 @@ mod tests {
     fn routing_guide_only_references_existing_tools() {
         let guide = routing_guide();
         assert!(guide.contains("search_knowledge"));
-        // None of these tools exist yet -- the guide must not claim they do.
-        for not_yet_implemented in ["lookup_construct", "validate_element", "crosscut_conflicts"] {
+        assert!(guide.contains("lookup_construct"));
+        // These tools don't exist yet -- the guide must not claim they do.
+        for not_yet_implemented in ["validate_element", "crosscut_conflicts"] {
             assert!(!guide.contains(not_yet_implemented));
         }
     }
@@ -196,5 +263,67 @@ mod tests {
         }));
         assert!(response.contains("Search failed"));
         assert!(response.contains("not a known authority layer"));
+    }
+
+    #[test]
+    fn lookup_construct_resolves_by_short_name() {
+        let server = test_server();
+        let response = server.lookup_construct(Parameters(ConstructLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: None,
+        }));
+        assert!(response.contains("AuthorityGrant"));
+        assert!(response.contains("uaf-1.3:AuthorityGrant"));
+        assert!(response.contains("scoped, time-bounded grant"));
+        // Both seeded rules for this construct, across two layers.
+        assert!(response.contains("Standard"));
+        assert!(response.contains("Conventions"));
+    }
+
+    #[test]
+    fn lookup_construct_resolves_by_id() {
+        let server = test_server();
+        let response = server.lookup_construct(Parameters(ConstructLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "uaf-1.3:AuthorityGrant".into(),
+            layer: None,
+        }));
+        assert!(response.contains("AuthorityGrant"));
+    }
+
+    #[test]
+    fn lookup_construct_layer_filter_narrows_rules() {
+        let server = test_server();
+        let response = server.lookup_construct(Parameters(ConstructLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: Some("Standard".into()),
+        }));
+        assert!(response.contains("Standard"));
+        assert!(!response.contains("Conventions"));
+    }
+
+    #[test]
+    fn lookup_construct_does_not_leak_across_domains() {
+        let server = test_server();
+        // DataProduct exists in data-mesh, not uaf-1.3.
+        let response = server.lookup_construct(Parameters(ConstructLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "DataProduct".into(),
+            layer: None,
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn lookup_construct_unknown_ref_reports_not_found() {
+        let server = test_server();
+        let response = server.lookup_construct(Parameters(ConstructLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "DoesNotExist".into(),
+            layer: None,
+        }));
+        assert!(response.contains("not found"));
     }
 }
