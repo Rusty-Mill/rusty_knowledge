@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement meta.routing_guide
-**2026-08-12**
+## PR #20 — Implement meta.routing_guide
+**2026-08-12** · [#20](https://github.com/Rusty-Mill/rusty_knowledge/pull/20)
 
 - **Added:** `meta_routing_guide` MCP tool (closes
   [rusty_knowledge#17](https://github.com/Rusty-Mill/rusty_knowledge/issues/17)),
