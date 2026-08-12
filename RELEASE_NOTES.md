@@ -5,6 +5,23 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #25 — Implement lookup.valid_relationships
+**2026-08-12** · [#25](https://github.com/Rusty-Mill/rusty_knowledge/pull/25)
+
+- **Added:** `lookup_valid_relationships` MCP tool (closes
+  [rusty_knowledge#7](https://github.com/Rusty-Mill/rusty_knowledge/issues/7)) —
+  given two construct types, all valid relationship types between them.
+- **Added:** `ValidRelationshipRule` entity and a new `valid_relationships`
+  table — a *declared* rule about which relationship types are valid between
+  two construct *types*, distinct from `Relationship` (an actual link between
+  two construct *instances*). `RM-KNOWLEDGE-MODEL-0004` requires validation
+  to check against this declared set rather than inferring validity from
+  whatever relationship instances happen to already exist, so this couldn't
+  just reuse the `relationships` table from #6. Seed data gets one declared
+  rule matching the relationship instance already seeded in #6.
+- 4 new tests (seeded rule returned at both the store and tool layer, unknown
+  type-pair reports none at both layers).
+
 ## PR #24 — Implement lookup.relationships
 **2026-08-12** · [#24](https://github.com/Rusty-Mill/rusty_knowledge/pull/24)
 

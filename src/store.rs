@@ -134,8 +134,8 @@ pub struct Rule {
 }
 
 /// A typed, directional link between two constructs in the same domain.
-/// Queried by `lookup_relationships`; `lookup.valid_relationships` and
-/// `crosscut.traceability` (rusty_knowledge#7/#13) land in later issues.
+/// Queried by `lookup_relationships`; `crosscut.traceability`
+/// (rusty_knowledge#13) lands in a later issue.
 pub struct Relationship {
     pub id: String,
     pub domain_id: String,
@@ -144,6 +144,20 @@ pub struct Relationship {
     pub relationship_type: String,
     pub cardinality: String,
     pub layer: AuthorityLayer,
+}
+
+/// A *declared* rule about which relationship types are valid between two
+/// construct *types* in a domain -- distinct from `Relationship`, which
+/// records an actual link between two specific construct *instances*.
+/// `RM-KNOWLEDGE-MODEL-0004` requires validation to check against this
+/// declared set rather than inferring validity from whatever relationship
+/// instances happen to already exist.
+pub struct ValidRelationshipRule {
+    pub domain_id: String,
+    pub from_type: String,
+    pub to_type: String,
+    pub relationship_type: String,
+    pub cardinality: String,
 }
 
 pub fn open_store() -> rusqlite::Result<Connection> {
@@ -197,6 +211,14 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              relationship_type TEXT NOT NULL,
              cardinality       TEXT NOT NULL,
              layer             TEXT NOT NULL
+         );
+         CREATE TABLE valid_relationships (
+             domain_id         TEXT NOT NULL REFERENCES domains(id),
+             from_type         TEXT NOT NULL,
+             to_type           TEXT NOT NULL,
+             relationship_type TEXT NOT NULL,
+             cardinality       TEXT NOT NULL,
+             PRIMARY KEY (domain_id, from_type, to_type, relationship_type)
          );
          CREATE VIRTUAL TABLE rule_vectors USING vec0(embedding float[4]);",
     )?;
@@ -367,6 +389,49 @@ pub fn relationships_from(
             })
         },
     )?;
+    rows.collect()
+}
+
+pub fn insert_valid_relationship(
+    conn: &Connection,
+    rule: &ValidRelationshipRule,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO valid_relationships (domain_id, from_type, to_type, relationship_type, cardinality)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            &rule.domain_id,
+            &rule.from_type,
+            &rule.to_type,
+            &rule.relationship_type,
+            &rule.cardinality,
+        ),
+    )?;
+    Ok(())
+}
+
+/// All declared valid relationship types between two construct types in a
+/// domain -- `RM-KNOWLEDGE-MODEL-0004`'s "declared valid-relationship set".
+pub fn valid_relationships_between(
+    conn: &Connection,
+    domain_id: &str,
+    from_type: &str,
+    to_type: &str,
+) -> rusqlite::Result<Vec<ValidRelationshipRule>> {
+    let mut stmt = conn.prepare(
+        "SELECT domain_id, from_type, to_type, relationship_type, cardinality
+         FROM valid_relationships
+         WHERE domain_id = ?1 AND from_type = ?2 AND to_type = ?3",
+    )?;
+    let rows = stmt.query_map((domain_id, from_type, to_type), |row| {
+        Ok(ValidRelationshipRule {
+            domain_id: row.get(0)?,
+            from_type: row.get(1)?,
+            to_type: row.get(2)?,
+            relationship_type: row.get(3)?,
+            cardinality: row.get(4)?,
+        })
+    })?;
     rows.collect()
 }
 
@@ -558,6 +623,17 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    insert_valid_relationship(
+        conn,
+        &ValidRelationshipRule {
+            domain_id: "uaf-1.3".into(),
+            from_type: "entity".into(),
+            to_type: "entity".into(),
+            relationship_type: "records".into(),
+            cardinality: "0..*".into(),
+        },
+    )?;
+
     Ok(())
 }
 
@@ -633,6 +709,25 @@ mod tests {
 
         let rels = relationships_from(&conn, "data-mesh:DataProduct", None, None).unwrap();
         assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn valid_relationships_between_returns_seeded_rule() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rules = valid_relationships_between(&conn, "uaf-1.3", "entity", "entity").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].relationship_type, "records");
+    }
+
+    #[test]
+    fn valid_relationships_between_unknown_type_pair_is_empty() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rules = valid_relationships_between(&conn, "uaf-1.3", "entity", "viewpoint").unwrap();
+        assert!(rules.is_empty());
     }
 
     #[test]

@@ -9,8 +9,8 @@
 //!
 //! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
 //! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
-//! `meta_routing_guide`, `lookup_construct`, `lookup_rules`, and
-//! `lookup_relationships`.
+//! `meta_routing_guide`, `lookup_construct`, `lookup_rules`,
+//! `lookup_relationships`, and `lookup_valid_relationships`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -113,6 +113,16 @@ struct RelationshipsLookupParams {
     /// Restrict to one relationship type (e.g. "records"). Omit for all types.
     #[serde(default)]
     relationship_type: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidRelationshipsLookupParams {
+    /// Domain to check, e.g. "uaf-1.3".
+    domain_id: String,
+    /// Source construct type, e.g. "entity".
+    from_type: String,
+    /// Target construct type.
+    to_type: String,
 }
 
 #[derive(Clone)]
@@ -362,6 +372,42 @@ impl KnowledgeServer {
             rels.len()
         )
     }
+
+    #[tool(
+        description = "Given two construct types, return all valid relationship types between them across all layers, per the domain's declared valid-relationship set (RM-KNOWLEDGE-MODEL-0004)."
+    )]
+    fn lookup_valid_relationships(
+        &self,
+        Parameters(ValidRelationshipsLookupParams {
+            domain_id,
+            from_type,
+            to_type,
+        }): Parameters<ValidRelationshipsLookupParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let rules =
+            match store::valid_relationships_between(&conn, &domain_id, &from_type, &to_type) {
+                Ok(rules) => rules,
+                Err(err) => return format!("Lookup failed: {err}"),
+            };
+
+        if rules.is_empty() {
+            return format!(
+                "No valid relationship types declared from {from_type:?} to {to_type:?} in domain {domain_id:?}."
+            );
+        }
+
+        let rules_block = rules
+            .iter()
+            .map(|r| format!("  {} (cardinality: {})", r.relationship_type, r.cardinality))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{from_type} -> {to_type}: {} valid relationship type(s):\n{rules_block}",
+            rules.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -390,7 +436,8 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
-         meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships)"
+         meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
+         lookup_valid_relationships)"
     );
 
     let server = KnowledgeServer {
@@ -640,5 +687,30 @@ mod tests {
             relationship_type: None,
         }));
         assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn lookup_valid_relationships_returns_seeded_rule() {
+        let server = test_server();
+        let response =
+            server.lookup_valid_relationships(Parameters(ValidRelationshipsLookupParams {
+                domain_id: "uaf-1.3".into(),
+                from_type: "entity".into(),
+                to_type: "entity".into(),
+            }));
+        assert!(response.contains("1 valid relationship type(s)"));
+        assert!(response.contains("records"));
+    }
+
+    #[test]
+    fn lookup_valid_relationships_unknown_type_pair_reports_none() {
+        let server = test_server();
+        let response =
+            server.lookup_valid_relationships(Parameters(ValidRelationshipsLookupParams {
+                domain_id: "uaf-1.3".into(),
+                from_type: "entity".into(),
+                to_type: "viewpoint".into(),
+            }));
+        assert!(response.contains("No valid relationship types declared"));
     }
 }
