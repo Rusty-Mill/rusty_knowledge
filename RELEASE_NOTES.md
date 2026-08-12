@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement lookup.relationships
-**2026-08-12**
+## PR #24 — Implement lookup.relationships
+**2026-08-12** · [#24](https://github.com/Rusty-Mill/rusty_knowledge/pull/24)
 
 - **Added:** `lookup_relationships` MCP tool (closes
   [rusty_knowledge#6](https://github.com/Rusty-Mill/rusty_knowledge/issues/6)) —
