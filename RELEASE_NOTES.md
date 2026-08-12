@@ -5,6 +5,25 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #47 — Rewrite the README to reflect current reality
+**2026-08-12** · [#47](https://github.com/Rusty-Mill/rusty_knowledge/pull/47)
+
+- **Fixed:** (closes
+  [rusty_knowledge#45](https://github.com/Rusty-Mill/rusty_knowledge/issues/45))
+  `README.md` had been unchanged since the original bootstrap commit —
+  still claiming `**Status: pre-code**`, "not yet authorized to contain
+  implementation code," and unmet `TRIAL-0003` governance gates, none of
+  which reflected reality after dozens of merged PRs.
+- Rewritten to describe what's actually implemented: the full 15-tool
+  `knowledge-mcp` parity surface, the two tools with no `knowledge-mcp`
+  equivalent (`crosscut_valid_relationship_candidates`, the SQLite
+  importer), and a documented list of every environment variable that
+  configures runtime behavior (`EMBEDDING_BACKEND`/`EMBEDDING_MODEL`/
+  `EMBEDDING_DIMENSION`/`OPENAI_API_KEY`, `KNOWLEDGE_MCP_IMPORT_PATH`,
+  `KNOWLEDGE_DB_PATH`) — none of which were documented anywhere outside
+  source comments before this.
+- Docs only, no code changes.
+
 ## PR #44 — Suggest candidate valid-relationship rules
 **2026-08-12** · [#44](https://github.com/Rusty-Mill/rusty_knowledge/pull/44)
 
