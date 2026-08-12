@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Domain/construct/relationship data model
-**2026-08-12**
+## PR #19 — Domain/construct/relationship data model
+**2026-08-12** · [#19](https://github.com/Rusty-Mill/rusty_knowledge/pull/19)
 
 - **Added:** `Domain`, `Construct`, and `Relationship` entities in `store.rs`,
   alongside the existing `Rule`/`AuthorityLayer` types — `rules_fts` now carries
