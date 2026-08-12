@@ -680,21 +680,39 @@ pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::R
 /// unresolvable `to_construct_ref` filter rather than erroring), an
 /// unresolvable `to_construct_id` here is the caller's job to resolve first
 /// -- this function takes an already-resolved ID, not a ref string.
+fn relationship_from_row(row: &rusqlite::Row) -> rusqlite::Result<Relationship> {
+    let layer_text: String = row.get(6)?;
+    let rule_type_text: String = row.get(7)?;
+    Ok(Relationship {
+        id: row.get(0)?,
+        domain_id: row.get(1)?,
+        from_construct_id: row.get(2)?,
+        to_construct_id: row.get(3)?,
+        relationship_type: row.get(4)?,
+        cardinality: row.get(5)?,
+        layer: AuthorityLayer::from_str(&layer_text),
+        rule_type: RuleType::from_str(&rule_type_text),
+    })
+}
+
 pub fn relationships_from(
     conn: &Connection,
     from_construct_id: &str,
     to_construct_id: Option<&str>,
     relationship_type: Option<&str>,
     rule_type: Option<RuleType>,
+    layer: Option<AuthorityLayer>,
 ) -> rusqlite::Result<Vec<Relationship>> {
     let rule_type_str = rule_type.map(RuleType::as_str);
+    let layer_str = layer.map(AuthorityLayer::as_str);
     let mut stmt = conn.prepare(
         "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type
          FROM relationships
          WHERE from_construct_id = ?1
            AND (?2 IS NULL OR to_construct_id = ?2)
            AND (?3 IS NULL OR relationship_type = ?3)
-           AND (?4 IS NULL OR rule_type = ?4)",
+           AND (?4 IS NULL OR rule_type = ?4)
+           AND (?5 IS NULL OR layer = ?5)",
     )?;
     let rows = stmt.query_map(
         (
@@ -702,21 +720,45 @@ pub fn relationships_from(
             to_construct_id,
             relationship_type,
             rule_type_str,
+            layer_str,
         ),
-        |row| {
-            let layer_text: String = row.get(6)?;
-            let rule_type_text: String = row.get(7)?;
-            Ok(Relationship {
-                id: row.get(0)?,
-                domain_id: row.get(1)?,
-                from_construct_id: row.get(2)?,
-                to_construct_id: row.get(3)?,
-                relationship_type: row.get(4)?,
-                cardinality: row.get(5)?,
-                layer: AuthorityLayer::from_str(&layer_text),
-                rule_type: RuleType::from_str(&rule_type_text),
-            })
-        },
+        relationship_from_row,
+    )?;
+    rows.collect()
+}
+
+/// Mirror of `relationships_from`, keyed by the target construct instead --
+/// "what points at this construct" rather than "what this construct points
+/// at". Needed for `crosscut.traceability`'s `must_be_traced_from` side,
+/// which `knowledge-mcp` answers with a `to_construct_id`-keyed query.
+pub fn relationships_to(
+    conn: &Connection,
+    to_construct_id: &str,
+    from_construct_id: Option<&str>,
+    relationship_type: Option<&str>,
+    rule_type: Option<RuleType>,
+    layer: Option<AuthorityLayer>,
+) -> rusqlite::Result<Vec<Relationship>> {
+    let rule_type_str = rule_type.map(RuleType::as_str);
+    let layer_str = layer.map(AuthorityLayer::as_str);
+    let mut stmt = conn.prepare(
+        "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type
+         FROM relationships
+         WHERE to_construct_id = ?1
+           AND (?2 IS NULL OR from_construct_id = ?2)
+           AND (?3 IS NULL OR relationship_type = ?3)
+           AND (?4 IS NULL OR rule_type = ?4)
+           AND (?5 IS NULL OR layer = ?5)",
+    )?;
+    let rows = stmt.query_map(
+        (
+            to_construct_id,
+            from_construct_id,
+            relationship_type,
+            rule_type_str,
+            layer_str,
+        ),
+        relationship_from_row,
     )?;
     rows.collect()
 }
@@ -755,7 +797,7 @@ pub fn evaluate_completeness(
         .map(|r| r.text.clone())
         .collect();
 
-    let rels = relationships_from(conn, construct_id, None, None, Some(RuleType::Must))?;
+    let rels = relationships_from(conn, construct_id, None, None, Some(RuleType::Must), None)?;
     let required_types: std::collections::BTreeSet<String> =
         rels.iter().map(|r| r.to_construct_id.clone()).collect();
     let present_set: std::collections::BTreeSet<String> =
@@ -1091,7 +1133,8 @@ mod tests {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        let rels = relationships_from(&conn, "uaf-1.3:AuthorityGrant", None, None, None).unwrap();
+        let rels =
+            relationships_from(&conn, "uaf-1.3:AuthorityGrant", None, None, None, None).unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].to_construct_id, "uaf-1.3:ConflictRegistryEntry");
         assert_eq!(rels[0].relationship_type, "records");
@@ -1108,6 +1151,7 @@ mod tests {
             Some("uaf-1.3:ConflictRegistryEntry"),
             Some("records"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(rels.len(), 1);
@@ -1117,6 +1161,7 @@ mod tests {
             "uaf-1.3:AuthorityGrant",
             None,
             Some("does-not-exist"),
+            None,
             None,
         )
         .unwrap();
@@ -1134,6 +1179,7 @@ mod tests {
             None,
             None,
             Some(RuleType::Must),
+            None,
         )
         .unwrap();
         assert_eq!(must_only.len(), 1);
@@ -1144,9 +1190,38 @@ mod tests {
             None,
             None,
             Some(RuleType::Should),
+            None,
         )
         .unwrap();
         assert!(should_only.is_empty());
+    }
+
+    #[test]
+    fn relationships_from_filters_by_layer() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let standard_only = relationships_from(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            None,
+            None,
+            None,
+            Some(AuthorityLayer::Standard),
+        )
+        .unwrap();
+        assert_eq!(standard_only.len(), 1);
+
+        let process_only = relationships_from(
+            &conn,
+            "uaf-1.3:AuthorityGrant",
+            None,
+            None,
+            None,
+            Some(AuthorityLayer::Process),
+        )
+        .unwrap();
+        assert!(process_only.is_empty());
     }
 
     #[test]
@@ -1154,7 +1229,36 @@ mod tests {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        let rels = relationships_from(&conn, "data-mesh:DataProduct", None, None, None).unwrap();
+        let rels =
+            relationships_from(&conn, "data-mesh:DataProduct", None, None, None, None).unwrap();
+        assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn relationships_to_returns_seeded_relationship() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rels = relationships_to(
+            &conn,
+            "uaf-1.3:ConflictRegistryEntry",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].from_construct_id, "uaf-1.3:AuthorityGrant");
+    }
+
+    #[test]
+    fn relationships_to_construct_with_no_incoming_relationships_is_empty() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rels =
+            relationships_to(&conn, "uaf-1.3:AuthorityGrant", None, None, None, None).unwrap();
         assert!(rels.is_empty());
     }
 

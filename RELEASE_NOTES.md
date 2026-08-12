@@ -5,6 +5,26 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement crosscut.traceability
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `crosscut_traceability` MCP tool (closes
+  [rusty_knowledge#13](https://github.com/Rusty-Mill/rusty_knowledge/issues/13)) —
+  given a construct, reports what it must/should trace to (`traces_to`
+  relationships outgoing) and what must/should trace to it (`traces_to`
+  relationships incoming). MUST/SHALL-typed traces only by default;
+  `include_optional` widens to SHOULD/MAY as well, matching `knowledge-mcp`.
+  Traceability is always evaluated at the Standard authority layer, matching
+  `knowledge-mcp`'s hardcoded `layer_num=1`.
+- **Added:** `store::relationships_to` — mirrors `relationships_from`, keyed
+  by the target construct instead of the source, needed for the
+  "traced from" side. Both now share a `layer` filter parameter and a
+  factored-out `relationship_from_row` mapper.
+- 6 new tests (2 store-level for `relationships_from`/`relationships_to`'s
+  new layer filter and the "to" direction, 4 tool-level: outgoing + incoming
+  MUST traces, SHOULD traces excluded/included via `include_optional`, no
+  requirements, unknown construct).
+
 ## PR #30 — Implement search.constructs
 **2026-08-12** · [#30](https://github.com/Rusty-Mill/rusty_knowledge/pull/30)
 

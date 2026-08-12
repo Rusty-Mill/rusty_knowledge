@@ -14,7 +14,8 @@
 //! `lookup_domain_summary`, `validate_element` (required-property,
 //! enum-value, range, and pattern machine checks -- pattern matching via
 //! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
-//! `validate_relationship`, `validate_completeness`, and `search_constructs`.
+//! `validate_relationship`, `validate_completeness`, `search_constructs`,
+//! and `crosscut_traceability`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -179,6 +180,18 @@ struct SearchConstructsParams {
     /// Restrict to one construct type, e.g. "entity". Omit for all types.
     #[serde(default)]
     construct_type: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TraceabilityParams {
+    /// Domain the construct belongs to, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The construct's short name or ID to check traceability for.
+    construct_ref: String,
+    /// Include SHOULD/MAY-typed traces alongside MUST/SHALL. Defaults to
+    /// false (MUST/SHALL only), matching `knowledge-mcp`.
+    #[serde(default)]
+    include_optional: bool,
 }
 
 #[derive(Clone)]
@@ -395,6 +408,7 @@ impl KnowledgeServer {
             &from_construct.id,
             to_id.as_deref(),
             relationship_type.as_deref(),
+            None,
             None,
         ) {
             Ok(rels) => rels,
@@ -645,6 +659,7 @@ impl KnowledgeServer {
             Some(&to_construct.id),
             Some(&relationship_type),
             None,
+            None,
         ) {
             Ok(rels) => rels,
             Err(err) => return format!("Validation failed: {err}"),
@@ -760,6 +775,92 @@ impl KnowledgeServer {
             constructs.len()
         )
     }
+
+    #[tool(
+        description = "Get traceability requirements for a construct -- what it must/should trace to and what must/should trace to it."
+    )]
+    fn crosscut_traceability(
+        &self,
+        Parameters(TraceabilityParams {
+            domain_id,
+            construct_ref,
+            include_optional,
+        }): Parameters<TraceabilityParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let construct = match store::resolve_construct(&conn, &domain_id, &construct_ref) {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!("Construct {construct_ref:?} not found in domain {domain_id:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        // `knowledge-mcp` hardcodes layer_num=1 (Standard) for traceability
+        // relationships regardless of caller input -- traces are always a
+        // Standard-layer concern there.
+        let outgoing = match store::relationships_from(
+            &conn,
+            &construct.id,
+            None,
+            Some("traces_to"),
+            None,
+            Some(AuthorityLayer::Standard),
+        ) {
+            Ok(rels) => rels,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+        let incoming = match store::relationships_to(
+            &conn,
+            &construct.id,
+            None,
+            Some("traces_to"),
+            None,
+            Some(AuthorityLayer::Standard),
+        ) {
+            Ok(rels) => rels,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let required_only = |rels: Vec<store::Relationship>| -> Vec<store::Relationship> {
+            if include_optional {
+                rels
+            } else {
+                rels.into_iter()
+                    .filter(|r| matches!(r.rule_type, RuleType::Must | RuleType::Shall))
+                    .collect()
+            }
+        };
+        let outgoing = required_only(outgoing);
+        let incoming = required_only(incoming);
+
+        if outgoing.is_empty() && incoming.is_empty() {
+            return format!(
+                "{} ({}) has no traceability requirements.",
+                construct.short_name, construct.id
+            );
+        }
+
+        let format_side = |rels: &[store::Relationship],
+                           other: fn(&store::Relationship) -> &str| {
+            if rels.is_empty() {
+                "  (none)".to_string()
+            } else {
+                rels.iter()
+                    .map(|r| format!("  {} (cardinality: {})", other(r), r.cardinality))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+
+        format!(
+            "{} ({}) traceability:\nmust trace to:\n{}\nmust be traced from:\n{}",
+            construct.short_name,
+            construct.id,
+            format_side(&outgoing, |r| &r.to_construct_id),
+            format_side(&incoming, |r| &r.from_construct_id),
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -769,13 +870,14 @@ impl KnowledgeServer {
 /// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
 /// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#13-#16):\n\
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#14-#16):\n\
      - \"I can't find the right construct\" -> search_knowledge, search_constructs\n\
      - \"What does X mean?\" -> lookup_construct\n\
      - \"What should X be named/styled?\" -> lookup_rules (layer=Conventions)\n\
      - \"Who owns X / when is X due?\" -> lookup_rules (layer=Process)\n\
      - \"Is X valid/conformant?\" -> validate_element, validate_relationship\n\
-     - \"Is this model/viewpoint complete?\" -> validate_completeness"
+     - \"Is this model/viewpoint complete?\" -> validate_completeness\n\
+     - \"Does X trace to Y?\" -> crosscut_traceability"
         .to_string()
 }
 
@@ -792,7 +894,8 @@ async fn main() -> anyhow::Result<()> {
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
-         validate_relationship, validate_completeness, search_constructs)"
+         validate_relationship, validate_completeness, search_constructs, \
+         crosscut_traceability)"
     );
 
     let server = KnowledgeServer {
@@ -817,6 +920,7 @@ mod tests {
         assert!(guide.contains("validate_element"));
         assert!(guide.contains("validate_relationship"));
         assert!(guide.contains("validate_completeness"));
+        assert!(guide.contains("crosscut_traceability"));
         // These tools don't exist yet -- the guide must not claim they do.
         for not_yet_implemented in ["crosscut_conflicts", "meta_list_domains"] {
             assert!(!guide.contains(not_yet_implemented));
@@ -1333,5 +1437,95 @@ mod tests {
             construct_type: None,
         }));
         assert!(response.contains("No constructs found"));
+    }
+
+    fn insert_traces_to(server: &KnowledgeServer, id: &str, rule_type: RuleType) {
+        let conn = server.conn.lock().unwrap();
+        store::insert_relationship(
+            &conn,
+            &store::Relationship {
+                id: id.into(),
+                domain_id: "uaf-1.3".into(),
+                from_construct_id: "uaf-1.3:AuthorityGrant".into(),
+                to_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
+                relationship_type: "traces_to".into(),
+                cardinality: "1..1".into(),
+                layer: AuthorityLayer::Standard,
+                rule_type,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn crosscut_traceability_reports_outgoing_and_incoming_must_traces() {
+        let server = test_server();
+        insert_traces_to(
+            &server,
+            "AuthorityGrant-traces_to-ConflictRegistryEntry",
+            RuleType::Must,
+        );
+
+        let outgoing = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            include_optional: false,
+        }));
+        assert!(outgoing.contains("must trace to"));
+        assert!(outgoing.contains("uaf-1.3:ConflictRegistryEntry"));
+
+        let incoming = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "ConflictRegistryEntry".into(),
+            include_optional: false,
+        }));
+        assert!(incoming.contains("must be traced from"));
+        assert!(incoming.contains("uaf-1.3:AuthorityGrant"));
+    }
+
+    #[test]
+    fn crosscut_traceability_excludes_should_traces_unless_include_optional() {
+        let server = test_server();
+        insert_traces_to(
+            &server,
+            "AuthorityGrant-traces_to-ConflictRegistryEntry",
+            RuleType::Should,
+        );
+
+        let required_only = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            include_optional: false,
+        }));
+        assert!(required_only.contains("no traceability requirements"));
+
+        let with_optional = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            include_optional: true,
+        }));
+        assert!(with_optional.contains("uaf-1.3:ConflictRegistryEntry"));
+    }
+
+    #[test]
+    fn crosscut_traceability_no_requirements_reports_none() {
+        let server = test_server();
+        let response = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            include_optional: false,
+        }));
+        assert!(response.contains("no traceability requirements"));
+    }
+
+    #[test]
+    fn crosscut_traceability_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "DoesNotExist".into(),
+            include_optional: false,
+        }));
+        assert!(response.contains("not found"));
     }
 }
