@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Rewrite the README to reflect current reality
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #47 — Rewrite the README to reflect current reality
+**2026-08-12** · [#47](https://github.com/Rusty-Mill/rusty_knowledge/pull/47)
 
 - **Fixed:** (closes
   [rusty_knowledge#45](https://github.com/Rusty-Mill/rusty_knowledge/issues/45))
