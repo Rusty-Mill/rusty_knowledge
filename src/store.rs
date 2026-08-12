@@ -886,15 +886,22 @@ pub fn search_scoped(
 // Exercised by tests today; by `meta.list_domains`/`search.constructs`
 // (rusty_knowledge#12/#16) next.
 #[allow(dead_code)]
+/// Constructs in a domain, optionally narrowed to one `construct_type`.
+/// `knowledge-mcp`'s `search.constructs` also filters by `layer_num`, but
+/// this crate's `Construct` doesn't carry an authority layer (only `Rule`
+/// does) -- not modeled here, since a construct itself isn't layered, only
+/// the rules attached to it are.
 pub fn constructs_in_domain(
     conn: &Connection,
     domain_id: &str,
+    construct_type: Option<&str>,
 ) -> rusqlite::Result<Vec<Construct>> {
     let mut stmt = conn.prepare(
         "SELECT id, domain_id, short_name, construct_type, description
-         FROM constructs WHERE domain_id = ?1",
+         FROM constructs
+         WHERE domain_id = ?1 AND (?2 IS NULL OR construct_type = ?2)",
     )?;
-    let rows = stmt.query_map([domain_id], construct_from_row)?;
+    let rows = stmt.query_map((domain_id, construct_type), construct_from_row)?;
     rows.collect()
 }
 
@@ -1046,14 +1053,14 @@ mod tests {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        let uaf = constructs_in_domain(&conn, "uaf-1.3").unwrap();
+        let uaf = constructs_in_domain(&conn, "uaf-1.3", None).unwrap();
         assert_eq!(uaf.len(), 2);
         assert!(uaf.iter().all(|c| c.domain_id == "uaf-1.3"));
         assert!(uaf.iter().any(|c| c.short_name == "AuthorityGrant"));
         assert!(uaf.iter().any(|c| c.short_name == "ConflictRegistryEntry"));
         assert!(!uaf.iter().any(|c| c.short_name == "DataProduct"));
 
-        let data_mesh = constructs_in_domain(&conn, "data-mesh").unwrap();
+        let data_mesh = constructs_in_domain(&conn, "data-mesh", None).unwrap();
         assert_eq!(data_mesh.len(), 1);
         assert_eq!(data_mesh[0].short_name, "DataProduct");
     }
@@ -1063,7 +1070,19 @@ mod tests {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
 
-        let none = constructs_in_domain(&conn, "does-not-exist").unwrap();
+        let none = constructs_in_domain(&conn, "does-not-exist", None).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn constructs_in_domain_filters_by_construct_type() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let entities = constructs_in_domain(&conn, "uaf-1.3", Some("entity")).unwrap();
+        assert_eq!(entities.len(), 2);
+
+        let none = constructs_in_domain(&conn, "uaf-1.3", Some("viewpoint")).unwrap();
         assert!(none.is_empty());
     }
 

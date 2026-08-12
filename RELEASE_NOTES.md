@@ -5,6 +5,22 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #30 — Implement search.constructs
+**2026-08-12** · [#30](https://github.com/Rusty-Mill/rusty_knowledge/pull/30)
+
+- **Added:** `search_constructs` MCP tool (closes
+  [rusty_knowledge#12](https://github.com/Rusty-Mill/rusty_knowledge/issues/12)) —
+  lists constructs in a domain, optionally narrowed to one `construct_type`.
+- **Changed:** `store::constructs_in_domain` gained an optional
+  `construct_type` filter parameter; existing call sites pass `None`
+  (unchanged behavior).
+- **Not modeled:** `knowledge-mcp`'s `search.constructs` also filters by
+  `layer_num`, but this crate's `Construct` doesn't carry an authority
+  layer (only `Rule` does) — a construct itself isn't layered, only the
+  rules attached to it are.
+- 4 new tests (1 store-level filter test, 3 tool-level: list all, filter by
+  type, unknown domain reports none found).
+
 ## PR #29 — Implement validate.completeness
 **2026-08-12** · [#29](https://github.com/Rusty-Mill/rusty_knowledge/pull/29)
 
