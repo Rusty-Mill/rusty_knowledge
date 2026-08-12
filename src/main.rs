@@ -8,8 +8,8 @@
 //! without TRIAL-0003's full entry-gate process.
 //!
 //! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
-//! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005)
-//! and `meta_routing_guide`.
+//! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
+//! `meta_routing_guide`, `lookup_construct`, and `lookup_rules`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -25,7 +25,34 @@ use rmcp::{
 };
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
-use store::AuthorityLayer;
+use store::{AuthorityLayer, RuleType};
+
+/// Shared by every tool that accepts an optional authority-layer filter
+/// string: `Ok(None)` for "no filter", `Ok(Some(_))` for a recognized layer,
+/// `Err` (never silently ignored) for anything else.
+fn parse_layer_filter(layer: &Option<String>) -> Result<Option<AuthorityLayer>, String> {
+    match layer.as_deref().map(AuthorityLayer::parse) {
+        Some(None) => Err(format!(
+            "{:?} is not a known authority layer (expected one of Standard, Tool Implementation, \
+             Conventions, Process).",
+            layer.as_ref().unwrap()
+        )),
+        Some(Some(parsed)) => Ok(Some(parsed)),
+        None => Ok(None),
+    }
+}
+
+/// Same contract as `parse_layer_filter`, for the rule-type filter.
+fn parse_rule_type_filter(rule_type: &Option<String>) -> Result<Option<RuleType>, String> {
+    match rule_type.as_deref().map(RuleType::parse) {
+        Some(None) => Err(format!(
+            "{:?} is not a known rule type (expected one of MUST, SHALL, SHOULD, MAY, MUST_NOT).",
+            rule_type.as_ref().unwrap()
+        )),
+        Some(Some(parsed)) => Ok(Some(parsed)),
+        None => Ok(None),
+    }
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchParams {
@@ -55,6 +82,22 @@ struct ConstructLookupParams {
     layer: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RulesLookupParams {
+    /// Domain to look up the construct in, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The construct's short name or ID.
+    construct_ref: String,
+    /// Restrict to one authority layer ("Standard" / "Tool Implementation" /
+    /// "Conventions" / "Process"). Omit for all layers.
+    #[serde(default)]
+    layer: Option<String>,
+    /// Restrict to one rule type ("MUST" / "SHALL" / "SHOULD" / "MAY" /
+    /// "MUST_NOT"). Omit for all types.
+    #[serde(default)]
+    rule_type: Option<String>,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -73,16 +116,9 @@ impl KnowledgeServer {
             layer,
         }): Parameters<SearchParams>,
     ) -> String {
-        let layer_filter = match layer.as_deref().map(AuthorityLayer::parse) {
-            Some(None) => {
-                return format!(
-                    "Search failed: {:?} is not a known authority layer (expected one of Standard, \
-                     Tool Implementation, Conventions, Process).",
-                    layer.unwrap()
-                );
-            }
-            Some(Some(parsed)) => Some(parsed),
-            None => None,
+        let layer_filter = match parse_layer_filter(&layer) {
+            Ok(filter) => filter,
+            Err(err) => return format!("Search failed: {err}"),
         };
 
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -131,16 +167,9 @@ impl KnowledgeServer {
             layer,
         }): Parameters<ConstructLookupParams>,
     ) -> String {
-        let layer_filter = match layer.as_deref().map(AuthorityLayer::parse) {
-            Some(None) => {
-                return format!(
-                    "Lookup failed: {:?} is not a known authority layer (expected one of Standard, \
-                     Tool Implementation, Conventions, Process).",
-                    layer.unwrap()
-                );
-            }
-            Some(Some(parsed)) => Some(parsed),
-            None => None,
+        let layer_filter = match parse_layer_filter(&layer) {
+            Ok(filter) => filter,
+            Err(err) => return format!("Lookup failed: {err}"),
         };
 
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -152,7 +181,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let rules = match store::rules_for_construct(&conn, &construct.id, layer_filter) {
+        let rules = match store::rules_for_construct(&conn, &construct.id, layer_filter, None) {
             Ok(rules) => rules,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -172,6 +201,74 @@ impl KnowledgeServer {
             construct.short_name, construct.id, construct.construct_type, construct.description
         )
     }
+
+    #[tool(
+        description = "Get rules for a construct, optionally filtered by authority layer and/or rule type (MUST/SHALL/SHOULD/MAY/MUST_NOT)."
+    )]
+    fn lookup_rules(
+        &self,
+        Parameters(RulesLookupParams {
+            domain_id,
+            construct_ref,
+            layer,
+            rule_type,
+        }): Parameters<RulesLookupParams>,
+    ) -> String {
+        let layer_filter = match parse_layer_filter(&layer) {
+            Ok(filter) => filter,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+        let rule_type_filter = match parse_rule_type_filter(&rule_type) {
+            Ok(filter) => filter,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let construct = match store::resolve_construct(&conn, &domain_id, &construct_ref) {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!("Construct {construct_ref:?} not found in domain {domain_id:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let rules = match store::rules_for_construct(
+            &conn,
+            &construct.id,
+            layer_filter,
+            rule_type_filter,
+        ) {
+            Ok(rules) => rules,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if rules.is_empty() {
+            return format!(
+                "No rules found for {} ({}).",
+                construct.short_name, construct.id
+            );
+        }
+
+        let rules_block = rules
+            .iter()
+            .map(|r| {
+                format!(
+                    "  [{}, {}] {}",
+                    r.layer.as_str(),
+                    r.rule_type.as_str(),
+                    r.text
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} ({}) -- {} rule(s):\n{rules_block}",
+            construct.short_name,
+            construct.id,
+            rules.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -181,9 +278,11 @@ impl KnowledgeServer {
 /// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
 /// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#5-#16):\n\
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#6-#16):\n\
      - \"I can't find the right construct\" -> search_knowledge\n\
-     - \"What does X mean?\" -> lookup_construct"
+     - \"What does X mean?\" -> lookup_construct\n\
+     - \"What should X be named/styled?\" -> lookup_rules (layer=Conventions)\n\
+     - \"Who owns X / when is X due?\" -> lookup_rules (layer=Process)"
         .to_string()
 }
 
@@ -197,7 +296,8 @@ async fn main() -> anyhow::Result<()> {
     let _: AuthorityLayer = AuthorityLayer::Standard;
 
     eprintln!(
-        "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, meta_routing_guide)"
+        "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
+         meta_routing_guide, lookup_construct, lookup_rules)"
     );
 
     let server = KnowledgeServer {
@@ -217,6 +317,7 @@ mod tests {
         let guide = routing_guide();
         assert!(guide.contains("search_knowledge"));
         assert!(guide.contains("lookup_construct"));
+        assert!(guide.contains("lookup_rules"));
         // These tools don't exist yet -- the guide must not claim they do.
         for not_yet_implemented in ["validate_element", "crosscut_conflicts"] {
             assert!(!guide.contains(not_yet_implemented));
@@ -323,6 +424,65 @@ mod tests {
             domain_id: "uaf-1.3".into(),
             construct_ref: "DoesNotExist".into(),
             layer: None,
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn lookup_rules_returns_all_rules_for_a_construct() {
+        let server = test_server();
+        let response = server.lookup_rules(Parameters(RulesLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: None,
+            rule_type: None,
+        }));
+        assert!(response.contains("2 rule(s)"));
+        assert!(response.contains("MUST"));
+        assert!(response.contains("MAY"));
+    }
+
+    #[test]
+    fn lookup_rules_layer_and_rule_type_filters_combine() {
+        let server = test_server();
+        let response = server.lookup_rules(Parameters(RulesLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: Some("Standard".into()),
+            rule_type: Some("MUST".into()),
+        }));
+        assert!(response.contains("1 rule(s)"));
+
+        let response = server.lookup_rules(Parameters(RulesLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: Some("Standard".into()),
+            rule_type: Some("MAY".into()),
+        }));
+        assert!(response.contains("No rules found"));
+    }
+
+    #[test]
+    fn lookup_rules_rejects_unknown_rule_type() {
+        let server = test_server();
+        let response = server.lookup_rules(Parameters(RulesLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: None,
+            rule_type: Some("MIGHT".into()),
+        }));
+        assert!(response.contains("Lookup failed"));
+        assert!(response.contains("not a known rule type"));
+    }
+
+    #[test]
+    fn lookup_rules_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.lookup_rules(Parameters(RulesLookupParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "DoesNotExist".into(),
+            layer: None,
+            rule_type: None,
         }));
         assert!(response.contains("not found"));
     }
