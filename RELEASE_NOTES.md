@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement search.constructs
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #30 — Implement search.constructs
+**2026-08-12** · [#30](https://github.com/Rusty-Mill/rusty_knowledge/pull/30)
 
 - **Added:** `search_constructs` MCP tool (closes
   [rusty_knowledge#12](https://github.com/Rusty-Mill/rusty_knowledge/issues/12)) —
