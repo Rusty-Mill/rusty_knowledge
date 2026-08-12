@@ -60,6 +60,25 @@ impl KnowledgeServer {
             Err(err) => format!("Search failed: {err}"),
         }
     }
+
+    #[tool(
+        description = "Query routing guidance -- which tools to use for which question types. Call this when unsure how to decompose a task."
+    )]
+    fn meta_routing_guide(&self) -> String {
+        routing_guide()
+    }
+}
+
+/// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
+/// Deliberately limited to tools that actually exist in this crate today --
+/// `search_knowledge` only. `knowledge-mcp`'s own routing table also covers
+/// lookup/validate/crosscut question patterns and a multi-step evaluation
+/// workflow; those entries land here as their tools are implemented
+/// (rusty_knowledge#4-#16), not advertised ahead of a working tool.
+fn routing_guide() -> String {
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#4-#16):\n\
+     - \"I can't find the right construct\" -> search_knowledge"
+        .to_string()
 }
 
 #[tokio::main]
@@ -79,4 +98,19 @@ async fn main() -> anyhow::Result<()> {
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routing_guide_only_references_existing_tools() {
+        let guide = routing_guide();
+        assert!(guide.contains("search_knowledge"));
+        // None of these tools exist yet -- the guide must not claim they do.
+        for not_yet_implemented in ["lookup_construct", "validate_element", "crosscut_conflicts"] {
+            assert!(!guide.contains(not_yet_implemented));
+        }
+    }
 }

@@ -5,6 +5,18 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement meta.routing_guide
+**2026-08-12**
+
+- **Added:** `meta_routing_guide` MCP tool (closes
+  [rusty_knowledge#17](https://github.com/Rusty-Mill/rusty_knowledge/issues/17)),
+  matching `knowledge-mcp`'s `meta.routing_guide` in shape. Deliberately
+  limited to tools that actually exist in this crate today — just
+  `search_knowledge` — rather than advertising routing guidance for
+  `lookup.*`/`validate.*`/`crosscut.*` tools that don't exist yet and would
+  fail if called. Grows as those tools land (rusty_knowledge#4-#16).
+- 1 new test asserting the guide only references tools that actually exist.
+
 ## PR #19 — Domain/construct/relationship data model
 **2026-08-12** · [#19](https://github.com/Rusty-Mill/rusty_knowledge/pull/19)
 
