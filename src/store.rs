@@ -4,6 +4,7 @@
 //! See `main.rs`'s module doc for what this slice tests and why.
 
 use rusqlite::Connection;
+use rusty_embedder_core::{Embedder, serialize_f32};
 
 /// The four-layer authority model from ADR-0165. Not `Option<Layer>` —
 /// per RK-001, an unlabeled rule must be structurally unrepresentable.
@@ -428,7 +429,12 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              min_value   REAL,
              max_value   REAL
          );
-         CREATE VIRTUAL TABLE rule_vectors USING vec0(embedding float[4]);",
+         CREATE TABLE construct_embeddings (
+             construct_id TEXT PRIMARY KEY REFERENCES constructs(id),
+             domain_id    TEXT NOT NULL,
+             model        TEXT NOT NULL,
+             embedding    BLOB NOT NULL
+         );",
     )?;
     Ok(conn)
 }
@@ -1047,16 +1053,23 @@ pub fn cross_domain_relationships_from(
 /// forget to pick one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalMode {
-    /// FTS5 keyword match only. The only mode this crate can produce until
-    /// rusty_knowledge#18 wires the existing (but unused) `vec0` table into
-    /// search.
+    /// FTS5 keyword match only -- the mode when no real `Embedder` is
+    /// configured (a `NullEmbedder`, `dimension() == 0`), or when a
+    /// configured embedder's vector search fails or has no index to query
+    /// yet. Never silently upgraded to `Hybrid` in that case.
     LexicalOnly,
+    /// FTS5 keyword match fused with `vec0` cosine-similarity search via
+    /// Reciprocal Rank Fusion, matching `knowledge-mcp`'s `hybrid_search`.
+    /// Only ever returned when a real embedder actually produced vectors
+    /// for this query.
+    Hybrid,
 }
 
 impl RetrievalMode {
     pub fn as_str(self) -> &'static str {
         match self {
             RetrievalMode::LexicalOnly => "lexical-only",
+            RetrievalMode::Hybrid => "hybrid",
         }
     }
 }
@@ -1072,9 +1085,9 @@ pub struct SearchHit {
 /// Domain/layer-scoped, ranked search — the `RM-KNOWLEDGE-MODEL-0005`-conforming
 /// upgrade to plain `search`. `domain_id`/`layer` are optional filters; `None`
 /// means unfiltered on that axis, matching the previous unscoped behavior when
-/// both are `None`. Always returns `RetrievalMode::LexicalOnly` today; a caller
-/// combining this with vector similarity (once rusty_knowledge#18 lands) would
-/// report a different mode rather than this function silently claiming hybrid.
+/// both are `None`. Always returns `RetrievalMode::LexicalOnly` -- this is the
+/// FTS-only half of [`hybrid_search`], which is what actually declares `Hybrid`
+/// when a real embedder is in play.
 pub fn search_scoped(
     conn: &Connection,
     query: &str,
@@ -1100,6 +1113,297 @@ pub fn search_scoped(
         rows.collect::<rusqlite::Result<Vec<_>>>()?,
         RetrievalMode::LexicalOnly,
     ))
+}
+
+/// Errors from the embedding/vector-search path -- unifies SQLite errors
+/// with `rusty_embedder_core::EmbedError` so callers get one `Result` type
+/// regardless of whether the storage step or the embedder itself failed.
+#[derive(Debug)]
+pub enum EmbeddingError {
+    Sqlite(rusqlite::Error),
+    Embed(rusty_embedder_core::EmbedError),
+}
+
+impl std::fmt::Display for EmbeddingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbeddingError::Sqlite(err) => write!(f, "{err}"),
+            EmbeddingError::Embed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for EmbeddingError {}
+
+impl From<rusqlite::Error> for EmbeddingError {
+    fn from(err: rusqlite::Error) -> Self {
+        EmbeddingError::Sqlite(err)
+    }
+}
+
+impl From<rusty_embedder_core::EmbedError> for EmbeddingError {
+    fn from(err: rusty_embedder_core::EmbedError) -> Self {
+        EmbeddingError::Embed(err)
+    }
+}
+
+/// Embeds every construct's `description` and stores the result in
+/// `construct_embeddings`, matching `knowledge-mcp`'s ingestion-time
+/// `_build_embeddings` -- one vector per construct (not per rule), skipping
+/// constructs with an empty description.
+///
+/// A no-op returning `Ok(0)` when `embedder.dimension() == 0` (the
+/// `NullEmbedder` case): matches `knowledge-mcp`'s own early return, so
+/// calling this with no real embedder configured is always safe and free.
+pub fn build_construct_embeddings(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+) -> Result<usize, EmbeddingError> {
+    if embedder.dimension() == 0 {
+        return Ok(0);
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT id, domain_id, description FROM constructs WHERE description != ''")?;
+    let eligible = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let domain_id: String = row.get(1)?;
+            let description: String = row.get(2)?;
+            Ok((id, domain_id, description))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+
+    let texts: Vec<String> = eligible.iter().map(|(_, _, text)| text.clone()).collect();
+    let vectors = embedder.embed(&texts)?;
+
+    for ((construct_id, domain_id, _), vector) in eligible.iter().zip(vectors.iter()) {
+        conn.execute(
+            "INSERT OR REPLACE INTO construct_embeddings (construct_id, domain_id, model, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            (
+                construct_id,
+                domain_id,
+                embedder.model_name(),
+                serialize_f32(vector),
+            ),
+        )?;
+    }
+    Ok(eligible.len())
+}
+
+/// (Re)builds the `vec_constructs` `vec0` virtual table from
+/// `construct_embeddings`, sizing it to whatever dimension the stored
+/// vectors actually are -- matching `knowledge-mcp`'s `_init_vec`/
+/// `_sync_vec_table`, which detects dimension from the first stored row
+/// rather than baking a fixed size into the schema up front (a single
+/// server may switch embedder/model between runs).
+///
+/// Returns `Ok(false)` with no table created if `construct_embeddings` is
+/// still empty (no embedder has run yet) -- the vector-search path stays
+/// unavailable, and callers should fall back to lexical-only, exactly the
+/// same "vec not ready" case `knowledge-mcp`'s `_vec_available` flag covers.
+pub fn sync_vector_index(conn: &Connection) -> rusqlite::Result<bool> {
+    let sample: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT embedding FROM construct_embeddings LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(sample) = sample else {
+        return Ok(false);
+    };
+    let dimension = sample.len() / 4;
+
+    conn.execute(
+        &format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_constructs \
+             USING vec0(construct_id TEXT PRIMARY KEY, embedding float[{dimension}] distance_metric=cosine)"
+        ),
+        [],
+    )?;
+    conn.execute("DELETE FROM vec_constructs", [])?;
+    conn.execute(
+        "INSERT INTO vec_constructs (construct_id, embedding)
+         SELECT construct_id, embedding FROM construct_embeddings",
+        [],
+    )?;
+    Ok(true)
+}
+
+/// KNN vector search: embeds `query`, matches it against `vec_constructs`,
+/// and returns `(construct_id, distance)` pairs ordered by distance
+/// ascending (smaller = more similar, matching cosine-distance semantics).
+/// `domain_id` is a post-filter, same as `knowledge-mcp`'s `_vector_search`
+/// -- `vec0` itself has no domain column to filter on.
+pub fn vector_search(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    domain_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, f64)>, EmbeddingError> {
+    let query_vec = embedder.embed(std::slice::from_ref(&query.to_string()))?;
+    let Some(query_vec) = query_vec.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    let query_blob = serialize_f32(&query_vec);
+
+    let mut stmt = conn.prepare(
+        "SELECT construct_id, distance FROM vec_constructs WHERE embedding MATCH ?1 AND k = ?2",
+    )?;
+    let rows = stmt
+        .query_map((query_blob, limit as i64), |row| {
+            let construct_id: String = row.get(0)?;
+            let distance: f64 = row.get(1)?;
+            Ok((construct_id, distance))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let results = match domain_id {
+        None => rows,
+        Some(domain_id) => {
+            let mut stmt = conn.prepare("SELECT id FROM constructs WHERE domain_id = ?1")?;
+            let allowed: std::collections::HashSet<String> = stmt
+                .query_map([domain_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows.into_iter()
+                .filter(|(construct_id, _)| allowed.contains(construct_id))
+                .collect()
+        }
+    };
+    Ok(results)
+}
+
+/// One result from [`hybrid_search`]: either a lexical hit (a rule matched
+/// by FTS5), a vector-only hit (a construct whose *description* matched
+/// semantically but produced no FTS5 hit of its own -- `knowledge-mcp`'s
+/// `content_type="vector_match"`), or a construct that hit on both, fused
+/// into a single relevance score.
+pub struct HybridHit {
+    pub construct_id: String,
+    pub domain_id: String,
+    pub construct_name: String,
+    /// `Some` for a lexical hit (the matched rule's layer). `None` for a
+    /// vector-only hit -- a construct's *description* matched semantically,
+    /// and (same as `search.constructs`, rusty_knowledge#12) a construct
+    /// itself isn't layered, only the rules attached to it are.
+    pub layer: Option<AuthorityLayer>,
+    pub text: String,
+    pub is_vector_match: bool,
+    pub score: f64,
+}
+
+/// Fuses ranked FTS hits with ranked vector hits via Reciprocal Rank Fusion
+/// (RRF), matching `knowledge-mcp`'s `_reciprocal_rank_fusion`: each list
+/// contributes `1 / (k + rank_position + 1)` to a construct's fused score,
+/// so a construct appearing in both lists is naturally boosted. `k = 60` is
+/// the standard RRF constant, the same default Python uses. Vector-only
+/// hits are backfilled from the `constructs` table (domain, description),
+/// since they have no FTS row of their own to source `domain_id`/`text` from.
+fn reciprocal_rank_fusion(
+    conn: &Connection,
+    fts_hits: &[SearchHit],
+    vec_hits: &[(String, f64)],
+) -> rusqlite::Result<Vec<HybridHit>> {
+    const K: f64 = 60.0;
+
+    let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut fts_by_construct: std::collections::HashMap<&str, &SearchHit> =
+        std::collections::HashMap::new();
+
+    for (pos, hit) in fts_hits.iter().enumerate() {
+        *scores.entry(hit.rule.construct_id.clone()).or_insert(0.0) += 1.0 / (K + pos as f64 + 1.0);
+        fts_by_construct.insert(hit.rule.construct_id.as_str(), hit);
+    }
+    for (pos, (construct_id, _distance)) in vec_hits.iter().enumerate() {
+        *scores.entry(construct_id.clone()).or_insert(0.0) += 1.0 / (K + pos as f64 + 1.0);
+    }
+
+    let mut ordered: Vec<(String, f64)> = scores.into_iter().collect();
+    ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut merged = Vec::with_capacity(ordered.len());
+    for (construct_id, score) in ordered {
+        if let Some(hit) = fts_by_construct.get(construct_id.as_str()) {
+            merged.push(HybridHit {
+                construct_id,
+                domain_id: hit.rule.domain_id.clone(),
+                construct_name: hit.rule.construct.clone(),
+                layer: Some(hit.rule.layer),
+                text: hit.rule.text.clone(),
+                is_vector_match: false,
+                score,
+            });
+        } else {
+            let found: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT domain_id, short_name, description FROM constructs WHERE id = ?1",
+                    [&construct_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok();
+            if let Some((domain_id, short_name, description)) = found {
+                merged.push(HybridHit {
+                    construct_id,
+                    domain_id,
+                    construct_name: short_name,
+                    layer: None,
+                    text: description,
+                    is_vector_match: true,
+                    score,
+                });
+            }
+        }
+    }
+    Ok(merged)
+}
+
+fn lexical_only_hits(fts_hits: Vec<SearchHit>) -> Vec<HybridHit> {
+    fts_hits
+        .into_iter()
+        .map(|hit| HybridHit {
+            construct_id: hit.rule.construct_id.clone(),
+            domain_id: hit.rule.domain_id.clone(),
+            construct_name: hit.rule.construct.clone(),
+            layer: Some(hit.rule.layer),
+            text: hit.rule.text.clone(),
+            is_vector_match: false,
+            score: hit.rank,
+        })
+        .collect()
+}
+
+/// Combined FTS + vector search with Reciprocal Rank Fusion -- the
+/// `RM-KNOWLEDGE-MODEL-0005`-conforming entry point `search_knowledge`
+/// calls. Always runs FTS first. If `embedder.dimension() > 0` and a vector
+/// index is available (`sync_vector_index` finds embeddings to build one
+/// from), also runs vector search and fuses the two; falls back to
+/// FTS-only -- honestly declared as `RetrievalMode::LexicalOnly`, not
+/// silently -- on any vector-search error, matching `knowledge-mcp`'s own
+/// try/except fallback in `hybrid_search`.
+pub fn hybrid_search(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    domain_id: Option<&str>,
+    layer: Option<AuthorityLayer>,
+    limit: usize,
+) -> rusqlite::Result<(Vec<HybridHit>, RetrievalMode)> {
+    let (fts_hits, _) = search_scoped(conn, query, domain_id, layer)?;
+
+    let vector_ready = embedder.dimension() > 0 && sync_vector_index(conn)?;
+    if vector_ready && let Ok(vec_hits) = vector_search(conn, embedder, query, domain_id, limit) {
+        let mut fused = reciprocal_rank_fusion(conn, &fts_hits, &vec_hits)?;
+        fused.truncate(limit);
+        return Ok((fused, RetrievalMode::Hybrid));
+    }
+
+    Ok((lexical_only_hits(fts_hits), RetrievalMode::LexicalOnly))
 }
 
 /// Constructs belonging to exactly one domain — proves `RM-KNOWLEDGE-MODEL-0001`
@@ -1882,5 +2186,217 @@ mod tests {
             cross_domain_relationships_from(&conn, "data-mesh", "data-mesh:DataProduct", None)
                 .unwrap();
         assert!(rels.is_empty());
+    }
+
+    /// A deterministic test double for [`Embedder`]: maps each exact input
+    /// text to a hand-picked vector via a lookup table (falling back to the
+    /// origin for anything unlisted), so nearest-neighbor results in these
+    /// tests are fully predictable rather than depending on a real model.
+    struct FakeEmbedder {
+        dimension: usize,
+        vectors: std::collections::HashMap<String, Vec<f32>>,
+    }
+
+    impl FakeEmbedder {
+        fn new(dimension: usize) -> Self {
+            Self {
+                dimension,
+                vectors: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with_vector(mut self, text: &str, vector: Vec<f32>) -> Self {
+            self.vectors.insert(text.to_string(), vector);
+            self
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn model_name(&self) -> &str {
+            "fake-test-embedder"
+        }
+
+        fn embed(&self, texts: &[String]) -> rusty_embedder_core::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    self.vectors
+                        .get(t)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; self.dimension])
+                })
+                .collect())
+        }
+    }
+
+    /// The three seeded constructs' descriptions, placed on distinct axes
+    /// of a 2D space so cosine-nearest-neighbor is unambiguous by
+    /// construction: `AuthorityGrant` on +x, `ConflictRegistryEntry` on +y,
+    /// `DataProduct` on -x.
+    fn fake_embedder_for_seed_descriptions() -> FakeEmbedder {
+        FakeEmbedder::new(2)
+            .with_vector(
+                "A scoped, time-bounded grant of authority to act within a domain.",
+                vec![1.0, 0.0],
+            )
+            .with_vector(
+                "A recorded contradiction between two rules across authority layers.",
+                vec![0.0, 1.0],
+            )
+            .with_vector(
+                "A discoverable, owned unit of data published by a domain team.",
+                vec![-1.0, 0.0],
+            )
+    }
+
+    #[test]
+    fn build_construct_embeddings_with_null_embedder_is_a_noop() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let embedded =
+            build_construct_embeddings(&conn, &rusty_embedder_core::NullEmbedder::new()).unwrap();
+        assert_eq!(embedded, 0);
+        assert!(!sync_vector_index(&conn).unwrap());
+    }
+
+    #[test]
+    fn build_construct_embeddings_stores_one_row_per_described_construct() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let embedder = fake_embedder_for_seed_descriptions();
+        let embedded = build_construct_embeddings(&conn, &embedder).unwrap();
+        // All three seeded constructs (uaf-1.3:AuthorityGrant,
+        // uaf-1.3:ConflictRegistryEntry, data-mesh:DataProduct) have
+        // non-empty descriptions.
+        assert_eq!(embedded, 3);
+    }
+
+    #[test]
+    fn sync_vector_index_with_no_embeddings_is_unavailable() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        assert!(!sync_vector_index(&conn).unwrap());
+    }
+
+    #[test]
+    fn sync_vector_index_builds_table_sized_to_stored_dimension() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        build_construct_embeddings(&conn, &fake_embedder_for_seed_descriptions()).unwrap();
+        assert!(sync_vector_index(&conn).unwrap());
+    }
+
+    #[test]
+    fn vector_search_returns_nearest_by_cosine_distance() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let embedder = fake_embedder_for_seed_descriptions()
+            .with_vector("query near AuthorityGrant", vec![0.9, 0.1]);
+        build_construct_embeddings(&conn, &embedder).unwrap();
+        sync_vector_index(&conn).unwrap();
+
+        let results =
+            vector_search(&conn, &embedder, "query near AuthorityGrant", None, 3).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, "uaf-1.3:AuthorityGrant");
+    }
+
+    #[test]
+    fn vector_search_domain_filter_excludes_other_domains() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let embedder = fake_embedder_for_seed_descriptions()
+            .with_vector("query near AuthorityGrant", vec![0.9, 0.1]);
+        build_construct_embeddings(&conn, &embedder).unwrap();
+        sync_vector_index(&conn).unwrap();
+
+        let results = vector_search(
+            &conn,
+            &embedder,
+            "query near AuthorityGrant",
+            Some("data-mesh"),
+            3,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "data-mesh:DataProduct");
+    }
+
+    #[test]
+    fn hybrid_search_with_null_embedder_stays_lexical_only() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let (hits, mode) = hybrid_search(
+            &conn,
+            &rusty_embedder_core::NullEmbedder::new(),
+            "AuthorityGrant",
+            None,
+            None,
+            20,
+        )
+        .unwrap();
+        assert_eq!(mode, RetrievalMode::LexicalOnly);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| !h.is_vector_match));
+    }
+
+    #[test]
+    fn hybrid_search_fuses_lexical_and_vector_hits() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // "AuthorityGrant" is both an FTS keyword hit (matches the
+        // construct/rule text) and, via the fake embedder, the nearest
+        // vector hit -- present in both ranked lists, so RRF should surface
+        // it first with a lexical (non-vector-only) hit.
+        let embedder =
+            fake_embedder_for_seed_descriptions().with_vector("AuthorityGrant", vec![1.0, 0.0]);
+        build_construct_embeddings(&conn, &embedder).unwrap();
+
+        let (hits, mode) =
+            hybrid_search(&conn, &embedder, "AuthorityGrant", None, None, 20).unwrap();
+        assert_eq!(mode, RetrievalMode::Hybrid);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].construct_id, "uaf-1.3:AuthorityGrant");
+        assert!(!hits[0].is_vector_match);
+    }
+
+    #[test]
+    fn hybrid_search_surfaces_vector_only_hit_with_no_keyword_match() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // This query string appears in no rule's FTS-indexed text, but the
+        // fake embedder places it nearest ConflictRegistryEntry's
+        // description vector -- a vector-only hit.
+        let embedder = fake_embedder_for_seed_descriptions()
+            .with_vector("zzznotinanyrule zzzalsomissing", vec![0.1, 0.9]);
+        build_construct_embeddings(&conn, &embedder).unwrap();
+
+        let (hits, mode) = hybrid_search(
+            &conn,
+            &embedder,
+            "zzznotinanyrule zzzalsomissing",
+            None,
+            None,
+            20,
+        )
+        .unwrap();
+        assert_eq!(mode, RetrievalMode::Hybrid);
+        assert!(
+            hits.iter()
+                .any(|h| h.construct_id == "uaf-1.3:ConflictRegistryEntry" && h.is_vector_match)
+        );
     }
 }

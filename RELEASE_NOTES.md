@@ -5,6 +5,48 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Wire sqlite-vec vec0 table into search
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** hybrid search (closes
+  [rusty_knowledge#18](https://github.com/Rusty-Mill/rusty_knowledge/issues/18))
+  — `search_knowledge` now fuses FTS5 with `sqlite-vec` cosine-similarity
+  search over construct descriptions (RK-004) via Reciprocal Rank Fusion,
+  matching `knowledge-mcp`'s `hybrid_search`/`_reciprocal_rank_fusion`
+  exactly in shape: same RRF formula and `k=60` constant, embeddings keyed
+  by construct (not rule), a lazily-sized `vec0` table detected from the
+  first stored vector's byte length rather than a fixed dimension baked
+  into the schema, and a silent-but-honest fallback to `RetrievalMode::LexicalOnly`
+  on any vector-search error.
+- **New dependency:** [`rusty_embedder`](https://github.com/baileyrd/rusty_embedder)
+  (pinned to `6add27a`), the `Embedder` trait + `NullEmbedder` this crate
+  needed to close #18 — built earlier in this same parity-loop session
+  specifically for this gap, after confirming no existing org crate covered
+  it. Only `rusty-embedder-core` (zero-dependency: the trait, `NullEmbedder`,
+  and `serialize_f32`/`deserialize_f32`) is a mandatory dependency; the real
+  backends are opt-in Cargo features (`local-embeddings` via `fastembed-rs`,
+  no network at runtime after model download; `http-embeddings`, any
+  OpenAI-compatible endpoint via `reqwest`).
+- **Default behavior is unchanged:** the server still runs `NullEmbedder`
+  (dimension 0) unless both a real-backend feature is compiled in *and*
+  `EMBEDDING_BACKEND` (`local` / `http` / `openai`) selects it at startup --
+  matching `knowledge-mcp`'s own `EMBEDDING_BACKEND` env var and its
+  `NullEmbedder`-by-default posture. `cargo build`/`cargo test` with no
+  extra features stays exactly as fast and dependency-light as before;
+  every existing test keeps passing unmodified.
+- **Changed:** `store::RetrievalMode` gained a `Hybrid` variant. The
+  placeholder `rule_vectors` vec0 table (declared in schema since an early
+  slice, never populated, fixed at a meaningless `float[4]`) is replaced by
+  a real `construct_embeddings` table plus a `vec_constructs` vec0 table
+  built on demand.
+- 11 new tests (9 store-level: embedding storage/no-op with `NullEmbedder`,
+  vec0 index sync and dimension detection, KNN vector search and its domain
+  filter, hybrid fusion producing both a lexical+vector hit and a
+  vector-only hit, lexical-only fallback with `NullEmbedder`; 2 tool-level:
+  hybrid-mode search response formatting, semantic-only-match annotation).
+  All pre-existing tests continue to pass unmodified against the
+  `NullEmbedder` default (101 total, up from 90).
+
 ## PR #34 — Implement meta.list_domains
 **2026-08-12** · [#34](https://github.com/Rusty-Mill/rusty_knowledge/pull/34)
 
