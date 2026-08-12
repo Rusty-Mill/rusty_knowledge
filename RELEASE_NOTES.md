@@ -5,6 +5,27 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — RuleType gains RECOMMENDED/FORBIDDEN
+**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Fixed:** (closes
+  [rusty_knowledge#46](https://github.com/Rusty-Mill/rusty_knowledge/issues/46))
+  `RuleType` only modeled five of `knowledge-mcp`'s seven `rule_type`
+  values (`MUST`/`SHALL`/`SHOULD`/`MAY`/`MUST_NOT`). Rules or
+  valid-relationship rules using `RECOMMENDED`/`FORBIDDEN` were silently
+  unimportable — the `knowledge-mcp` importer skipped them row-by-row
+  with a disclosure, and the MCP tools' `rule_type` filter rejected them
+  outright. Added both as full `RuleType` variants (`as_str`/`from_str`
+  parity update included, so a row written with either value can also be
+  read back without panicking).
+- **Decision:** `RECOMMENDED`/`FORBIDDEN` are accepted as MCP-tool-facing
+  `rule_type` filter values too, via the same shared `RuleType::parse()`
+  path every other variant already uses — no separate, more restrictive
+  parsing surface for just these two.
+- The `knowledge-mcp` importer now imports rules using either value
+  instead of skipping them; a new test proves both round-trip correctly
+  through storage.
+
 ## PR #49 — Documentation refresh: ARCHITECTURE.md, gap-analysis.md, governance profile
 **2026-08-12** · [#49](https://github.com/Rusty-Mill/rusty_knowledge/pull/49)
 

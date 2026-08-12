@@ -75,7 +75,12 @@ pub struct Construct {
     pub description: String,
 }
 
-/// A rule's normative strength, matching `knowledge-mcp`'s five rule types.
+/// A rule's normative strength, matching `knowledge-mcp`'s seven rule
+/// types -- the five most rules use (`Must`/`Shall`/`Should`/`May`/
+/// `MustNot`) plus `Recommended`/`Forbidden`, which `knowledge-mcp`'s
+/// schema also allows but this crate didn't originally model (see
+/// rusty_knowledge#46: real rules using either value were silently
+/// unimportable until this variant existed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {
     Must,
@@ -83,6 +88,8 @@ pub enum RuleType {
     Should,
     May,
     MustNot,
+    Recommended,
+    Forbidden,
 }
 
 impl RuleType {
@@ -93,6 +100,8 @@ impl RuleType {
             RuleType::Should => "SHOULD",
             RuleType::May => "MAY",
             RuleType::MustNot => "MUST_NOT",
+            RuleType::Recommended => "RECOMMENDED",
+            RuleType::Forbidden => "FORBIDDEN",
         }
     }
 
@@ -103,7 +112,9 @@ impl RuleType {
             "SHOULD" => RuleType::Should,
             "MAY" => RuleType::May,
             "MUST_NOT" => RuleType::MustNot,
-            other => panic!("stored rule_type {other:?} is not one of the five known types"),
+            "RECOMMENDED" => RuleType::Recommended,
+            "FORBIDDEN" => RuleType::Forbidden,
+            other => panic!("stored rule_type {other:?} is not one of the seven known types"),
         }
     }
 
@@ -117,6 +128,8 @@ impl RuleType {
             "SHOULD" => Some(RuleType::Should),
             "MAY" => Some(RuleType::May),
             "MUST_NOT" => Some(RuleType::MustNot),
+            "RECOMMENDED" => Some(RuleType::Recommended),
+            "FORBIDDEN" => Some(RuleType::Forbidden),
             _ => None,
         }
     }

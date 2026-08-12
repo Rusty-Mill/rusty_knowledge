@@ -304,8 +304,7 @@ fn import_rules(
         let Some(rule_type) = RuleType::parse(&rule_type_str) else {
             report.rows_skipped += 1;
             report.disclosures.push(format!(
-                "rules: skipped rule {id:?} -- unrecognized rule_type {rule_type_str:?} \
-                 (rusty_knowledge has no equivalent for knowledge-mcp's RECOMMENDED/FORBIDDEN)"
+                "rules: skipped rule {id:?} -- unrecognized rule_type {rule_type_str:?}"
             ));
             continue;
         };
@@ -783,7 +782,7 @@ mod tests {
                  INSERT INTO constructs (id, domain_id, layer_num, construct_type, name)
                      VALUES ('d1:c1', 'd1', 1, 'entity', 'C1');
                  INSERT INTO rules (id, construct_id, domain_id, layer_num, rule_type, rule_text)
-                     VALUES ('r1', 'd1:c1', 'd1', 1, 'RECOMMENDED', 'no rusty_knowledge equivalent');",
+                     VALUES ('r1', 'd1:c1', 'd1', 1, 'MAYBE', 'not a real rule_type value');",
             )
             .unwrap();
         drop(fixture);
@@ -793,7 +792,44 @@ mod tests {
 
         assert_eq!(report.rules_imported, 0);
         assert_eq!(report.rows_skipped, 1);
-        assert!(report.disclosures.iter().any(|d| d.contains("RECOMMENDED")));
+        assert!(report.disclosures.iter().any(|d| d.contains("MAYBE")));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn import_knowledge_mcp_db_imports_recommended_and_forbidden_rule_types() {
+        let path = fixture_path("recommended_forbidden");
+        let fixture = create_fixture_schema(&path);
+        fixture
+            .execute_batch(
+                "INSERT INTO domains (id, name) VALUES ('d1', 'Demo');
+                 INSERT INTO constructs (id, domain_id, layer_num, construct_type, name)
+                     VALUES ('d1:c1', 'd1', 1, 'entity', 'C1');
+                 INSERT INTO rules (id, construct_id, domain_id, layer_num, rule_type, rule_text)
+                     VALUES ('r1', 'd1:c1', 'd1', 1, 'RECOMMENDED', 'a recommended practice');
+                 INSERT INTO rules (id, construct_id, domain_id, layer_num, rule_type, rule_text)
+                     VALUES ('r2', 'd1:c1', 'd1', 1, 'FORBIDDEN', 'a forbidden practice');",
+            )
+            .unwrap();
+        drop(fixture);
+
+        let dest = store::open_store().unwrap();
+        let report = import_knowledge_mcp_db(&dest, &path).unwrap();
+
+        assert_eq!(report.rules_imported, 2);
+        assert_eq!(report.rows_skipped, 0);
+        let rules = store::rules_with_checks_for_construct(&dest, "d1:c1", None).unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|(r, _)| r.rule_type == RuleType::Recommended)
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|(r, _)| r.rule_type == RuleType::Forbidden)
+        );
 
         let _ = std::fs::remove_file(&path);
     }
