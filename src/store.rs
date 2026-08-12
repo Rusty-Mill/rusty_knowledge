@@ -25,6 +25,9 @@ impl AuthorityLayer {
         }
     }
 
+    /// Trusted-storage parse: panics on a value that isn't one of the four
+    /// layers, since a row already in `rules_fts` was only ever written by
+    /// `insert_rule` with a valid `as_str()` output.
     fn from_str(text: &str) -> Self {
         match text {
             "Standard" => AuthorityLayer::Standard,
@@ -32,6 +35,19 @@ impl AuthorityLayer {
             "Conventions" => AuthorityLayer::Conventions,
             "Process" => AuthorityLayer::Process,
             other => panic!("stored layer {other:?} is not one of the four known layers"),
+        }
+    }
+
+    /// Fallible parse for untrusted input (e.g. an MCP tool caller's layer
+    /// filter) -- `None` rather than a panic on anything that isn't one of
+    /// the four known layers.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "Standard" => Some(AuthorityLayer::Standard),
+            "Tool Implementation" => Some(AuthorityLayer::ToolImplementation),
+            "Conventions" => Some(AuthorityLayer::Conventions),
+            "Process" => Some(AuthorityLayer::Process),
+            _ => None,
         }
     }
 }
@@ -191,27 +207,72 @@ pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::R
     Ok(())
 }
 
-/// Unscoped full-text search across every domain's rules. Deliberately not
-/// domain/layer-filtered yet, and deliberately not exposed with a wider
-/// response shape — RM-KNOWLEDGE-MODEL-0005-conforming hybrid/rank/mode
-/// output is tracked separately (rusty_knowledge#3) as a breaking change to
-/// the existing `search_knowledge` tool contract, not bundled into this slice.
-pub fn search(conn: &Connection, query: &str) -> rusqlite::Result<Vec<Rule>> {
+/// How a search response was produced. `RM-KNOWLEDGE-MODEL-0005` requires
+/// this be declared on every search response, not silently omitted or
+/// substituted -- there is deliberately no `Default` impl, so a caller can't
+/// forget to pick one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalMode {
+    /// FTS5 keyword match only. The only mode this crate can produce until
+    /// rusty_knowledge#18 wires the existing (but unused) `vec0` table into
+    /// search.
+    LexicalOnly,
+}
+
+impl RetrievalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetrievalMode::LexicalOnly => "lexical-only",
+        }
+    }
+}
+
+/// One ranked search hit: a rule plus its FTS5 rank (more negative = better
+/// match, per SQLite's bm25-derived `rank` auxiliary column -- ascending
+/// order is already best-first).
+pub struct SearchHit {
+    pub rule: Rule,
+    pub rank: f64,
+}
+
+/// Domain/layer-scoped, ranked search — the `RM-KNOWLEDGE-MODEL-0005`-conforming
+/// upgrade to plain `search`. `domain_id`/`layer` are optional filters; `None`
+/// means unfiltered on that axis, matching the previous unscoped behavior when
+/// both are `None`. Always returns `RetrievalMode::LexicalOnly` today; a caller
+/// combining this with vector similarity (once rusty_knowledge#18 lands) would
+/// report a different mode rather than this function silently claiming hybrid.
+pub fn search_scoped(
+    conn: &Connection,
+    query: &str,
+    domain_id: Option<&str>,
+    layer: Option<AuthorityLayer>,
+) -> rusqlite::Result<(Vec<SearchHit>, RetrievalMode)> {
+    let layer_str = layer.map(AuthorityLayer::as_str);
     let mut stmt = conn.prepare(
-        "SELECT domain_id, construct_id, construct, text, layer
-         FROM rules_fts WHERE rules_fts MATCH ?1",
+        "SELECT domain_id, construct_id, construct, text, layer, rank
+         FROM rules_fts
+         WHERE rules_fts MATCH ?1
+           AND (?2 IS NULL OR domain_id = ?2)
+           AND (?3 IS NULL OR layer = ?3)
+         ORDER BY rank",
     )?;
-    let rows = stmt.query_map([query], |row| {
+    let rows = stmt.query_map((query, domain_id, layer_str), |row| {
         let layer_text: String = row.get(4)?;
-        Ok(Rule {
-            domain_id: row.get(0)?,
-            construct_id: row.get(1)?,
-            construct: row.get(2)?,
-            text: row.get(3)?,
-            layer: AuthorityLayer::from_str(&layer_text),
+        Ok(SearchHit {
+            rule: Rule {
+                domain_id: row.get(0)?,
+                construct_id: row.get(1)?,
+                construct: row.get(2)?,
+                text: row.get(3)?,
+                layer: AuthorityLayer::from_str(&layer_text),
+            },
+            rank: row.get(5)?,
         })
     })?;
-    rows.collect()
+    Ok((
+        rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        RetrievalMode::LexicalOnly,
+    ))
 }
 
 /// Constructs belonging to exactly one domain — proves `RM-KNOWLEDGE-MODEL-0001`
@@ -360,20 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn search_still_matches_seeded_rules_across_all_domains() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let results = search(&conn, "AuthorityGrant").unwrap();
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.domain_id == "uaf-1.3"));
-
-        let cross_domain = search(&conn, "DataProduct").unwrap();
-        assert_eq!(cross_domain.len(), 1);
-        assert_eq!(cross_domain[0].domain_id, "data-mesh");
-    }
-
-    #[test]
     fn insert_relationship_round_trips() {
         let conn = open_store().unwrap();
         seed(&conn).unwrap();
@@ -396,5 +443,58 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM relationships", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn search_scoped_unfiltered_matches_plain_search() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let (hits, mode) = search_scoped(&conn, "AuthorityGrant", None, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(mode, RetrievalMode::LexicalOnly);
+    }
+
+    #[test]
+    fn search_scoped_filters_by_domain() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let (hits, _) = search_scoped(&conn, "DataProduct", Some("uaf-1.3"), None).unwrap();
+        assert!(
+            hits.is_empty(),
+            "data-mesh's DataProduct must not leak into a uaf-1.3-scoped search"
+        );
+
+        let (hits, _) = search_scoped(&conn, "DataProduct", Some("data-mesh"), None).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_scoped_filters_by_layer() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let (hits, _) = search_scoped(
+            &conn,
+            "AuthorityGrant",
+            None,
+            Some(AuthorityLayer::Conventions),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rule.layer, AuthorityLayer::Conventions);
+    }
+
+    #[test]
+    fn search_scoped_always_declares_lexical_only_today() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        // RM-KNOWLEDGE-MODEL-0005: the mode must be declared, never silently
+        // substituted -- until rusty_knowledge#18 wires vector retrieval in,
+        // every response is lexical-only, and this test pins that down.
+        let (_, mode) = search_scoped(&conn, "AuthorityGrant", None, None).unwrap();
+        assert_eq!(mode, RetrievalMode::LexicalOnly);
     }
 }

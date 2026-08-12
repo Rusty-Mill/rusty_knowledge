@@ -5,6 +5,28 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — search_knowledge: domain/layer filtering, rank, retrieval-mode
+**2026-08-12**
+
+- **Changed (breaking, explicitly signed off):** `search_knowledge`'s response
+  now always declares its retrieval mode (`lexical-only` until
+  [rusty_knowledge#18](https://github.com/Rusty-Mill/rusty_knowledge/issues/18)
+  wires vector retrieval in, per `RM-KNOWLEDGE-MODEL-0005`), includes each
+  hit's FTS5 rank, and accepts optional `domain_id`/`layer` filter params
+  (closes [rusty_knowledge#3](https://github.com/Rusty-Mill/rusty_knowledge/issues/3)).
+  Confirmed low-risk before implementing: no external consumer of this tool
+  exists yet besides this crate itself.
+- **Added:** `store::search_scoped`, `store::RetrievalMode`, `store::SearchHit`,
+  and `AuthorityLayer::parse` (a fallible parser for untrusted caller input,
+  separate from the existing panic-on-corruption `from_str` used for trusted
+  storage reads).
+- **Removed:** `store::search` — superseded by `search_scoped` called with no
+  filters; kept no dead code around once nothing needed it.
+- An unrecognized `layer` value is reported as a tool error, not silently
+  ignored or defaulted.
+- 7 new/updated tests (mode declaration, domain filter, layer filter,
+  unknown-layer error path); all pass.
+
 ## PR #20 — Implement meta.routing_guide
 **2026-08-12** · [#20](https://github.com/Rusty-Mill/rusty_knowledge/pull/20)
 
