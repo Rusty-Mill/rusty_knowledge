@@ -1,24 +1,22 @@
-//! Rusty Knowledge — vertical-slice proof of concept.
+//! Rusty Knowledge — an MCP server (via `rmcp`, stdio transport) over an
+//! FTS5/sqlite-vec store, working toward parity with `knowledge-mcp`'s
+//! 15-tool surface (tracked as rusty_knowledge#2-#18).
 //!
 //! Authorized by `rusty_foundation_akb`'s ADR-0166 (RFC-0005 fast-lane
 //! entry): `knowledge` doesn't author unsafe/FFI, a native platform
 //! backend, or authority/crypto primitives, so implementation proceeds
 //! without TRIAL-0003's full entry-gate process.
 //!
-//! This slice adds a real, minimal MCP server (via `rmcp`, stdio
-//! transport) exposing one tool — `search_knowledge` — over the
-//! FTS5/sqlite-vec store from the previous slice. It is deliberately
-//! not the full 15-tool surface `knowledge-mcp` exposes; the point of
-//! a vertical slice is proving the transport, the store, and the typed
-//! authority layer all compose end-to-end before building the rest.
+//! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
+//! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005)
+//! and `meta_routing_guide`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
-//! layered-authority conflict registry (RK-002), multi-domain hosting
-//! (RK-003), or hybrid vector retrieval in the tool surface itself
-//! (RK-004's vec0 table exists in the store but isn't queried by this
-//! tool yet). Each is a candidate for the next slice, not silently
-//! dropped.
+//! layered-authority conflict registry (RK-002), or hybrid vector
+//! retrieval in the tool surface itself (RK-004's vec0 table exists in
+//! the store but isn't queried by this tool yet). Each is a candidate
+//! for a later slice, not silently dropped.
 
 mod store;
 
@@ -33,6 +31,16 @@ use store::AuthorityLayer;
 struct SearchParams {
     /// FTS5 query string, e.g. a construct name or a word from a rule's text.
     query: String,
+    /// Restrict results to one domain (e.g. "uaf-1.3"). Omit to search all
+    /// loaded domains.
+    #[serde(default)]
+    domain_id: Option<String>,
+    /// Restrict results to one authority layer ("Standard" / "Tool
+    /// Implementation" / "Conventions" / "Process"). Omit to search all
+    /// layers. An unrecognized value is reported as an error, not silently
+    /// ignored.
+    #[serde(default)]
+    layer: Option<String>,
 }
 
 #[derive(Clone)]
@@ -43,20 +51,52 @@ struct KnowledgeServer {
 #[tool_router(server_handler)]
 impl KnowledgeServer {
     #[tool(
-        description = "Search knowledge-base rules by full-text query; every result carries its authority layer (Standard / Tool Implementation / Conventions / Process) — RM-KNOWLEDGE-MODEL-0002."
+        description = "Search knowledge-base rules by full-text query, optionally scoped to a domain and/or authority layer. Every result carries its authority layer (Standard / Tool Implementation / Conventions / Process), a rank, and the response always declares its retrieval mode (lexical-only today) per RM-KNOWLEDGE-MODEL-0002 and RM-KNOWLEDGE-MODEL-0005."
     )]
     fn search_knowledge(
         &self,
-        Parameters(SearchParams { query }): Parameters<SearchParams>,
+        Parameters(SearchParams {
+            query,
+            domain_id,
+            layer,
+        }): Parameters<SearchParams>,
     ) -> String {
+        let layer_filter = match layer.as_deref().map(AuthorityLayer::parse) {
+            Some(None) => {
+                return format!(
+                    "Search failed: {:?} is not a known authority layer (expected one of Standard, \
+                     Tool Implementation, Conventions, Process).",
+                    layer.unwrap()
+                );
+            }
+            Some(Some(parsed)) => Some(parsed),
+            None => None,
+        };
+
         let conn = self.conn.lock().expect("store mutex poisoned");
-        match store::search(&conn, &query) {
-            Ok(rules) if rules.is_empty() => format!("No rules matched {query:?}."),
-            Ok(rules) => rules
-                .iter()
-                .map(|r| format!("[{}] {}: {}", r.layer.as_str(), r.construct, r.text))
-                .collect::<Vec<_>>()
-                .join("\n"),
+        match store::search_scoped(&conn, &query, domain_id.as_deref(), layer_filter) {
+            Ok((hits, mode)) if hits.is_empty() => {
+                format!(
+                    "Retrieval mode: {}\nNo rules matched {query:?}.",
+                    mode.as_str()
+                )
+            }
+            Ok((hits, mode)) => {
+                let results = hits
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "[rank={:.3}] [{}] {}: {}",
+                            h.rank,
+                            h.rule.layer.as_str(),
+                            h.rule.construct,
+                            h.rule.text
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Retrieval mode: {}\n{results}", mode.as_str())
+            }
             Err(err) => format!("Search failed: {err}"),
         }
     }
@@ -90,7 +130,9 @@ async fn main() -> anyhow::Result<()> {
     // still only compiles because AuthorityLayer has no "unknown" variant.
     let _: AuthorityLayer = AuthorityLayer::Standard;
 
-    eprintln!("rusty-knowledge MCP server starting on stdio (tool: search_knowledge)");
+    eprintln!(
+        "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, meta_routing_guide)"
+    );
 
     let server = KnowledgeServer {
         conn: Arc::new(Mutex::new(conn)),
@@ -112,5 +154,47 @@ mod tests {
         for not_yet_implemented in ["lookup_construct", "validate_element", "crosscut_conflicts"] {
             assert!(!guide.contains(not_yet_implemented));
         }
+    }
+
+    fn test_server() -> KnowledgeServer {
+        let conn = store::open_store().unwrap();
+        store::seed(&conn).unwrap();
+        KnowledgeServer {
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    #[test]
+    fn search_knowledge_declares_retrieval_mode() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchParams {
+            query: "AuthorityGrant".into(),
+            domain_id: None,
+            layer: None,
+        }));
+        assert!(response.starts_with("Retrieval mode: lexical-only"));
+    }
+
+    #[test]
+    fn search_knowledge_domain_filter_excludes_other_domains() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchParams {
+            query: "DataProduct".into(),
+            domain_id: Some("uaf-1.3".into()),
+            layer: None,
+        }));
+        assert!(response.contains("No rules matched"));
+    }
+
+    #[test]
+    fn search_knowledge_rejects_unknown_layer_without_panicking() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchParams {
+            query: "AuthorityGrant".into(),
+            domain_id: None,
+            layer: Some("Nonexistent".into()),
+        }));
+        assert!(response.contains("Search failed"));
+        assert!(response.contains("not a known authority layer"));
     }
 }
