@@ -233,6 +233,35 @@ pub fn insert_domain(conn: &Connection, domain: &Domain) -> rusqlite::Result<()>
     Ok(())
 }
 
+pub fn domain_by_id(conn: &Connection, domain_id: &str) -> rusqlite::Result<Option<Domain>> {
+    let mut stmt = conn.prepare("SELECT id, name FROM domains WHERE id = ?1")?;
+    let rows = stmt
+        .query_map([domain_id], |row| {
+            Ok(Domain {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().next())
+}
+
+/// Distinct authority layers with at least one rule in a domain --
+/// `lookup.domain_summary`'s "layers" field, derived rather than tracked
+/// separately, since it's fully determined by what's already in `rules_fts`.
+pub fn layers_present_in_domain(
+    conn: &Connection,
+    domain_id: &str,
+) -> rusqlite::Result<Vec<AuthorityLayer>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT layer FROM rules_fts WHERE domain_id = ?1 ORDER BY layer")?;
+    let rows = stmt.query_map([domain_id], |row| {
+        let layer_text: String = row.get(0)?;
+        Ok(AuthorityLayer::from_str(&layer_text))
+    })?;
+    rows.collect()
+}
+
 pub fn insert_construct(conn: &Connection, construct: &Construct) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO constructs (id, domain_id, short_name, construct_type, description)
@@ -728,6 +757,28 @@ mod tests {
 
         let rules = valid_relationships_between(&conn, "uaf-1.3", "entity", "viewpoint").unwrap();
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn domain_by_id_returns_seeded_domain() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let domain = domain_by_id(&conn, "uaf-1.3").unwrap().unwrap();
+        assert_eq!(domain.name, "UAF 1.3");
+
+        assert!(domain_by_id(&conn, "does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn layers_present_in_domain_matches_seeded_rules() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let layers = layers_present_in_domain(&conn, "uaf-1.3").unwrap();
+        assert!(layers.contains(&AuthorityLayer::Standard));
+        assert!(layers.contains(&AuthorityLayer::Conventions));
+        assert!(!layers.contains(&AuthorityLayer::Process));
     }
 
     #[test]

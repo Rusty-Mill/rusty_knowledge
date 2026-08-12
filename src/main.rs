@@ -10,7 +10,8 @@
 //! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
 //! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
 //! `meta_routing_guide`, `lookup_construct`, `lookup_rules`,
-//! `lookup_relationships`, and `lookup_valid_relationships`.
+//! `lookup_relationships`, `lookup_valid_relationships`, and
+//! `lookup_domain_summary`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -123,6 +124,12 @@ struct ValidRelationshipsLookupParams {
     from_type: String,
     /// Target construct type.
     to_type: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DomainSummaryParams {
+    /// Domain to summarize, e.g. "uaf-1.3".
+    domain_id: String,
 }
 
 #[derive(Clone)]
@@ -408,6 +415,61 @@ impl KnowledgeServer {
             rules.len()
         )
     }
+
+    #[tool(
+        description = "Get a summary of a domain: name, authority layers present, and construct counts (total and by type)."
+    )]
+    fn lookup_domain_summary(
+        &self,
+        Parameters(DomainSummaryParams { domain_id }): Parameters<DomainSummaryParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let domain = match store::domain_by_id(&conn, &domain_id) {
+            Ok(Some(domain)) => domain,
+            Ok(None) => return format!("Domain {domain_id:?} not found."),
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let constructs = match store::constructs_in_domain(&conn, &domain_id) {
+            Ok(constructs) => constructs,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+        let layers = match store::layers_present_in_domain(&conn, &domain_id) {
+            Ok(layers) => layers,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let mut by_type: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for c in &constructs {
+            *by_type.entry(c.construct_type.as_str()).or_insert(0) += 1;
+        }
+        let by_type_block = if by_type.is_empty() {
+            "  (none)".to_string()
+        } else {
+            by_type
+                .iter()
+                .map(|(construct_type, count)| format!("  {construct_type}: {count}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let layers_block = if layers.is_empty() {
+            "(none)".to_string()
+        } else {
+            layers
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        format!(
+            "{} ({})\nLayers present: {layers_block}\nConstructs: {} total\n{by_type_block}",
+            domain.name,
+            domain.id,
+            constructs.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -437,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
-         lookup_valid_relationships)"
+         lookup_valid_relationships, lookup_domain_summary)"
     );
 
     let server = KnowledgeServer {
@@ -712,5 +774,37 @@ mod tests {
                 to_type: "viewpoint".into(),
             }));
         assert!(response.contains("No valid relationship types declared"));
+    }
+
+    #[test]
+    fn lookup_domain_summary_reports_layers_and_counts() {
+        let server = test_server();
+        let response = server.lookup_domain_summary(Parameters(DomainSummaryParams {
+            domain_id: "uaf-1.3".into(),
+        }));
+        assert!(response.contains("UAF 1.3"));
+        assert!(response.contains("Constructs: 2 total"));
+        assert!(response.contains("entity: 2"));
+        // uaf-1.3's seeded rules span Standard and Conventions layers.
+        assert!(response.contains("Standard"));
+        assert!(response.contains("Conventions"));
+    }
+
+    #[test]
+    fn lookup_domain_summary_other_domain_does_not_leak_counts() {
+        let server = test_server();
+        let response = server.lookup_domain_summary(Parameters(DomainSummaryParams {
+            domain_id: "data-mesh".into(),
+        }));
+        assert!(response.contains("Constructs: 1 total"));
+    }
+
+    #[test]
+    fn lookup_domain_summary_unknown_domain_reports_not_found() {
+        let server = test_server();
+        let response = server.lookup_domain_summary(Parameters(DomainSummaryParams {
+            domain_id: "does-not-exist".into(),
+        }));
+        assert!(response.contains("not found"));
     }
 }
