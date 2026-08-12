@@ -5,6 +5,43 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement validate.element
+**2026-08-12**
+
+- **Added:** `validate_element` MCP tool (closes
+  [rusty_knowledge#9](https://github.com/Rusty-Mill/rusty_knowledge/issues/9)) —
+  validates a caller-supplied element's properties against a construct's
+  machine-checkable rules, returning PASS/FAIL/WARNING per rule plus an
+  overall result. This is the rule-evaluation engine `knowledge-mcp`'s
+  `_evaluate_machine_rule` provides — the biggest real gap in this list.
+- **Added:** `MachineRule` (a structured, machine-checkable rule attached to
+  a `Rule` row — required-property, enum-value, pattern, and range checks,
+  matching `knowledge-mcp`'s `machine_rule` schema), `ValidationOutcome`, and
+  `evaluate_machine_rule`. A new `rule_machine_checks` side table keyed by
+  `rules_fts`'s `rowid` stores them, since most rules are free text only and
+  don't need one. `insert_rule` now returns that `rowid` so a caller can
+  attach a check afterward.
+- **Deliberately incomplete, disclosed rather than silently skipped:**
+  `Pattern` (regex) checks are modeled but not evaluated —
+  `evaluate_machine_rule` returns a clear "not supported yet" `WARNING`
+  rather than a false PASS/FAIL. Implementing it needs a `regex` crate
+  dependency, and adding a new third-party dependency is its own stop-and-ask
+  gate per this skill's rule, same as a breaking change — not something to
+  add silently mid-issue. No seed data constructs a `Pattern` check yet.
+- **Deliberately not included:** the separate "required-property schema per
+  construct type" completeness check `knowledge-mcp` also runs in
+  `validate.element` (distinct from per-rule machine checks) isn't modeled —
+  it's a different concept (a declared property schema) that would double
+  this issue's scope. Also skipped: `known_conflicts` (needs #14).
+- Seed data: one existing rule (`AuthorityGrant`'s "MUST declare an explicit
+  scope and expiry") now carries a `RequiredProperty { property: "scope" }`
+  check, so there's something real to validate against — no new rule row
+  added, so existing rule-count assertions elsewhere are untouched.
+- 10 new tests (5 tool-level: fail/pass on the required-property check,
+  no-machine-checks construct, unknown construct, layer filter excluding the
+  check; 5 store-level: joined query returns the seeded check, and
+  `evaluate_machine_rule` for required-property/enum/range/pattern-disclosed).
+
 ## PR #26 — Implement lookup.domain_summary
 **2026-08-12** · [#26](https://github.com/Rusty-Mill/rusty_knowledge/pull/26)
 
