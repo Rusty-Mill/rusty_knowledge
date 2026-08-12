@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement meta.list_domains
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #34 — Implement meta.list_domains
+**2026-08-12** · [#34](https://github.com/Rusty-Mill/rusty_knowledge/pull/34)
 
 - **Added:** `meta_list_domains` MCP tool (closes
   [rusty_knowledge#16](https://github.com/Rusty-Mill/rusty_knowledge/issues/16))
