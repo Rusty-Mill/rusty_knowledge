@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — RuleType gains RECOMMENDED/FORBIDDEN
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #50 — RuleType gains RECOMMENDED/FORBIDDEN
+**2026-08-12** · [#50](https://github.com/Rusty-Mill/rusty_knowledge/pull/50)
 
 - **Fixed:** (closes
   [rusty_knowledge#46](https://github.com/Rusty-Mill/rusty_knowledge/issues/46))
