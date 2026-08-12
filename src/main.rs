@@ -14,7 +14,7 @@
 //! `lookup_domain_summary`, `validate_element` (required-property,
 //! enum-value, range, and pattern machine checks -- pattern matching via
 //! `rusty_regx`, a zero-dependency in-ecosystem regex engine),
-//! `validate_relationship`, and `validate_completeness`.
+//! `validate_relationship`, `validate_completeness`, and `search_constructs`.
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -170,6 +170,15 @@ struct ValidateCompletenessParams {
     /// Element type IDs actually present in the model being checked.
     #[serde(default)]
     present_element_types: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SearchConstructsParams {
+    /// Domain to list constructs from, e.g. "uaf-1.3".
+    domain_id: String,
+    /// Restrict to one construct type, e.g. "entity". Omit for all types.
+    #[serde(default)]
+    construct_type: Option<String>,
 }
 
 #[derive(Clone)]
@@ -471,7 +480,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let constructs = match store::constructs_in_domain(&conn, &domain_id) {
+        let constructs = match store::constructs_in_domain(&conn, &domain_id, None) {
             Ok(constructs) => constructs,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -720,6 +729,37 @@ impl KnowledgeServer {
             list_or_none(&report.recommended_rule_texts),
         )
     }
+
+    #[tool(description = "List and filter constructs within a domain by construct type.")]
+    fn search_constructs(
+        &self,
+        Parameters(SearchConstructsParams {
+            domain_id,
+            construct_type,
+        }): Parameters<SearchConstructsParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let constructs =
+            match store::constructs_in_domain(&conn, &domain_id, construct_type.as_deref()) {
+                Ok(constructs) => constructs,
+                Err(err) => return format!("Search failed: {err}"),
+            };
+
+        if constructs.is_empty() {
+            return format!("No constructs found in domain {domain_id:?}.");
+        }
+
+        let constructs_block = constructs
+            .iter()
+            .map(|c| format!("  {} ({}) [{}]", c.short_name, c.id, c.construct_type))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} construct(s) in domain {domain_id:?}:\n{constructs_block}",
+            constructs.len()
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -729,11 +769,13 @@ impl KnowledgeServer {
 /// their tools are implemented (rusty_knowledge#5-#16), not advertised ahead
 /// of a working tool.
 fn routing_guide() -> String {
-    "Routing guidance (grows as more tools land -- see rusty_knowledge#6-#16):\n\
-     - \"I can't find the right construct\" -> search_knowledge\n\
+    "Routing guidance (grows as more tools land -- see rusty_knowledge#13-#16):\n\
+     - \"I can't find the right construct\" -> search_knowledge, search_constructs\n\
      - \"What does X mean?\" -> lookup_construct\n\
      - \"What should X be named/styled?\" -> lookup_rules (layer=Conventions)\n\
-     - \"Who owns X / when is X due?\" -> lookup_rules (layer=Process)"
+     - \"Who owns X / when is X due?\" -> lookup_rules (layer=Process)\n\
+     - \"Is X valid/conformant?\" -> validate_element, validate_relationship\n\
+     - \"Is this model/viewpoint complete?\" -> validate_completeness"
         .to_string()
 }
 
@@ -750,7 +792,7 @@ async fn main() -> anyhow::Result<()> {
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
          lookup_valid_relationships, lookup_domain_summary, validate_element, \
-         validate_relationship, validate_completeness)"
+         validate_relationship, validate_completeness, search_constructs)"
     );
 
     let server = KnowledgeServer {
@@ -769,10 +811,14 @@ mod tests {
     fn routing_guide_only_references_existing_tools() {
         let guide = routing_guide();
         assert!(guide.contains("search_knowledge"));
+        assert!(guide.contains("search_constructs"));
         assert!(guide.contains("lookup_construct"));
         assert!(guide.contains("lookup_rules"));
+        assert!(guide.contains("validate_element"));
+        assert!(guide.contains("validate_relationship"));
+        assert!(guide.contains("validate_completeness"));
         // These tools don't exist yet -- the guide must not claim they do.
-        for not_yet_implemented in ["validate_element", "crosscut_conflicts"] {
+        for not_yet_implemented in ["crosscut_conflicts", "meta_list_domains"] {
             assert!(!guide.contains(not_yet_implemented));
         }
     }
@@ -1254,5 +1300,38 @@ mod tests {
             present_element_types: vec![],
         }));
         assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn search_constructs_lists_all_in_domain() {
+        let server = test_server();
+        let response = server.search_constructs(Parameters(SearchConstructsParams {
+            domain_id: "uaf-1.3".into(),
+            construct_type: None,
+        }));
+        assert!(response.contains("2 construct(s)"));
+        assert!(response.contains("AuthorityGrant"));
+        assert!(response.contains("ConflictRegistryEntry"));
+        assert!(!response.contains("DataProduct"));
+    }
+
+    #[test]
+    fn search_constructs_filters_by_type() {
+        let server = test_server();
+        let response = server.search_constructs(Parameters(SearchConstructsParams {
+            domain_id: "uaf-1.3".into(),
+            construct_type: Some("viewpoint".into()),
+        }));
+        assert!(response.contains("No constructs found"));
+    }
+
+    #[test]
+    fn search_constructs_unknown_domain_reports_none_found() {
+        let server = test_server();
+        let response = server.search_constructs(Parameters(SearchConstructsParams {
+            domain_id: "does-not-exist".into(),
+            construct_type: None,
+        }));
+        assert!(response.contains("No constructs found"));
     }
 }
