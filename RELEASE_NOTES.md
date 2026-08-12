@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Documentation refresh: ARCHITECTURE.md, gap-analysis.md, governance profile
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #49 — Documentation refresh: ARCHITECTURE.md, gap-analysis.md, governance profile
+**2026-08-12** · [#49](https://github.com/Rusty-Mill/rusty_knowledge/pull/49)
 
 - **Fixed:** (closes
   [rusty_knowledge#48](https://github.com/Rusty-Mill/rusty_knowledge/issues/48))
