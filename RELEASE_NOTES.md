@@ -5,6 +5,35 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #32 — Implement crosscut.conflicts
+**2026-08-12** · [#32](https://github.com/Rusty-Mill/rusty_knowledge/pull/32)
+
+- **Added:** `crosscut_conflicts` MCP tool (closes
+  [rusty_knowledge#14](https://github.com/Rusty-Mill/rusty_knowledge/issues/14),
+  the layered-authority conflict registry, RK-002) — lists conflict-registry
+  entries for a domain, optionally narrowed to one construct. Matching
+  `knowledge-mcp`'s `get_conflicts`, a construct-scoped query returns both
+  that construct's own conflicts *and* the domain's construct-independent
+  ones (a domain-level conflict applies no matter which construct you asked
+  about).
+- **Deliberately different from `knowledge-mcp`:** an unresolvable
+  `construct_ref` is a hard error here, not a silently dropped filter that
+  falls back to the whole domain — the same divergence already made for
+  `lookup_relationships`' `to_construct_ref` (rusty_knowledge#6), for the
+  same reason: silently widening the result set on a typo'd reference is
+  more surprising than failing loudly.
+- **Added:** `Conflict` struct, `conflicts` table, `insert_conflict`, and
+  `conflicts_for` in `store.rs`. `layer_a`/`layer_b` are `AuthorityLayer`
+  (matching how `Rule`/`Relationship` already model layers), not raw
+  integers as in `knowledge-mcp`'s `layer_num`.
+- **Seed data:** one real conflict entry, documenting the exact
+  Standard-vs-Conventions contradiction the two existing seeded
+  `AuthorityGrant` rules already imply (expiry required vs. often omitted).
+- 8 new tests (3 store-level: seeded conflict, construct + domain-level
+  scoping, a domain with none; 5 tool-level: seeded conflict reported,
+  construct + domain-level listing, construct-scoped filter, no conflicts,
+  unknown construct).
+
 ## PR #31 — Implement crosscut.traceability
 **2026-08-12** · [#31](https://github.com/Rusty-Mill/rusty_knowledge/pull/31)
 
