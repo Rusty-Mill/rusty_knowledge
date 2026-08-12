@@ -50,7 +50,8 @@ pub fn open_store() -> rusqlite::Result<Connection> {
     // `sqlite3_auto_extension` lives in rusqlite::ffi, not sqlite_vec itself
     // (sqlite_vec only exports the init entrypoint) -- confirmed against
     // the crate's own usage guide, not guessed.
-    #[allow(clippy::missing_transmute_annotations)] // matches sqlite-vec's own documented usage verbatim
+    #[allow(clippy::missing_transmute_annotations)]
+    // matches sqlite-vec's own documented usage verbatim
     unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
             sqlite_vec::sqlite3_vec_init as *const (),
