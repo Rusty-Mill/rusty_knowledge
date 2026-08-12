@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Import a knowledge-mcp SQLite database
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #39 — Import a knowledge-mcp SQLite database
+**2026-08-12** · [#39](https://github.com/Rusty-Mill/rusty_knowledge/pull/39)
 
 - **Added:** `knowledge_mcp_import::import_knowledge_mcp_db` (closes
   [rusty_knowledge#38](https://github.com/Rusty-Mill/rusty_knowledge/issues/38))
