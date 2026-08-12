@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement crosscut.traceability
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #31 — Implement crosscut.traceability
+**2026-08-12** · [#31](https://github.com/Rusty-Mill/rusty_knowledge/pull/31)
 
 - **Added:** `crosscut_traceability` MCP tool (closes
   [rusty_knowledge#13](https://github.com/Rusty-Mill/rusty_knowledge/issues/13)) —
