@@ -5,6 +5,23 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Implement lookup.domain_summary
+**2026-08-12**
+
+- **Added:** `lookup_domain_summary` MCP tool (closes
+  [rusty_knowledge#8](https://github.com/Rusty-Mill/rusty_knowledge/issues/8)) —
+  domain name, authority layers present, and construct counts (total and by
+  type).
+- **Added:** `domain_by_id` and `layers_present_in_domain` queries in
+  `store.rs`. Layers-present is derived from `rules_fts` rather than tracked
+  as separate state, since it's fully determined by what rules already exist.
+- **Deliberately not included:** `conflict_count` — `knowledge-mcp`'s summary
+  includes a count from its conflict registry, which doesn't exist in this
+  crate yet (lands with
+  [rusty_knowledge#14](https://github.com/Rusty-Mill/rusty_knowledge/issues/14)).
+- 6 new tests (layers + counts for a populated domain, no cross-domain count
+  leakage, unknown domain, plus 2 new store-level tests).
+
 ## PR #25 — Implement lookup.valid_relationships
 **2026-08-12** · [#25](https://github.com/Rusty-Mill/rusty_knowledge/pull/25)
 
