@@ -5,6 +5,34 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #49 — Documentation refresh: ARCHITECTURE.md, gap-analysis.md, governance profile
+**2026-08-12** · [#49](https://github.com/Rusty-Mill/rusty_knowledge/pull/49)
+
+- **Fixed:** (closes
+  [rusty_knowledge#48](https://github.com/Rusty-Mill/rusty_knowledge/issues/48))
+  `ARCHITECTURE.md` was unchanged since the first vertical slice — still
+  described one tool, two modules, no persistence, and listed the
+  conflict registry/multi-domain hosting/vector retrieval as deliberate
+  non-goals when all three had since been implemented. Rewritten to
+  match current reality: the full tool surface, all three modules
+  (`main.rs`/`store.rs`/`knowledge_mcp_import.rs`), the search and
+  startup data flows, and a non-goals list that no longer contradicts
+  the codebase.
+- **Updated:** `gap-analysis.md`'s status banner — it previously said
+  the `knowledge-mcp` import gap (#38) "remains open"; it and its three
+  follow-ups (#41, #43, #45) have since closed, and #46 (`RuleType`
+  extension) is noted as the one still-open item.
+- **Updated:** `docs/rusty-mill-profile.md`'s field *values* — several
+  claimed "no code exists," "no dependencies selected," "no CI," "no
+  tests," all false after implementation proceeded. Corrected to
+  describe this repository's actual state. The governance **status**
+  itself (Draft, not Accepted; `TRIAL-0003` not formally authorized) is
+  deliberately left unchanged — that determination belongs to
+  `rusty_foundation_akb`, not something this repository can declare for
+  itself. A note explains the gap between "formally authorized" and
+  "actually implemented" rather than papering over it.
+- Docs only, no code changes.
+
 ## PR #47 — Rewrite the README to reflect current reality
 **2026-08-12** · [#47](https://github.com/Rusty-Mill/rusty_knowledge/pull/47)
 
