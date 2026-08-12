@@ -160,6 +160,143 @@ pub struct ValidRelationshipRule {
     pub cardinality: String,
 }
 
+/// A structured, machine-checkable rule attached to a `Rule` row, matching
+/// (a subset of) `knowledge-mcp`'s `machine_rule` schema. Most rules are
+/// free text only (no `MachineRule` attached) -- this exists for the
+/// minority whose normative text can be checked programmatically against an
+/// element's properties.
+///
+/// `Pattern` (regex-match) is checked via `rusty_regx` -- a zero-dependency
+/// POSIX-ERE engine from this same GitHub account, added as a dependency
+/// only after explicit sign-off, per this skill's stop-and-ask rule for new
+/// third-party dependencies (a bare `regex` crate dependency was considered
+/// and deliberately not used, to avoid pulling in its several transitive
+/// dependencies when a zero-dependency in-ecosystem alternative exists).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MachineRule {
+    RequiredProperty {
+        property: String,
+    },
+    EnumValue {
+        property: String,
+        values: Vec<String>,
+    },
+    Pattern {
+        property: String,
+        pattern: String,
+    },
+    Range {
+        property: String,
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+}
+
+/// The result of evaluating one `MachineRule` against an element's
+/// properties -- PASS/FAIL/WARNING, matching `knowledge-mcp`'s three-way
+/// `validate.element` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    Pass,
+    Fail,
+    Warning,
+}
+
+impl ValidationOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValidationOutcome::Pass => "PASS",
+            ValidationOutcome::Fail => "FAIL",
+            ValidationOutcome::Warning => "WARNING",
+        }
+    }
+}
+
+/// Evaluate one machine rule against an element's properties (property name
+/// -> value, both as strings -- this crate doesn't model a typed property
+/// schema yet, matching `knowledge-mcp`'s own loosely-typed `dict`).
+pub fn evaluate_machine_rule(
+    check: &MachineRule,
+    properties: &std::collections::HashMap<String, String>,
+) -> (ValidationOutcome, String) {
+    match check {
+        MachineRule::RequiredProperty { property } => match properties.get(property) {
+            Some(v) if !v.is_empty() => (
+                ValidationOutcome::Pass,
+                format!("Property '{property}' is present"),
+            ),
+            _ => (
+                ValidationOutcome::Fail,
+                format!("Required property '{property}' is absent or empty"),
+            ),
+        },
+        MachineRule::EnumValue { property, values } => match properties.get(property) {
+            Some(v) if values.iter().any(|allowed| allowed == v) => (
+                ValidationOutcome::Pass,
+                format!("'{property}' value '{v}' is valid"),
+            ),
+            Some(v) => (
+                ValidationOutcome::Fail,
+                format!("'{property}' = '{v}' is not in {values:?}"),
+            ),
+            None => (
+                ValidationOutcome::Fail,
+                format!("Property '{property}' is absent"),
+            ),
+        },
+        MachineRule::Pattern { property, pattern } => {
+            let val = properties.get(property).map(String::as_str).unwrap_or("");
+            match rusty_regx::Regex::new(pattern) {
+                // `find` is an unanchored search; requiring the match to
+                // start at 0 replicates Python's `re.match` semantics
+                // (anchored at the start, not necessarily the whole string).
+                Ok(re) => match re.find(val) {
+                    Some(m) if m.start() == 0 => (
+                        ValidationOutcome::Pass,
+                        format!("'{property}' matches required pattern '{pattern}'"),
+                    ),
+                    _ => (
+                        ValidationOutcome::Warning,
+                        format!("'{property}' = '{val}' does not match pattern '{pattern}'"),
+                    ),
+                },
+                Err(err) => (
+                    ValidationOutcome::Warning,
+                    format!("Pattern '{pattern}' for '{property}' is invalid: {err}"),
+                ),
+            }
+        }
+        MachineRule::Range { property, min, max } => {
+            let Some(val) = properties.get(property).and_then(|v| v.parse::<f64>().ok()) else {
+                return (
+                    ValidationOutcome::Fail,
+                    format!("Property '{property}' is absent or not numeric"),
+                );
+            };
+            if let Some(min) = min
+                && val < *min
+            {
+                return (
+                    ValidationOutcome::Fail,
+                    format!("'{property}' = {val} is below minimum {min}"),
+                );
+            }
+            if let Some(max) = max
+                && val > *max
+            {
+                return (
+                    ValidationOutcome::Fail,
+                    format!("'{property}' = {val} is above maximum {max}"),
+                );
+            }
+            (
+                ValidationOutcome::Pass,
+                format!("'{property}' = {val} is within range"),
+            )
+        }
+    }
+}
+
 pub fn open_store() -> rusqlite::Result<Connection> {
     // sqlite-vec registers itself as an auto-extension: every connection
     // opened after this call gets vec0 virtual tables. This is the exact
@@ -219,6 +356,17 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              relationship_type TEXT NOT NULL,
              cardinality       TEXT NOT NULL,
              PRIMARY KEY (domain_id, from_type, to_type, relationship_type)
+         );
+         CREATE TABLE rule_machine_checks (
+             -- No FOREIGN KEY to rules_fts(rowid): SQLite doesn't support FK
+             -- constraints referencing a virtual (FTS5) table's rowid.
+             rule_rowid  INTEGER PRIMARY KEY,
+             check_type  TEXT NOT NULL,
+             property    TEXT NOT NULL,
+             enum_values TEXT,
+             pattern     TEXT,
+             min_value   REAL,
+             max_value   REAL
          );
          CREATE VIRTUAL TABLE rule_vectors USING vec0(embedding float[4]);",
     )?;
@@ -350,7 +498,10 @@ pub fn rules_for_construct(
     rows.collect()
 }
 
-pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
+/// Returns the inserted row's `rowid`, so a caller that also wants to attach
+/// a `MachineRule` (via `insert_machine_check`) has something to key it to --
+/// `rules_fts` has no other stable per-row identifier.
+pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO rules_fts (domain_id, construct_id, construct, text, layer, rule_type)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -363,7 +514,138 @@ pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
             rule.rule_type.as_str(),
         ),
     )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Flattened, table-row-shaped view of a `MachineRule` -- avoids an
+/// unwieldy tuple type for `insert_machine_check`'s internal decomposition.
+struct MachineCheckRow<'a> {
+    check_type: &'a str,
+    property: &'a str,
+    enum_values: Option<String>,
+    pattern: Option<&'a str>,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+}
+
+pub fn insert_machine_check(
+    conn: &Connection,
+    rule_rowid: i64,
+    check: &MachineRule,
+) -> rusqlite::Result<()> {
+    let row = match check {
+        MachineRule::RequiredProperty { property } => MachineCheckRow {
+            check_type: "required_property",
+            property,
+            enum_values: None,
+            pattern: None,
+            min_value: None,
+            max_value: None,
+        },
+        MachineRule::EnumValue { property, values } => MachineCheckRow {
+            check_type: "enum_value",
+            property,
+            enum_values: Some(values.join(",")),
+            pattern: None,
+            min_value: None,
+            max_value: None,
+        },
+        MachineRule::Pattern { property, pattern } => MachineCheckRow {
+            check_type: "pattern",
+            property,
+            enum_values: None,
+            pattern: Some(pattern.as_str()),
+            min_value: None,
+            max_value: None,
+        },
+        MachineRule::Range { property, min, max } => MachineCheckRow {
+            check_type: "range",
+            property,
+            enum_values: None,
+            pattern: None,
+            min_value: *min,
+            max_value: *max,
+        },
+    };
+    conn.execute(
+        "INSERT INTO rule_machine_checks
+             (rule_rowid, check_type, property, enum_values, pattern, min_value, max_value)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            rule_rowid,
+            row.check_type,
+            row.property,
+            row.enum_values,
+            row.pattern,
+            row.min_value,
+            row.max_value,
+        ),
+    )?;
     Ok(())
+}
+
+fn machine_rule_from_row(
+    check_type: Option<String>,
+    property: Option<String>,
+    enum_values: Option<String>,
+    pattern: Option<String>,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+) -> Option<MachineRule> {
+    let property = property?;
+    match check_type?.as_str() {
+        "required_property" => Some(MachineRule::RequiredProperty { property }),
+        "enum_value" => Some(MachineRule::EnumValue {
+            property,
+            values: enum_values
+                .unwrap_or_default()
+                .split(',')
+                .map(str::to_string)
+                .collect(),
+        }),
+        "pattern" => Some(MachineRule::Pattern {
+            property,
+            pattern: pattern.unwrap_or_default(),
+        }),
+        "range" => Some(MachineRule::Range {
+            property,
+            min: min_value,
+            max: max_value,
+        }),
+        _ => None,
+    }
+}
+
+/// Rules for a construct alongside any `MachineRule` each carries --
+/// `validate_element`'s input. `None` in the second tuple slot means the
+/// rule is free text only, same as `knowledge-mcp`'s `if rule.machine_rule:`
+/// guard.
+pub fn rules_with_checks_for_construct(
+    conn: &Connection,
+    construct_id: &str,
+    layer: Option<AuthorityLayer>,
+) -> rusqlite::Result<Vec<(Rule, Option<MachineRule>)>> {
+    let layer_str = layer.map(AuthorityLayer::as_str);
+    let mut stmt = conn.prepare(
+        "SELECT r.domain_id, r.construct_id, r.construct, r.text, r.layer, r.rule_type,
+                m.check_type, m.property, m.enum_values, m.pattern, m.min_value, m.max_value
+         FROM rules_fts r
+         LEFT JOIN rule_machine_checks m ON m.rule_rowid = r.rowid
+         WHERE r.construct_id = ?1 AND (?2 IS NULL OR r.layer = ?2)",
+    )?;
+    let rows = stmt.query_map((construct_id, layer_str), |row| {
+        let rule = rule_from_row(row)?;
+        let machine_rule = machine_rule_from_row(
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+        );
+        Ok((rule, machine_rule))
+    })?;
+    rows.collect()
 }
 
 pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::Result<()> {
@@ -594,7 +876,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    insert_rule(
+    let authority_grant_scope_rule_id = insert_rule(
         conn,
         &Rule {
             domain_id: "uaf-1.3".into(),
@@ -603,6 +885,13 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             text: "An AuthorityGrant MUST declare an explicit scope and expiry.".into(),
             layer: AuthorityLayer::Standard,
             rule_type: RuleType::Must,
+        },
+    )?;
+    insert_machine_check(
+        conn,
+        authority_grant_scope_rule_id,
+        &MachineRule::RequiredProperty {
+            property: "scope".into(),
         },
     )?;
     insert_rule(
@@ -627,7 +916,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             rule_type: RuleType::Must,
         },
     )?;
-    insert_rule(
+    let data_product_owning_team_rule_id = insert_rule(
         conn,
         &Rule {
             domain_id: "data-mesh".into(),
@@ -636,6 +925,14 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
             text: "A DataProduct MUST declare an owning domain team.".into(),
             layer: AuthorityLayer::Standard,
             rule_type: RuleType::Must,
+        },
+    )?;
+    insert_machine_check(
+        conn,
+        data_product_owning_team_rule_id,
+        &MachineRule::Pattern {
+            property: "owning_team".into(),
+            pattern: "[a-z][a-z0-9-]*".into(),
         },
     )?;
 
@@ -779,6 +1076,132 @@ mod tests {
         assert!(layers.contains(&AuthorityLayer::Standard));
         assert!(layers.contains(&AuthorityLayer::Conventions));
         assert!(!layers.contains(&AuthorityLayer::Process));
+    }
+
+    #[test]
+    fn rules_with_checks_for_construct_returns_seeded_machine_check() {
+        let conn = open_store().unwrap();
+        seed(&conn).unwrap();
+
+        let rules = rules_with_checks_for_construct(&conn, "uaf-1.3:AuthorityGrant", None).unwrap();
+        assert_eq!(rules.len(), 2);
+        let with_check = rules.iter().filter(|(_, m)| m.is_some()).count();
+        assert_eq!(with_check, 1);
+
+        let (_, machine_rule) = rules.iter().find(|(_, m)| m.is_some()).unwrap();
+        assert_eq!(
+            machine_rule,
+            &Some(MachineRule::RequiredProperty {
+                property: "scope".into()
+            })
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_required_property() {
+        let check = MachineRule::RequiredProperty {
+            property: "scope".into(),
+        };
+        let empty = std::collections::HashMap::new();
+        let (outcome, _) = evaluate_machine_rule(&check, &empty);
+        assert_eq!(outcome, ValidationOutcome::Fail);
+
+        let present = std::collections::HashMap::from([("scope".to_string(), "org".to_string())]);
+        let (outcome, _) = evaluate_machine_rule(&check, &present);
+        assert_eq!(outcome, ValidationOutcome::Pass);
+    }
+
+    #[test]
+    fn evaluate_machine_rule_enum_value() {
+        let check = MachineRule::EnumValue {
+            property: "status".into(),
+            values: vec!["active".into(), "revoked".into()],
+        };
+        let valid = std::collections::HashMap::from([("status".to_string(), "active".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &valid).0,
+            ValidationOutcome::Pass
+        );
+
+        let invalid =
+            std::collections::HashMap::from([("status".to_string(), "pending".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &invalid).0,
+            ValidationOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_range() {
+        let check = MachineRule::Range {
+            property: "priority".into(),
+            min: Some(1.0),
+            max: Some(5.0),
+        };
+        let in_range = std::collections::HashMap::from([("priority".to_string(), "3".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &in_range).0,
+            ValidationOutcome::Pass
+        );
+
+        let out_of_range =
+            std::collections::HashMap::from([("priority".to_string(), "9".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &out_of_range).0,
+            ValidationOutcome::Fail
+        );
+
+        let non_numeric =
+            std::collections::HashMap::from([("priority".to_string(), "high".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &non_numeric).0,
+            ValidationOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_pattern_matches() {
+        let check = MachineRule::Pattern {
+            property: "id".into(),
+            pattern: "[A-Z]+".into(),
+        };
+        let matching = std::collections::HashMap::from([("id".to_string(), "ABC".to_string())]);
+        assert_eq!(
+            evaluate_machine_rule(&check, &matching).0,
+            ValidationOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_pattern_mismatch_is_warning_not_fail() {
+        let check = MachineRule::Pattern {
+            property: "id".into(),
+            pattern: "[A-Z]+".into(),
+        };
+        // Doesn't match at position 0 -- rusty_regx's unanchored `find` would
+        // otherwise find "ABC" mid-string; requiring start()==0 replicates
+        // Python's re.match (anchored-at-start) semantics.
+        let mismatch = std::collections::HashMap::from([("id".to_string(), "1ABC".to_string())]);
+        let (outcome, message) = evaluate_machine_rule(&check, &mismatch);
+        assert_eq!(outcome, ValidationOutcome::Warning);
+        assert!(message.contains("does not match"));
+
+        let absent = std::collections::HashMap::new();
+        assert_eq!(
+            evaluate_machine_rule(&check, &absent).0,
+            ValidationOutcome::Warning
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_rule_invalid_pattern_is_warning_not_a_panic() {
+        let check = MachineRule::Pattern {
+            property: "id".into(),
+            pattern: "[unclosed".into(),
+        };
+        let (outcome, message) = evaluate_machine_rule(&check, &std::collections::HashMap::new());
+        assert_eq!(outcome, ValidationOutcome::Warning);
+        assert!(message.contains("invalid"));
     }
 
     #[test]

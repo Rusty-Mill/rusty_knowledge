@@ -10,8 +10,10 @@
 //! Tools implemented so far: `search_knowledge` (domain/layer-scoped,
 //! ranked, always declares its retrieval mode per RM-KNOWLEDGE-MODEL-0005),
 //! `meta_routing_guide`, `lookup_construct`, `lookup_rules`,
-//! `lookup_relationships`, `lookup_valid_relationships`, and
-//! `lookup_domain_summary`.
+//! `lookup_relationships`, `lookup_valid_relationships`,
+//! `lookup_domain_summary`, and `validate_element` (required-property,
+//! enum-value, range, and pattern machine checks -- pattern matching via
+//! `rusty_regx`, a zero-dependency in-ecosystem regex engine).
 //!
 //! What this does *not* yet do: Streamable HTTP transport (stdio only,
 //! since that's rmcp's simplest documented starting point), the
@@ -27,7 +29,7 @@ use rmcp::{
 };
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
-use store::{AuthorityLayer, RuleType};
+use store::{AuthorityLayer, RuleType, ValidationOutcome};
 
 /// Shared by every tool that accepts an optional authority-layer filter
 /// string: `Ok(None)` for "no filter", `Ok(Some(_))` for a recognized layer,
@@ -130,6 +132,20 @@ struct ValidRelationshipsLookupParams {
 struct DomainSummaryParams {
     /// Domain to summarize, e.g. "uaf-1.3".
     domain_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateElementParams {
+    /// Domain the construct belongs to, e.g. "uaf-1.3".
+    domain_id: String,
+    /// The construct type's short name or ID to validate the element against.
+    construct_ref: String,
+    /// Restrict validation to one authority layer. Omit to check all layers.
+    #[serde(default)]
+    layer: Option<String>,
+    /// The element's properties (name -> value) to validate.
+    #[serde(default)]
+    properties: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -470,6 +486,91 @@ impl KnowledgeServer {
             constructs.len()
         )
     }
+
+    #[tool(
+        description = "Validate an element (its properties) against the machine-checkable rules for a construct type. Returns PASS/FAIL/WARNING per checkable rule, plus an overall result. Use layer to validate against a specific authority layer only."
+    )]
+    fn validate_element(
+        &self,
+        Parameters(ValidateElementParams {
+            domain_id,
+            construct_ref,
+            layer,
+            properties,
+        }): Parameters<ValidateElementParams>,
+    ) -> String {
+        let layer_filter = match parse_layer_filter(&layer) {
+            Ok(filter) => filter,
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let construct = match store::resolve_construct(&conn, &domain_id, &construct_ref) {
+            Ok(Some(construct)) => construct,
+            Ok(None) => {
+                return format!("Construct {construct_ref:?} not found in domain {domain_id:?}.");
+            }
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        let rules = match store::rules_with_checks_for_construct(&conn, &construct.id, layer_filter)
+        {
+            Ok(rules) => rules,
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        let findings: Vec<(ValidationOutcome, String)> = rules
+            .iter()
+            .filter_map(|(rule, machine_rule)| {
+                let machine_rule = machine_rule.as_ref()?;
+                let (outcome, message) = store::evaluate_machine_rule(machine_rule, &properties);
+                Some((outcome, format!("[{}] {message}", rule.layer.as_str())))
+            })
+            .collect();
+
+        if findings.is_empty() {
+            return format!(
+                "{} ({}) -- no machine-checkable rules{}; nothing to validate.",
+                construct.short_name,
+                construct.id,
+                if layer_filter.is_some() {
+                    " at this layer"
+                } else {
+                    ""
+                }
+            );
+        }
+
+        let fail_count = findings
+            .iter()
+            .filter(|(o, _)| *o == ValidationOutcome::Fail)
+            .count();
+        let warning_count = findings
+            .iter()
+            .filter(|(o, _)| *o == ValidationOutcome::Warning)
+            .count();
+        let overall = if fail_count > 0 {
+            ValidationOutcome::Fail
+        } else if warning_count > 0 {
+            ValidationOutcome::Warning
+        } else {
+            ValidationOutcome::Pass
+        };
+
+        let findings_block = findings
+            .iter()
+            .map(|(outcome, message)| format!("  {} {message}", outcome.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} ({}) -- overall: {} ({fail_count} fail, {warning_count} warning, {} pass)\n{findings_block}",
+            construct.short_name,
+            construct.id,
+            overall.as_str(),
+            findings.len() - fail_count - warning_count,
+        )
+    }
 }
 
 /// Routing guidance, matching `knowledge-mcp`'s `meta.routing_guide` in shape.
@@ -499,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: search_knowledge, \
          meta_routing_guide, lookup_construct, lookup_rules, lookup_relationships, \
-         lookup_valid_relationships, lookup_domain_summary)"
+         lookup_valid_relationships, lookup_domain_summary, validate_element)"
     );
 
     let server = KnowledgeServer {
@@ -806,5 +907,100 @@ mod tests {
             domain_id: "does-not-exist".into(),
         }));
         assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn validate_element_missing_required_property_fails() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: None,
+            properties: std::collections::HashMap::new(),
+        }));
+        assert!(response.contains("overall: FAIL"));
+        assert!(response.contains("FAIL"));
+        assert!(response.contains("scope"));
+    }
+
+    #[test]
+    fn validate_element_present_required_property_passes() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: None,
+            properties: std::collections::HashMap::from([("scope".to_string(), "org".to_string())]),
+        }));
+        assert!(response.contains("overall: PASS"));
+        assert!(response.contains("1 pass"));
+    }
+
+    #[test]
+    fn validate_element_construct_with_no_machine_checks_has_nothing_to_validate() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "ConflictRegistryEntry".into(),
+            layer: None,
+            properties: std::collections::HashMap::new(),
+        }));
+        assert!(response.contains("no machine-checkable rules"));
+    }
+
+    #[test]
+    fn validate_element_unknown_construct_reports_not_found() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "DoesNotExist".into(),
+            layer: None,
+            properties: std::collections::HashMap::new(),
+        }));
+        assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn validate_element_layer_filter_excludes_checks_from_other_layers() {
+        let server = test_server();
+        // The machine-checkable rule (scope required) is on the Standard
+        // layer; filtering to Conventions should find nothing to validate.
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "uaf-1.3".into(),
+            construct_ref: "AuthorityGrant".into(),
+            layer: Some("Conventions".into()),
+            properties: std::collections::HashMap::new(),
+        }));
+        assert!(response.contains("no machine-checkable rules"));
+    }
+
+    #[test]
+    fn validate_element_pattern_check_passes_on_valid_team_slug() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "data-mesh".into(),
+            construct_ref: "DataProduct".into(),
+            layer: None,
+            properties: std::collections::HashMap::from([(
+                "owning_team".to_string(),
+                "checkout-platform".to_string(),
+            )]),
+        }));
+        assert!(response.contains("overall: PASS"));
+    }
+
+    #[test]
+    fn validate_element_pattern_check_warns_on_invalid_team_slug() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_id: "data-mesh".into(),
+            construct_ref: "DataProduct".into(),
+            layer: None,
+            properties: std::collections::HashMap::from([(
+                "owning_team".to_string(),
+                "Checkout Platform!".to_string(),
+            )]),
+        }));
+        assert!(response.contains("overall: WARNING"));
     }
 }

@@ -497,10 +497,16 @@ dependencies = [
  "anyhow",
  "rmcp",
  "rusqlite",
+ "rusty_regx",
  "serde",
  "sqlite-vec",
  "tokio",
 ]
+
+[[package]]
+name = "rusty_regx"
+version = "0.5.0"
+source = "git+https://github.com/baileyrd/rusty_regx?rev=93c5541d6713750141476c87d6cd774629e1ae3a#93c5541d6713750141476c87d6cd774629e1ae3a"
 
 [[package]]
 name = "schemars"

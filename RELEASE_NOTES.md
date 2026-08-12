@@ -5,6 +5,49 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #27 — Implement validate.element
+**2026-08-12** · [#27](https://github.com/Rusty-Mill/rusty_knowledge/pull/27)
+
+- **Added:** `validate_element` MCP tool (closes
+  [rusty_knowledge#9](https://github.com/Rusty-Mill/rusty_knowledge/issues/9)) —
+  validates a caller-supplied element's properties against a construct's
+  machine-checkable rules, returning PASS/FAIL/WARNING per rule plus an
+  overall result. This is the rule-evaluation engine `knowledge-mcp`'s
+  `_evaluate_machine_rule` provides — the biggest real gap in this list.
+- **Added:** `MachineRule` (a structured, machine-checkable rule attached to
+  a `Rule` row — required-property, enum-value, pattern, and range checks,
+  matching `knowledge-mcp`'s `machine_rule` schema), `ValidationOutcome`, and
+  `evaluate_machine_rule`. A new `rule_machine_checks` side table keyed by
+  `rules_fts`'s `rowid` stores them, since most rules are free text only and
+  don't need one. `insert_rule` now returns that `rowid` so a caller can
+  attach a check afterward.
+- **New dependency, added only after explicit sign-off:** `Pattern` (regex)
+  checks are evaluated via [`rusty_regx`](https://github.com/baileyrd/rusty_regx),
+  a zero-runtime-dependency POSIX-ERE engine from this same GitHub account —
+  deliberately chosen over the `regex` crate to avoid its several transitive
+  dependencies. `find`'s unanchored match is constrained to `start() == 0` to
+  replicate Python's `re.match` (anchored-at-start) semantics; an invalid
+  pattern or a mismatch reports `WARNING`, matching `_evaluate_machine_rule`'s
+  own behavior — never a silent PASS or a panic. Pinned to a commit SHA (no
+  tags exist upstream), same reproducibility standard as everything else this
+  repo depends on.
+- **Deliberately not included:** the separate "required-property schema per
+  construct type" completeness check `knowledge-mcp` also runs in
+  `validate.element` (distinct from per-rule machine checks) isn't modeled —
+  it's a different concept (a declared property schema) that would double
+  this issue's scope. Also skipped: `known_conflicts` (needs #14).
+- Seed data: two existing rules now carry machine checks —
+  `AuthorityGrant`'s "MUST declare an explicit scope and expiry"
+  (`RequiredProperty { property: "scope" }`) and `DataProduct`'s "MUST
+  declare an owning domain team" (`Pattern` matching a team-slug format) —
+  so there's something real to validate against for each check kind. No new
+  rule rows added, so existing rule-count assertions elsewhere are untouched.
+- 14 new tests (7 tool-level: fail/pass on the required-property check,
+  pass/warning on the pattern check, no-machine-checks construct, unknown
+  construct, layer filter excluding the check; 7 store-level: joined query
+  returns the seeded check, and `evaluate_machine_rule` for
+  required-property/enum/range/pattern-match/pattern-mismatch/invalid-pattern).
+
 ## PR #26 — Implement lookup.domain_summary
 **2026-08-12** · [#26](https://github.com/Rusty-Mill/rusty_knowledge/pull/26)
 
