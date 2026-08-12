@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Make the store's database path configurable
-**2026-08-12** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #42 — Make the store's database path configurable
+**2026-08-12** · [#42](https://github.com/Rusty-Mill/rusty_knowledge/pull/42)
 
 - **Added:** `store::open_store_at_path` (closes
   [rusty_knowledge#41](https://github.com/Rusty-Mill/rusty_knowledge/issues/41))
