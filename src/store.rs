@@ -335,13 +335,15 @@ pub fn evaluate_machine_rule(
     }
 }
 
-pub fn open_store() -> rusqlite::Result<Connection> {
-    // sqlite-vec registers itself as an auto-extension: every connection
-    // opened after this call gets vec0 virtual tables. This is the exact
-    // mechanism platform-research.md described, now proven to link and run.
-    // `sqlite3_auto_extension` lives in rusqlite::ffi, not sqlite_vec itself
-    // (sqlite_vec only exports the init entrypoint) -- confirmed against
-    // the crate's own usage guide, not guessed.
+/// Registers `sqlite-vec` as an auto-extension: every connection opened
+/// after this call gets `vec0` virtual tables. `sqlite3_auto_extension`
+/// lives in `rusqlite::ffi`, not `sqlite_vec` itself (`sqlite_vec` only
+/// exports the init entrypoint) -- confirmed against the crate's own usage
+/// guide, not guessed. Safe to call more than once: SQLite deduplicates
+/// registrations by function pointer, so both `open_store()` and
+/// `open_store_at_path()` calling this each time they run is a no-op after
+/// the first.
+fn register_vec_extension() {
     #[allow(clippy::missing_transmute_annotations)]
     // matches sqlite-vec's own documented usage verbatim
     unsafe {
@@ -349,8 +351,23 @@ pub fn open_store() -> rusqlite::Result<Connection> {
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     }
-    let conn = Connection::open_in_memory()?;
+}
 
+/// Whether `conn` already has `rusty_knowledge`'s schema (checked via the
+/// `domains` table) -- distinguishes a brand new/empty database file from
+/// one a previous run of this crate already initialized and populated.
+fn schema_exists(conn: &Connection) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'domains'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
+fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     // FTS5: no rusqlite-side feature flag needed (confirmed in
     // platform-research.md) — it's compiled into the bundled SQLite
     // binary via libsqlite3-sys's build.rs, used here via plain SQL.
@@ -435,8 +452,35 @@ pub fn open_store() -> rusqlite::Result<Connection> {
              model        TEXT NOT NULL,
              embedding    BLOB NOT NULL
          );",
-    )?;
+    )
+}
+
+pub fn open_store() -> rusqlite::Result<Connection> {
+    register_vec_extension();
+    let conn = Connection::open_in_memory()?;
+    create_schema(&conn)?;
     Ok(conn)
+}
+
+/// Opens (creating if it doesn't already exist) a file-backed store at
+/// `path`, for `KNOWLEDGE_DB_PATH` (rusty_knowledge#41) -- `open_store`'s
+/// in-memory default stays the one every test and the no-env-var-set
+/// server startup path use, unchanged.
+///
+/// Returns `(connection, is_fresh)`. `is_fresh` is `true` for a brand new
+/// or still-empty file (no `domains` table yet -- schema was just created)
+/// and `false` for a file a previous run already initialized. Callers use
+/// this to decide whether to run `seed()`/an import: a previously
+/// populated file already has its own data, and neither should silently
+/// run again on every restart on top of it.
+pub fn open_store_at_path(path: &std::path::Path) -> rusqlite::Result<(Connection, bool)> {
+    register_vec_extension();
+    let conn = Connection::open(path)?;
+    let already_initialized = schema_exists(&conn)?;
+    if !already_initialized {
+        create_schema(&conn)?;
+    }
+    Ok((conn, !already_initialized))
 }
 
 pub fn insert_domain(conn: &Connection, domain: &Domain) -> rusqlite::Result<()> {
@@ -2420,5 +2464,60 @@ mod tests {
             hits.iter()
                 .any(|h| h.construct_id == "uaf-1.3:ConflictRegistryEntry" && h.is_vector_match)
         );
+    }
+
+    /// A fresh path in the OS temp dir, unique per test (by test name +
+    /// thread ID) so concurrently-running tests never collide on the same
+    /// file. Removes any file already there, so each test starts from
+    /// "path does not exist" regardless of a previous run's leftovers.
+    fn db_fixture_path(test_name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rusty_knowledge_open_store_test_{test_name}_{:?}.db",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn open_store_at_path_creates_fresh_file_and_seeds_normally() {
+        let path = db_fixture_path("fresh");
+        let (conn, is_fresh) = open_store_at_path(&path).unwrap();
+        assert!(is_fresh);
+        seed(&conn).unwrap();
+        assert!(domain_by_id(&conn, "uaf-1.3").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_store_at_path_reopening_same_file_is_not_fresh_and_keeps_data() {
+        let path = db_fixture_path("reopen");
+        let (conn, is_fresh) = open_store_at_path(&path).unwrap();
+        assert!(is_fresh);
+        seed(&conn).unwrap();
+        drop(conn);
+
+        let (conn, is_fresh) = open_store_at_path(&path).unwrap();
+        assert!(!is_fresh);
+        // The domain seeded on the first open is still there -- this is
+        // real persistence, not just "didn't error the second time".
+        assert!(domain_by_id(&conn, "uaf-1.3").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_store_at_path_empty_existing_file_is_still_fresh() {
+        let path = db_fixture_path("empty_file");
+        // Simulates `touch`: a zero-byte file already at the path before
+        // rusty_knowledge ever opens it.
+        std::fs::write(&path, []).unwrap();
+
+        let (_conn, is_fresh) = open_store_at_path(&path).unwrap();
+        assert!(is_fresh);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
