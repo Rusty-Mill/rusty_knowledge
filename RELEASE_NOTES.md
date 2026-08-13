@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — knowledge-mcp importer for the v2 model, seeded with real data
-**2026-08-13** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #52 — knowledge-mcp importer for the v2 model, seeded with real data
+**2026-08-13** · [#52](https://github.com/Rusty-Mill/rusty_knowledge/pull/52)
 
 - **Added:** `knowledge_mcp_import_v2` -- a row-by-row translation of a
   real `knowledge-mcp` (Python) SQLite file into the v2 store. `domains` +
