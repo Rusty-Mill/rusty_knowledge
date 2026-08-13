@@ -1,1782 +1,875 @@
-//! The knowledge store: FTS5 + sqlite-vec over one SQLite connection,
-//! with the authority layer as a Rust type rather than an optional field.
+//! The knowledge-model-v2 store: seven tables (`Source`, `SourceAuthority`,
+//! `Subject`, `Rule`, `RuleRelation`, `SelectionGroup`, `RuleDerivation`)
+//! replacing the earlier `AuthorityLayer`/`Construct`/fixed-4-layer model.
 //!
-//! See `main.rs`'s module doc for what this slice tests and why.
+//! This redesign came out of stress-testing the original design against
+//! UDRA (a nested-organization authority chain that doesn't fit a fixed
+//! Standard/Tool/Convention/Process taxonomy), UAF (which needs exact,
+//! drift-proof construct identity -- `Subject`), a multi-parent-authority
+//! case (an org answering to two independent authorities at once --
+//! `SourceAuthority` is a DAG, not a tree), supersession over time (`Rule`
+//! content changes cascade hard into `RuleRelation.status`; `Source`/
+//! `Subject` identity changes cascade soft, as a review flag only), and
+//! NIST RMF (rules that need to be machine-checked against a real system's
+//! state, not just read by a human -- `Rule.machine_check`).
+//!
+//! This vertical slice proves the model against real UDRA data end-to-end:
+//! schema, insert-time invariants (DAG cycle rejection, supersession
+//! cascade), the two-tier conflict-candidate query, and two MCP tools
+//! (`lookup_subject`, `crosscut_conflicts` -- see `main.rs`). It does not
+//! yet carry forward the previous model's full 15-tool surface, the
+//! `knowledge-mcp` importer, file-backed persistence, or search -- those
+//! were all built around the schema this replaces and are deferred to
+//! follow-up work, not silently dropped.
 
-use rusqlite::Connection;
-use rusty_embedder_core::{Embedder, serialize_f32};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 
-/// The four-layer authority model from ADR-0165. Not `Option<Layer>` —
-/// per RK-001, an unlabeled rule must be structurally unrepresentable.
+/// A rule or relationship's normative strength. `Delegated` means the
+/// issuing Source explicitly hands the decision to whichever Source(s)
+/// answer to it -- a descendant Rule at `Must` under a `Delegated` parent
+/// is expected, not a conflict (see `conflict_candidates_for_subject`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthorityLayer {
-    Standard,
-    ToolImplementation,
-    Conventions,
-    Process,
+pub enum BindingStrength {
+    Must,
+    MustNot,
+    Should,
+    ShouldNot,
+    May,
+    Delegated,
 }
 
-impl AuthorityLayer {
+impl BindingStrength {
     pub fn as_str(self) -> &'static str {
         match self {
-            AuthorityLayer::Standard => "Standard",
-            AuthorityLayer::ToolImplementation => "Tool Implementation",
-            AuthorityLayer::Conventions => "Conventions",
-            AuthorityLayer::Process => "Process",
+            BindingStrength::Must => "MUST",
+            BindingStrength::MustNot => "MUST_NOT",
+            BindingStrength::Should => "SHOULD",
+            BindingStrength::ShouldNot => "SHOULD_NOT",
+            BindingStrength::May => "MAY",
+            BindingStrength::Delegated => "DELEGATED",
         }
     }
 
-    /// Trusted-storage parse: panics on a value that isn't one of the four
-    /// layers, since a row already in `rules_fts` was only ever written by
-    /// `insert_rule` with a valid `as_str()` output.
+    /// Trusted-storage parser: rows we wrote ourselves. Panics on
+    /// corruption rather than silently misreporting a rule's strength.
     fn from_str(text: &str) -> Self {
         match text {
-            "Standard" => AuthorityLayer::Standard,
-            "Tool Implementation" => AuthorityLayer::ToolImplementation,
-            "Conventions" => AuthorityLayer::Conventions,
-            "Process" => AuthorityLayer::Process,
-            other => panic!("stored layer {other:?} is not one of the four known layers"),
+            "MUST" => BindingStrength::Must,
+            "MUST_NOT" => BindingStrength::MustNot,
+            "SHOULD" => BindingStrength::Should,
+            "SHOULD_NOT" => BindingStrength::ShouldNot,
+            "MAY" => BindingStrength::May,
+            "DELEGATED" => BindingStrength::Delegated,
+            other => panic!("stored binding_strength {other:?} is not one of the six known values"),
         }
     }
 
-    /// Fallible parse for untrusted input (e.g. an MCP tool caller's layer
-    /// filter) -- `None` rather than a panic on anything that isn't one of
-    /// the four known layers.
-    pub fn parse(text: &str) -> Option<Self> {
+    // No untrusted-input `parse` yet -- neither of this slice's two tools
+    // takes a binding_strength filter param. Add it (matching the
+    // trusted-vs-untrusted parser split used elsewhere in this file) when
+    // a real tool actually needs one, not speculatively.
+}
+
+/// The fixed vocabulary for rule-to-rule relations (`RuleRelation`).
+/// Distinct from `Rule.relationship_type`, which is a free/extensible tag
+/// for *subject*-to-subject claims (e.g. "contains", "precedes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationType {
+    Extends,
+    Restricts,
+    Implements,
+    Satisfies,
+    ConflictsWith,
+    Requires,
+    Excludes,
+    NoRelation,
+}
+
+impl RelationType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelationType::Extends => "extends",
+            RelationType::Restricts => "restricts",
+            RelationType::Implements => "implements",
+            RelationType::Satisfies => "satisfies",
+            RelationType::ConflictsWith => "conflicts_with",
+            RelationType::Requires => "requires",
+            RelationType::Excludes => "excludes",
+            RelationType::NoRelation => "no_relation",
+        }
+    }
+
+    fn from_str(text: &str) -> Self {
         match text {
-            "Standard" => Some(AuthorityLayer::Standard),
-            "Tool Implementation" => Some(AuthorityLayer::ToolImplementation),
-            "Conventions" => Some(AuthorityLayer::Conventions),
-            "Process" => Some(AuthorityLayer::Process),
-            _ => None,
+            "extends" => RelationType::Extends,
+            "restricts" => RelationType::Restricts,
+            "implements" => RelationType::Implements,
+            "satisfies" => RelationType::Satisfies,
+            "conflicts_with" => RelationType::ConflictsWith,
+            "requires" => RelationType::Requires,
+            "excludes" => RelationType::Excludes,
+            "no_relation" => RelationType::NoRelation,
+            other => panic!("stored relation_type {other:?} is not one of the eight known values"),
+        }
+    }
+
+    // No untrusted-input `parse` yet, same reasoning as `BindingStrength`.
+}
+
+/// Whether a `RuleRelation` still reflects the current text of both rules
+/// it links. Flips to `Stale` automatically when either side is
+/// superseded (see `insert_rule`) -- never deleted or silently rewritten,
+/// so the row stays as an audit record of what was confirmed and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationStatus {
+    Active,
+    Stale,
+}
+
+impl RelationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            RelationStatus::Active => "active",
+            RelationStatus::Stale => "stale",
+        }
+    }
+
+    fn from_str(text: &str) -> Self {
+        match text {
+            "active" => RelationStatus::Active,
+            "stale" => RelationStatus::Stale,
+            other => panic!("stored relation status {other:?} is not \"active\" or \"stale\""),
         }
     }
 }
 
-/// A namespaced body of knowledge (for example UAF 1.3) — RM-KNOWLEDGE-MODEL-0001.
-/// A server instance hosts one or more domains concurrently.
-pub struct Domain {
+/// The authority node -- anything that can issue a `Rule`. Nesting is
+/// expressed separately via `SourceAuthority` (a DAG: a Source may answer
+/// to more than one independent parent), not a column on this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
     pub id: String,
     pub name: String,
+    pub kind: String,
+    /// Populated only on true roots (no parent edges in `SourceAuthority`).
+    pub domain_tags: Vec<String>,
+    pub steward: Option<String>,
+    pub citation: Option<String>,
+    pub supersedes_source_id: Option<String>,
 }
 
-/// A named element within a domain (an entity type, artifact, or modeling
-/// concept) with rules and relationships attached.
-///
-/// A subset of `knowledge-mcp`'s `Construct` model: `name`, `is_abstract`,
-/// `is_deprecated`, `parent_id`, `source_section`, and `metadata` aren't
-/// modeled yet, and aren't invented here -- they land with whichever
-/// parity-gap issue actually needs them, not speculatively.
-pub struct Construct {
+/// The thing a `Rule` is about -- canonical identity, independent of who's
+/// making claims about it. `parent_subject_id` is a *concept* hierarchy
+/// (e.g. a stereotype's supertype), deliberately independent of any
+/// Source's authority position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
     pub id: String,
-    pub domain_id: String,
+    pub domain_tag: String,
+    pub subject_type: String,
+    pub name: String,
     pub short_name: String,
-    pub construct_type: String,
-    pub description: String,
-}
-
-/// A rule's normative strength, matching `knowledge-mcp`'s seven rule
-/// types -- the five most rules use (`Must`/`Shall`/`Should`/`May`/
-/// `MustNot`) plus `Recommended`/`Forbidden`, which `knowledge-mcp`'s
-/// schema also allows but this crate didn't originally model (see
-/// rusty_knowledge#46: real rules using either value were silently
-/// unimportable until this variant existed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuleType {
-    Must,
-    Shall,
-    Should,
-    May,
-    MustNot,
-    Recommended,
-    Forbidden,
-}
-
-impl RuleType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RuleType::Must => "MUST",
-            RuleType::Shall => "SHALL",
-            RuleType::Should => "SHOULD",
-            RuleType::May => "MAY",
-            RuleType::MustNot => "MUST_NOT",
-            RuleType::Recommended => "RECOMMENDED",
-            RuleType::Forbidden => "FORBIDDEN",
-        }
-    }
-
-    fn from_str(text: &str) -> Self {
-        match text {
-            "MUST" => RuleType::Must,
-            "SHALL" => RuleType::Shall,
-            "SHOULD" => RuleType::Should,
-            "MAY" => RuleType::May,
-            "MUST_NOT" => RuleType::MustNot,
-            "RECOMMENDED" => RuleType::Recommended,
-            "FORBIDDEN" => RuleType::Forbidden,
-            other => panic!("stored rule_type {other:?} is not one of the seven known types"),
-        }
-    }
-
-    /// Fallible parse for untrusted input (e.g. an MCP tool caller's
-    /// rule_type filter) -- see `AuthorityLayer::parse`'s doc comment for
-    /// why this is kept separate from the trusted-storage `from_str` above.
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "MUST" => Some(RuleType::Must),
-            "SHALL" => Some(RuleType::Shall),
-            "SHOULD" => Some(RuleType::Should),
-            "MAY" => Some(RuleType::May),
-            "MUST_NOT" => Some(RuleType::MustNot),
-            "RECOMMENDED" => Some(RuleType::Recommended),
-            "FORBIDDEN" => Some(RuleType::Forbidden),
-            _ => None,
-        }
-    }
-}
-
-/// A single rule, always carrying its authority layer — RM-KNOWLEDGE-MODEL-0002.
-/// Scoped to the domain and construct it belongs to, so a query can be
-/// restricted to one domain without touching another's rules.
-pub struct Rule {
-    pub domain_id: String,
-    pub construct_id: String,
-    pub construct: String,
-    pub text: String,
-    pub layer: AuthorityLayer,
-    pub rule_type: RuleType,
-}
-
-/// A typed, directional link between two constructs in the same domain.
-/// Queried by `lookup_relationships` and `crosscut_traceability`.
-///
-/// `rule_type` mirrors `Rule`'s: `knowledge-mcp`'s completeness check
-/// (`validate.completeness`) treats a `MUST`/`SHALL` relationship as a
-/// required child element type, everything else as optional -- the same
-/// distinction `Rule::rule_type` already draws for free-text rules.
-pub struct Relationship {
-    pub id: String,
-    pub domain_id: String,
-    pub from_construct_id: String,
-    pub to_construct_id: String,
-    pub relationship_type: String,
-    pub cardinality: String,
-    pub layer: AuthorityLayer,
-    pub rule_type: RuleType,
-}
-
-/// A *declared* rule about which relationship types are valid between two
-/// construct *types* in a domain -- distinct from `Relationship`, which
-/// records an actual link between two specific construct *instances*.
-/// `RM-KNOWLEDGE-MODEL-0004` requires validation to check against this
-/// declared set rather than inferring validity from whatever relationship
-/// instances happen to already exist.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ValidRelationshipRule {
-    pub domain_id: String,
-    pub from_type: String,
-    pub to_type: String,
-    pub relationship_type: String,
-    pub cardinality: String,
-}
-
-/// A conflict-registry entry: an explicitly documented place where two
-/// authority layers disagree, and how that disagreement is resolved.
-/// `construct_id: None` marks a domain-level conflict rather than one tied
-/// to a specific construct.
-pub struct Conflict {
-    pub id: String,
-    pub domain_id: String,
-    pub construct_id: Option<String>,
-    pub layer_a: AuthorityLayer,
-    pub layer_b: AuthorityLayer,
-    pub conflict_type: String,
-    pub description: String,
-    pub resolution: String,
-    pub rationale: Option<String>,
-    pub review_date: Option<String>,
-}
-
-/// A typed link between constructs in *different* domains -- e.g. a UAF
-/// capability tracing to an RMF control family. Distinct from
-/// `Relationship`, which only ever connects two constructs within the same
-/// domain.
-pub struct CrossDomainRelationship {
-    pub id: String,
-    pub from_domain_id: String,
-    pub from_construct_id: String,
-    pub to_domain_id: String,
-    pub to_construct_id: String,
-    pub relationship_type: String,
     pub description: Option<String>,
-    pub rationale: Option<String>,
+    pub is_deprecated: bool,
+    pub parent_subject_id: Option<String>,
+    pub supersedes_subject_id: Option<String>,
 }
 
-/// A structured, machine-checkable rule attached to a `Rule` row, matching
-/// (a subset of) `knowledge-mcp`'s `machine_rule` schema. Most rules are
-/// free text only (no `MachineRule` attached) -- this exists for the
-/// minority whose normative text can be checked programmatically against an
-/// element's properties.
-///
-/// `Pattern` (regex-match) is checked via `rusty_regx` -- a zero-dependency
-/// POSIX-ERE engine from this same GitHub account, added as a dependency
-/// only after explicit sign-off, per this skill's stop-and-ask rule for new
-/// third-party dependencies (a bare `regex` crate dependency was considered
-/// and deliberately not used, to avoid pulling in its several transitive
-/// dependencies when a zero-dependency in-ecosystem alternative exists).
-#[derive(Debug, Clone, PartialEq)]
-pub enum MachineRule {
-    RequiredProperty {
-        property: String,
-    },
-    EnumValue {
-        property: String,
-        values: Vec<String>,
-    },
-    Pattern {
-        property: String,
-        pattern: String,
-    },
-    Range {
-        property: String,
-        min: Option<f64>,
-        max: Option<f64>,
-    },
+/// The ground-truth requirement/statement. A relationship claim between
+/// two subjects (e.g. "X must contain at least one Y") is expressed here
+/// too, via `related_subject_id`/`relationship_type`/`cardinality`,
+/// rather than in a separate table -- it has the same shape as any other
+/// rule (comes from a Source, carries a binding strength, can be
+/// superseded, participates in the conflict gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    pub id: String,
+    pub source_id: String,
+    pub subject_id: String,
+    pub related_subject_id: Option<String>,
+    pub relationship_type: Option<String>,
+    pub cardinality: Option<String>,
+    pub statement: String,
+    /// Structured, machine-parseable comparison logic (JSON), present
+    /// only when this rule is actually checkable against a real system's
+    /// state. Carries the same authority as `statement` -- it's the same
+    /// requirement, just also machine-parseable.
+    pub machine_check: Option<String>,
+    pub binding_strength: BindingStrength,
+    pub supersedes_rule_id: Option<String>,
 }
 
-/// The result of evaluating one `MachineRule` against an element's
-/// properties -- PASS/FAIL/WARNING, matching `knowledge-mcp`'s three-way
-/// `validate.element` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationOutcome {
-    Pass,
-    Fail,
-    Warning,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRelation {
+    pub rule_a_id: String,
+    pub rule_b_id: String,
+    pub relation_type: RelationType,
+    pub status: RelationStatus,
+    pub confirmed_by: String,
 }
 
-impl ValidationOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ValidationOutcome::Pass => "PASS",
-            ValidationOutcome::Fail => "FAIL",
-            ValidationOutcome::Warning => "WARNING",
-        }
-    }
-}
+fn schema_ddl() -> &'static str {
+    "
+    CREATE TABLE sources (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        domain_tags TEXT NOT NULL DEFAULT '[]',
+        steward TEXT,
+        citation TEXT,
+        supersedes_source_id TEXT REFERENCES sources(id)
+    );
 
-/// Evaluate one machine rule against an element's properties (property name
-/// -> value, both as strings -- this crate doesn't model a typed property
-/// schema yet, matching `knowledge-mcp`'s own loosely-typed `dict`).
-pub fn evaluate_machine_rule(
-    check: &MachineRule,
-    properties: &std::collections::HashMap<String, String>,
-) -> (ValidationOutcome, String) {
-    match check {
-        MachineRule::RequiredProperty { property } => match properties.get(property) {
-            Some(v) if !v.is_empty() => (
-                ValidationOutcome::Pass,
-                format!("Property '{property}' is present"),
-            ),
-            _ => (
-                ValidationOutcome::Fail,
-                format!("Required property '{property}' is absent or empty"),
-            ),
-        },
-        MachineRule::EnumValue { property, values } => match properties.get(property) {
-            Some(v) if values.iter().any(|allowed| allowed == v) => (
-                ValidationOutcome::Pass,
-                format!("'{property}' value '{v}' is valid"),
-            ),
-            Some(v) => (
-                ValidationOutcome::Fail,
-                format!("'{property}' = '{v}' is not in {values:?}"),
-            ),
-            None => (
-                ValidationOutcome::Fail,
-                format!("Property '{property}' is absent"),
-            ),
-        },
-        MachineRule::Pattern { property, pattern } => {
-            let val = properties.get(property).map(String::as_str).unwrap_or("");
-            match rusty_regx::Regex::new(pattern) {
-                // `find` is an unanchored search; requiring the match to
-                // start at 0 replicates Python's `re.match` semantics
-                // (anchored at the start, not necessarily the whole string).
-                Ok(re) => match re.find(val) {
-                    Some(m) if m.start() == 0 => (
-                        ValidationOutcome::Pass,
-                        format!("'{property}' matches required pattern '{pattern}'"),
-                    ),
-                    _ => (
-                        ValidationOutcome::Warning,
-                        format!("'{property}' = '{val}' does not match pattern '{pattern}'"),
-                    ),
-                },
-                Err(err) => (
-                    ValidationOutcome::Warning,
-                    format!("Pattern '{pattern}' for '{property}' is invalid: {err}"),
-                ),
-            }
-        }
-        MachineRule::Range { property, min, max } => {
-            let Some(val) = properties.get(property).and_then(|v| v.parse::<f64>().ok()) else {
-                return (
-                    ValidationOutcome::Fail,
-                    format!("Property '{property}' is absent or not numeric"),
-                );
-            };
-            if let Some(min) = min
-                && val < *min
-            {
-                return (
-                    ValidationOutcome::Fail,
-                    format!("'{property}' = {val} is below minimum {min}"),
-                );
-            }
-            if let Some(max) = max
-                && val > *max
-            {
-                return (
-                    ValidationOutcome::Fail,
-                    format!("'{property}' = {val} is above maximum {max}"),
-                );
-            }
-            (
-                ValidationOutcome::Pass,
-                format!("'{property}' = {val} is within range"),
-            )
-        }
-    }
-}
+    CREATE TABLE source_authority (
+        child_source_id TEXT NOT NULL REFERENCES sources(id),
+        parent_source_id TEXT NOT NULL REFERENCES sources(id),
+        PRIMARY KEY (child_source_id, parent_source_id)
+    );
 
-/// Registers `sqlite-vec` as an auto-extension: every connection opened
-/// after this call gets `vec0` virtual tables. `sqlite3_auto_extension`
-/// lives in `rusqlite::ffi`, not `sqlite_vec` itself (`sqlite_vec` only
-/// exports the init entrypoint) -- confirmed against the crate's own usage
-/// guide, not guessed. Safe to call more than once: SQLite deduplicates
-/// registrations by function pointer, so both `open_store()` and
-/// `open_store_at_path()` calling this each time they run is a no-op after
-/// the first.
-fn register_vec_extension() {
-    #[allow(clippy::missing_transmute_annotations)]
-    // matches sqlite-vec's own documented usage verbatim
-    unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    }
-}
+    CREATE TABLE subjects (
+        id TEXT PRIMARY KEY,
+        domain_tag TEXT NOT NULL,
+        subject_type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        short_name TEXT NOT NULL,
+        description TEXT,
+        is_deprecated INTEGER NOT NULL DEFAULT 0,
+        parent_subject_id TEXT REFERENCES subjects(id),
+        supersedes_subject_id TEXT REFERENCES subjects(id)
+    );
+    CREATE INDEX idx_subjects_short ON subjects(domain_tag, short_name);
 
-/// Whether `conn` already has `rusty_knowledge`'s schema (checked via the
-/// `domains` table) -- distinguishes a brand new/empty database file from
-/// one a previous run of this crate already initialized and populated.
-fn schema_exists(conn: &Connection) -> rusqlite::Result<bool> {
-    use rusqlite::OptionalExtension;
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'domains'",
-        [],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|row| row.is_some())
-}
+    CREATE TABLE rules (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL REFERENCES sources(id),
+        subject_id TEXT NOT NULL REFERENCES subjects(id),
+        related_subject_id TEXT REFERENCES subjects(id),
+        relationship_type TEXT,
+        cardinality TEXT,
+        statement TEXT NOT NULL,
+        machine_check TEXT,
+        binding_strength TEXT NOT NULL,
+        supersedes_rule_id TEXT REFERENCES rules(id)
+    );
+    CREATE INDEX idx_rules_subject ON rules(subject_id);
+    CREATE INDEX idx_rules_related_subject ON rules(related_subject_id);
+    CREATE INDEX idx_rules_source ON rules(source_id);
 
-fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
-    // FTS5: no rusqlite-side feature flag needed (confirmed in
-    // platform-research.md) — it's compiled into the bundled SQLite
-    // binary via libsqlite3-sys's build.rs, used here via plain SQL.
-    //
-    // `domain_id`/`construct_id` are UNINDEXED: FTS5 still allows an exact-match
-    // predicate on them alongside a MATCH clause, which is what domain-scoped
-    // search (a later slice) needs, without folding them into the full-text index.
-    conn.execute_batch(
-        "CREATE TABLE domains (
-             id   TEXT PRIMARY KEY,
-             name TEXT NOT NULL
-         );
-         CREATE TABLE constructs (
-             id             TEXT PRIMARY KEY,
-             domain_id      TEXT NOT NULL REFERENCES domains(id),
-             short_name     TEXT NOT NULL,
-             construct_type TEXT NOT NULL,
-             description    TEXT NOT NULL
-         );
-         CREATE VIRTUAL TABLE rules_fts USING fts5(
-             domain_id UNINDEXED,
-             construct_id UNINDEXED,
-             construct,
-             text,
-             layer UNINDEXED,
-             rule_type UNINDEXED
-         );
-         CREATE TABLE relationships (
-             id                TEXT PRIMARY KEY,
-             domain_id         TEXT NOT NULL REFERENCES domains(id),
-             from_construct_id TEXT NOT NULL REFERENCES constructs(id),
-             to_construct_id   TEXT NOT NULL REFERENCES constructs(id),
-             relationship_type TEXT NOT NULL,
-             cardinality       TEXT NOT NULL,
-             layer             TEXT NOT NULL,
-             rule_type         TEXT NOT NULL
-         );
-         CREATE TABLE valid_relationships (
-             domain_id         TEXT NOT NULL REFERENCES domains(id),
-             from_type         TEXT NOT NULL,
-             to_type           TEXT NOT NULL,
-             relationship_type TEXT NOT NULL,
-             cardinality       TEXT NOT NULL,
-             PRIMARY KEY (domain_id, from_type, to_type, relationship_type)
-         );
-         CREATE TABLE conflicts (
-             id            TEXT PRIMARY KEY,
-             domain_id     TEXT NOT NULL REFERENCES domains(id),
-             construct_id  TEXT REFERENCES constructs(id),
-             layer_a       TEXT NOT NULL,
-             layer_b       TEXT NOT NULL,
-             conflict_type TEXT NOT NULL,
-             description   TEXT NOT NULL,
-             resolution    TEXT NOT NULL,
-             rationale     TEXT,
-             review_date   TEXT
-         );
-         CREATE TABLE cross_domain_relationships (
-             id                 TEXT PRIMARY KEY,
-             from_domain_id     TEXT NOT NULL REFERENCES domains(id),
-             from_construct_id  TEXT NOT NULL REFERENCES constructs(id),
-             to_domain_id       TEXT NOT NULL REFERENCES domains(id),
-             to_construct_id    TEXT NOT NULL REFERENCES constructs(id),
-             relationship_type  TEXT NOT NULL,
-             description        TEXT,
-             rationale          TEXT
-         );
-         CREATE TABLE rule_machine_checks (
-             -- No FOREIGN KEY to rules_fts(rowid): SQLite doesn't support FK
-             -- constraints referencing a virtual (FTS5) table's rowid.
-             rule_rowid  INTEGER PRIMARY KEY,
-             check_type  TEXT NOT NULL,
-             property    TEXT NOT NULL,
-             enum_values TEXT,
-             pattern     TEXT,
-             min_value   REAL,
-             max_value   REAL
-         );
-         CREATE TABLE construct_embeddings (
-             construct_id TEXT PRIMARY KEY REFERENCES constructs(id),
-             domain_id    TEXT NOT NULL,
-             model        TEXT NOT NULL,
-             embedding    BLOB NOT NULL
-         );",
-    )
+    CREATE TABLE rule_relations (
+        rule_a_id TEXT NOT NULL REFERENCES rules(id),
+        rule_b_id TEXT NOT NULL REFERENCES rules(id),
+        relation_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        confirmed_by TEXT NOT NULL,
+        PRIMARY KEY (rule_a_id, rule_b_id)
+    );
+    "
 }
 
 pub fn open_store() -> rusqlite::Result<Connection> {
-    register_vec_extension();
     let conn = Connection::open_in_memory()?;
-    create_schema(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch(schema_ddl())?;
     Ok(conn)
 }
 
-/// Opens (creating if it doesn't already exist) a file-backed store at
-/// `path`, for `KNOWLEDGE_DB_PATH` (rusty_knowledge#41) -- `open_store`'s
-/// in-memory default stays the one every test and the no-env-var-set
-/// server startup path use, unchanged.
-///
-/// Returns `(connection, is_fresh)`. `is_fresh` is `true` for a brand new
-/// or still-empty file (no `domains` table yet -- schema was just created)
-/// and `false` for a file a previous run already initialized. Callers use
-/// this to decide whether to run `seed()`/an import: a previously
-/// populated file already has its own data, and neither should silently
-/// run again on every restart on top of it.
-pub fn open_store_at_path(path: &std::path::Path) -> rusqlite::Result<(Connection, bool)> {
-    register_vec_extension();
-    let conn = Connection::open(path)?;
-    let already_initialized = schema_exists(&conn)?;
-    if !already_initialized {
-        create_schema(&conn)?;
-    }
-    Ok((conn, !already_initialized))
-}
-
-pub fn insert_domain(conn: &Connection, domain: &Domain) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO domains (id, name) VALUES (?1, ?2)",
-        (&domain.id, &domain.name),
-    )?;
-    Ok(())
-}
-
-pub fn domain_by_id(conn: &Connection, domain_id: &str) -> rusqlite::Result<Option<Domain>> {
-    let mut stmt = conn.prepare("SELECT id, name FROM domains WHERE id = ?1")?;
-    let rows = stmt
-        .query_map([domain_id], |row| {
-            Ok(Domain {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows.into_iter().next())
-}
-
-/// All loaded domains, ordered by name. `meta.list_domains`'
-/// per-domain layer counts and coverage summary live in
-/// `lookup_domain_summary` instead -- `knowledge-mcp`'s own
-/// `meta.list_domains` implementation returns bare domain rows despite its
-/// tool description, matching this.
-pub fn list_domains(conn: &Connection) -> rusqlite::Result<Vec<Domain>> {
-    let mut stmt = conn.prepare("SELECT id, name FROM domains ORDER BY name")?;
-    let rows = stmt.query_map([], |row| {
-        Ok(Domain {
-            id: row.get(0)?,
-            name: row.get(1)?,
-        })
-    })?;
-    rows.collect()
-}
-
-/// Distinct authority layers with at least one rule in a domain --
-/// `lookup.domain_summary`'s "layers" field, derived rather than tracked
-/// separately, since it's fully determined by what's already in `rules_fts`.
-pub fn layers_present_in_domain(
-    conn: &Connection,
-    domain_id: &str,
-) -> rusqlite::Result<Vec<AuthorityLayer>> {
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT layer FROM rules_fts WHERE domain_id = ?1 ORDER BY layer")?;
-    let rows = stmt.query_map([domain_id], |row| {
-        let layer_text: String = row.get(0)?;
-        Ok(AuthorityLayer::from_str(&layer_text))
-    })?;
-    rows.collect()
-}
-
-pub fn insert_construct(conn: &Connection, construct: &Construct) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO constructs (id, domain_id, short_name, construct_type, description)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        (
-            &construct.id,
-            &construct.domain_id,
-            &construct.short_name,
-            &construct.construct_type,
-            &construct.description,
-        ),
-    )?;
-    Ok(())
-}
-
-/// Resolve a construct reference within a domain: tries an exact `short_name`
-/// match first, then falls back to a direct ID lookup verified against the
-/// domain (matching `knowledge-mcp`'s `_resolve` fallback order in `server.py`).
-pub fn resolve_construct(
-    conn: &Connection,
-    domain_id: &str,
-    construct_ref: &str,
-) -> rusqlite::Result<Option<Construct>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, domain_id, short_name, construct_type, description
-         FROM constructs WHERE domain_id = ?1 AND short_name = ?2",
-    )?;
-    let by_name = stmt
-        .query_map((domain_id, construct_ref), construct_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if let Some(construct) = by_name.into_iter().next() {
-        return Ok(Some(construct));
-    }
-
-    let mut stmt = conn.prepare(
-        "SELECT id, domain_id, short_name, construct_type, description
-         FROM constructs WHERE id = ?1 AND domain_id = ?2",
-    )?;
-    let by_id = stmt
-        .query_map((construct_ref, domain_id), construct_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(by_id.into_iter().next())
-}
-
-fn construct_from_row(row: &rusqlite::Row) -> rusqlite::Result<Construct> {
-    Ok(Construct {
+fn source_from_row(row: &rusqlite::Row) -> rusqlite::Result<Source> {
+    let domain_tags_json: String = row.get(3)?;
+    Ok(Source {
         id: row.get(0)?,
-        domain_id: row.get(1)?,
-        short_name: row.get(2)?,
-        construct_type: row.get(3)?,
-        description: row.get(4)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        domain_tags: serde_json::from_str(&domain_tags_json).unwrap_or_default(),
+        steward: row.get(4)?,
+        citation: row.get(5)?,
+        supersedes_source_id: row.get(6)?,
     })
+}
+
+pub fn insert_source(conn: &Connection, source: &Source) -> rusqlite::Result<()> {
+    let domain_tags_json = serde_json::to_string(&source.domain_tags).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO sources (id, name, kind, domain_tags, steward, citation, supersedes_source_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            source.id,
+            source.name,
+            source.kind,
+            domain_tags_json,
+            source.steward,
+            source.citation,
+            source.supersedes_source_id,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn source_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<Source>> {
+    conn.query_row(
+        "SELECT id, name, kind, domain_tags, steward, citation, supersedes_source_id
+         FROM sources WHERE id = ?1",
+        params![id],
+        source_from_row,
+    )
+    .optional()
+}
+
+/// All ancestors of `source_id` reachable through any parent-edge path in
+/// `source_authority` -- the full transitive closure over the DAG, not a
+/// single lineage. This is what makes multi-parent authority (an org
+/// answering to two independent frameworks at once) visible to the
+/// conflict gate: walking only one parent would make the other parent's
+/// rules invisible to enforcement.
+pub fn ancestors_of(conn: &Connection, source_id: &str) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE ancestors(id) AS (
+            SELECT parent_source_id FROM source_authority WHERE child_source_id = ?1
+            UNION
+            SELECT sa.parent_source_id
+            FROM source_authority sa
+            JOIN ancestors a ON sa.child_source_id = a.id
+        )
+        SELECT id FROM ancestors",
+    )?;
+    let rows = stmt.query_map(params![source_id], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+fn is_ancestor(conn: &Connection, candidate: &str, of_source: &str) -> rusqlite::Result<bool> {
+    Ok(ancestors_of(conn, of_source)?.contains(candidate))
+}
+
+/// Adds a `child answers to parent` edge, rejecting anything that would
+/// make `source_authority` a cyclic graph (a self-loop, or `parent`
+/// already answering -- transitively -- to `child`). SQLite has no native
+/// DAG-acyclicity constraint, so this is enforced here, in application
+/// logic, before the write.
+pub fn insert_source_authority_edge(
+    conn: &Connection,
+    child_source_id: &str,
+    parent_source_id: &str,
+) -> Result<(), String> {
+    if child_source_id == parent_source_id {
+        return Err(format!("{child_source_id:?} cannot answer to itself"));
+    }
+    let would_cycle =
+        is_ancestor(conn, child_source_id, parent_source_id).map_err(|err| err.to_string())?;
+    if would_cycle {
+        return Err(format!(
+            "{parent_source_id:?} already answers (transitively) to {child_source_id:?}; \
+             adding this edge would create a cycle"
+        ));
+    }
+    conn.execute(
+        "INSERT INTO source_authority (child_source_id, parent_source_id) VALUES (?1, ?2)",
+        params![child_source_id, parent_source_id],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn subject_from_row(row: &rusqlite::Row) -> rusqlite::Result<Subject> {
+    Ok(Subject {
+        id: row.get(0)?,
+        domain_tag: row.get(1)?,
+        subject_type: row.get(2)?,
+        name: row.get(3)?,
+        short_name: row.get(4)?,
+        description: row.get(5)?,
+        is_deprecated: row.get::<_, i64>(6)? != 0,
+        parent_subject_id: row.get(7)?,
+        supersedes_subject_id: row.get(8)?,
+    })
+}
+
+pub fn insert_subject(conn: &Connection, subject: &Subject) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO subjects
+             (id, domain_tag, subject_type, name, short_name, description, is_deprecated,
+              parent_subject_id, supersedes_subject_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            subject.id,
+            subject.domain_tag,
+            subject.subject_type,
+            subject.name,
+            subject.short_name,
+            subject.description,
+            subject.is_deprecated as i64,
+            subject.parent_subject_id,
+            subject.supersedes_subject_id,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn subject_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<Subject>> {
+    conn.query_row(
+        "SELECT id, domain_tag, subject_type, name, short_name, description, is_deprecated,
+                parent_subject_id, supersedes_subject_id
+         FROM subjects WHERE id = ?1",
+        params![id],
+        subject_from_row,
+    )
+    .optional()
+}
+
+/// Resolves a subject reference by exact short name first (within
+/// `domain_tag`), then by direct ID match -- mirroring the previous
+/// model's `resolve_construct` convention.
+pub fn resolve_subject(
+    conn: &Connection,
+    domain_tag: &str,
+    subject_ref: &str,
+) -> rusqlite::Result<Option<Subject>> {
+    let by_short_name = conn
+        .query_row(
+            "SELECT id, domain_tag, subject_type, name, short_name, description, is_deprecated,
+                    parent_subject_id, supersedes_subject_id
+             FROM subjects WHERE domain_tag = ?1 AND short_name = ?2",
+            params![domain_tag, subject_ref],
+            subject_from_row,
+        )
+        .optional()?;
+    if by_short_name.is_some() {
+        return Ok(by_short_name);
+    }
+    subject_by_id(conn, subject_ref)
 }
 
 fn rule_from_row(row: &rusqlite::Row) -> rusqlite::Result<Rule> {
-    let layer_text: String = row.get(4)?;
-    let rule_type_text: String = row.get(5)?;
+    let binding_strength_text: String = row.get(8)?;
     Ok(Rule {
-        domain_id: row.get(0)?,
-        construct_id: row.get(1)?,
-        construct: row.get(2)?,
-        text: row.get(3)?,
-        layer: AuthorityLayer::from_str(&layer_text),
-        rule_type: RuleType::from_str(&rule_type_text),
-    })
-}
-
-/// Rules attached to one construct, optionally filtered by authority layer
-/// and/or rule type (MUST/SHALL/SHOULD/MAY/MUST_NOT).
-pub fn rules_for_construct(
-    conn: &Connection,
-    construct_id: &str,
-    layer: Option<AuthorityLayer>,
-    rule_type: Option<RuleType>,
-) -> rusqlite::Result<Vec<Rule>> {
-    let layer_str = layer.map(AuthorityLayer::as_str);
-    let rule_type_str = rule_type.map(RuleType::as_str);
-    let mut stmt = conn.prepare(
-        "SELECT domain_id, construct_id, construct, text, layer, rule_type
-         FROM rules_fts
-         WHERE construct_id = ?1
-           AND (?2 IS NULL OR layer = ?2)
-           AND (?3 IS NULL OR rule_type = ?3)",
-    )?;
-    let rows = stmt.query_map((construct_id, layer_str, rule_type_str), rule_from_row)?;
-    rows.collect()
-}
-
-/// Returns the inserted row's `rowid`, so a caller that also wants to attach
-/// a `MachineRule` (via `insert_machine_check`) has something to key it to --
-/// `rules_fts` has no other stable per-row identifier.
-pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<i64> {
-    conn.execute(
-        "INSERT INTO rules_fts (domain_id, construct_id, construct, text, layer, rule_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        (
-            &rule.domain_id,
-            &rule.construct_id,
-            &rule.construct,
-            &rule.text,
-            rule.layer.as_str(),
-            rule.rule_type.as_str(),
-        ),
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Flattened, table-row-shaped view of a `MachineRule` -- avoids an
-/// unwieldy tuple type for `insert_machine_check`'s internal decomposition.
-struct MachineCheckRow<'a> {
-    check_type: &'a str,
-    property: &'a str,
-    enum_values: Option<String>,
-    pattern: Option<&'a str>,
-    min_value: Option<f64>,
-    max_value: Option<f64>,
-}
-
-pub fn insert_machine_check(
-    conn: &Connection,
-    rule_rowid: i64,
-    check: &MachineRule,
-) -> rusqlite::Result<()> {
-    let row = match check {
-        MachineRule::RequiredProperty { property } => MachineCheckRow {
-            check_type: "required_property",
-            property,
-            enum_values: None,
-            pattern: None,
-            min_value: None,
-            max_value: None,
-        },
-        MachineRule::EnumValue { property, values } => MachineCheckRow {
-            check_type: "enum_value",
-            property,
-            enum_values: Some(values.join(",")),
-            pattern: None,
-            min_value: None,
-            max_value: None,
-        },
-        MachineRule::Pattern { property, pattern } => MachineCheckRow {
-            check_type: "pattern",
-            property,
-            enum_values: None,
-            pattern: Some(pattern.as_str()),
-            min_value: None,
-            max_value: None,
-        },
-        MachineRule::Range { property, min, max } => MachineCheckRow {
-            check_type: "range",
-            property,
-            enum_values: None,
-            pattern: None,
-            min_value: *min,
-            max_value: *max,
-        },
-    };
-    conn.execute(
-        "INSERT INTO rule_machine_checks
-             (rule_rowid, check_type, property, enum_values, pattern, min_value, max_value)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        (
-            rule_rowid,
-            row.check_type,
-            row.property,
-            row.enum_values,
-            row.pattern,
-            row.min_value,
-            row.max_value,
-        ),
-    )?;
-    Ok(())
-}
-
-fn machine_rule_from_row(
-    check_type: Option<String>,
-    property: Option<String>,
-    enum_values: Option<String>,
-    pattern: Option<String>,
-    min_value: Option<f64>,
-    max_value: Option<f64>,
-) -> Option<MachineRule> {
-    let property = property?;
-    match check_type?.as_str() {
-        "required_property" => Some(MachineRule::RequiredProperty { property }),
-        "enum_value" => Some(MachineRule::EnumValue {
-            property,
-            values: enum_values
-                .unwrap_or_default()
-                .split(',')
-                .map(str::to_string)
-                .collect(),
-        }),
-        "pattern" => Some(MachineRule::Pattern {
-            property,
-            pattern: pattern.unwrap_or_default(),
-        }),
-        "range" => Some(MachineRule::Range {
-            property,
-            min: min_value,
-            max: max_value,
-        }),
-        _ => None,
-    }
-}
-
-/// Rules for a construct alongside any `MachineRule` each carries --
-/// `validate_element`'s input. `None` in the second tuple slot means the
-/// rule is free text only, same as `knowledge-mcp`'s `if rule.machine_rule:`
-/// guard.
-pub fn rules_with_checks_for_construct(
-    conn: &Connection,
-    construct_id: &str,
-    layer: Option<AuthorityLayer>,
-) -> rusqlite::Result<Vec<(Rule, Option<MachineRule>)>> {
-    let layer_str = layer.map(AuthorityLayer::as_str);
-    let mut stmt = conn.prepare(
-        "SELECT r.domain_id, r.construct_id, r.construct, r.text, r.layer, r.rule_type,
-                m.check_type, m.property, m.enum_values, m.pattern, m.min_value, m.max_value
-         FROM rules_fts r
-         LEFT JOIN rule_machine_checks m ON m.rule_rowid = r.rowid
-         WHERE r.construct_id = ?1 AND (?2 IS NULL OR r.layer = ?2)",
-    )?;
-    let rows = stmt.query_map((construct_id, layer_str), |row| {
-        let rule = rule_from_row(row)?;
-        let machine_rule = machine_rule_from_row(
-            row.get(6)?,
-            row.get(7)?,
-            row.get(8)?,
-            row.get(9)?,
-            row.get(10)?,
-            row.get(11)?,
-        );
-        Ok((rule, machine_rule))
-    })?;
-    rows.collect()
-}
-
-pub fn insert_relationship(conn: &Connection, rel: &Relationship) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO relationships
-             (id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        (
-            &rel.id,
-            &rel.domain_id,
-            &rel.from_construct_id,
-            &rel.to_construct_id,
-            &rel.relationship_type,
-            &rel.cardinality,
-            rel.layer.as_str(),
-            rel.rule_type.as_str(),
-        ),
-    )?;
-    Ok(())
-}
-
-/// Relationships originating from one construct, optionally narrowed to a
-/// specific target construct and/or relationship type. Unlike
-/// `knowledge-mcp`'s `lookup.relationships` (which silently drops an
-/// unresolvable `to_construct_ref` filter rather than erroring), an
-/// unresolvable `to_construct_id` here is the caller's job to resolve first
-/// -- this function takes an already-resolved ID, not a ref string.
-fn relationship_from_row(row: &rusqlite::Row) -> rusqlite::Result<Relationship> {
-    let layer_text: String = row.get(6)?;
-    let rule_type_text: String = row.get(7)?;
-    Ok(Relationship {
         id: row.get(0)?,
-        domain_id: row.get(1)?,
-        from_construct_id: row.get(2)?,
-        to_construct_id: row.get(3)?,
+        source_id: row.get(1)?,
+        subject_id: row.get(2)?,
+        related_subject_id: row.get(3)?,
         relationship_type: row.get(4)?,
         cardinality: row.get(5)?,
-        layer: AuthorityLayer::from_str(&layer_text),
-        rule_type: RuleType::from_str(&rule_type_text),
+        statement: row.get(6)?,
+        machine_check: row.get(7)?,
+        binding_strength: BindingStrength::from_str(&binding_strength_text),
+        supersedes_rule_id: row.get(9)?,
     })
 }
 
-pub fn relationships_from(
-    conn: &Connection,
-    from_construct_id: &str,
-    to_construct_id: Option<&str>,
-    relationship_type: Option<&str>,
-    rule_type: Option<RuleType>,
-    layer: Option<AuthorityLayer>,
-) -> rusqlite::Result<Vec<Relationship>> {
-    let rule_type_str = rule_type.map(RuleType::as_str);
-    let layer_str = layer.map(AuthorityLayer::as_str);
-    let mut stmt = conn.prepare(
-        "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type
-         FROM relationships
-         WHERE from_construct_id = ?1
-           AND (?2 IS NULL OR to_construct_id = ?2)
-           AND (?3 IS NULL OR relationship_type = ?3)
-           AND (?4 IS NULL OR rule_type = ?4)
-           AND (?5 IS NULL OR layer = ?5)",
-    )?;
-    let rows = stmt.query_map(
-        (
-            from_construct_id,
-            to_construct_id,
-            relationship_type,
-            rule_type_str,
-            layer_str,
-        ),
-        relationship_from_row,
-    )?;
-    rows.collect()
-}
+const RULE_COLUMNS: &str = "id, source_id, subject_id, related_subject_id, relationship_type, \
+     cardinality, statement, machine_check, binding_strength, supersedes_rule_id";
 
-/// Mirror of `relationships_from`, keyed by the target construct instead --
-/// "what points at this construct" rather than "what this construct points
-/// at". Needed for `crosscut.traceability`'s `must_be_traced_from` side,
-/// which `knowledge-mcp` answers with a `to_construct_id`-keyed query.
-pub fn relationships_to(
-    conn: &Connection,
-    to_construct_id: &str,
-    from_construct_id: Option<&str>,
-    relationship_type: Option<&str>,
-    rule_type: Option<RuleType>,
-    layer: Option<AuthorityLayer>,
-) -> rusqlite::Result<Vec<Relationship>> {
-    let rule_type_str = rule_type.map(RuleType::as_str);
-    let layer_str = layer.map(AuthorityLayer::as_str);
-    let mut stmt = conn.prepare(
-        "SELECT id, domain_id, from_construct_id, to_construct_id, relationship_type, cardinality, layer, rule_type
-         FROM relationships
-         WHERE to_construct_id = ?1
-           AND (?2 IS NULL OR from_construct_id = ?2)
-           AND (?3 IS NULL OR relationship_type = ?3)
-           AND (?4 IS NULL OR rule_type = ?4)
-           AND (?5 IS NULL OR layer = ?5)",
-    )?;
-    let rows = stmt.query_map(
-        (
-            to_construct_id,
-            from_construct_id,
-            relationship_type,
-            rule_type_str,
-            layer_str,
-        ),
-        relationship_from_row,
-    )?;
-    rows.collect()
-}
-
-/// `validate.completeness`'s result: given a construct (e.g. a viewpoint)
-/// and the element types actually present, what's required, what's missing,
-/// and what's present but not required.
-pub struct CompletenessReport {
-    pub required_element_types: Vec<String>,
-    pub present_element_types: Vec<String>,
-    pub missing_required: Vec<String>,
-    pub extra_present: Vec<String>,
-    pub required_rule_texts: Vec<String>,
-    pub recommended_rule_texts: Vec<String>,
-    pub is_complete: bool,
-}
-
-/// "Required" element types come from `MUST`-typed relationships originating
-/// at `construct_id` -- matching `knowledge-mcp`'s `evaluate_completeness`,
-/// which reuses its relationship store the same way `validate.relationship`
-/// does, filtered to `rule_type="MUST"`.
-pub fn evaluate_completeness(
-    conn: &Connection,
-    construct_id: &str,
-    present_element_types: &[String],
-) -> rusqlite::Result<CompletenessReport> {
-    let rules = rules_for_construct(conn, construct_id, None, None)?;
-    let required_rule_texts: Vec<String> = rules
-        .iter()
-        .filter(|r| matches!(r.rule_type, RuleType::Must | RuleType::Shall))
-        .map(|r| r.text.clone())
-        .collect();
-    let recommended_rule_texts: Vec<String> = rules
-        .iter()
-        .filter(|r| r.rule_type == RuleType::Should)
-        .map(|r| r.text.clone())
-        .collect();
-
-    let rels = relationships_from(conn, construct_id, None, None, Some(RuleType::Must), None)?;
-    let required_types: std::collections::BTreeSet<String> =
-        rels.iter().map(|r| r.to_construct_id.clone()).collect();
-    let present_set: std::collections::BTreeSet<String> =
-        present_element_types.iter().cloned().collect();
-
-    let missing_required: Vec<String> = required_types.difference(&present_set).cloned().collect();
-    let extra_present: Vec<String> = present_set.difference(&required_types).cloned().collect();
-    let is_complete = missing_required.is_empty();
-
-    Ok(CompletenessReport {
-        required_element_types: required_types.into_iter().collect(),
-        present_element_types: present_element_types.to_vec(),
-        missing_required,
-        extra_present,
-        required_rule_texts,
-        recommended_rule_texts,
-        is_complete,
-    })
-}
-
-pub fn insert_valid_relationship(
-    conn: &Connection,
-    rule: &ValidRelationshipRule,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO valid_relationships (domain_id, from_type, to_type, relationship_type, cardinality)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        (
-            &rule.domain_id,
-            &rule.from_type,
-            &rule.to_type,
-            &rule.relationship_type,
-            &rule.cardinality,
-        ),
-    )?;
-    Ok(())
-}
-
-/// All declared valid relationship types between two construct types in a
-/// domain -- `RM-KNOWLEDGE-MODEL-0004`'s "declared valid-relationship set".
-pub fn valid_relationships_between(
-    conn: &Connection,
-    domain_id: &str,
-    from_type: &str,
-    to_type: &str,
-) -> rusqlite::Result<Vec<ValidRelationshipRule>> {
-    let mut stmt = conn.prepare(
-        "SELECT domain_id, from_type, to_type, relationship_type, cardinality
-         FROM valid_relationships
-         WHERE domain_id = ?1 AND from_type = ?2 AND to_type = ?3",
-    )?;
-    let rows = stmt.query_map((domain_id, from_type, to_type), |row| {
-        Ok(ValidRelationshipRule {
-            domain_id: row.get(0)?,
-            from_type: row.get(1)?,
-            to_type: row.get(2)?,
-            relationship_type: row.get(3)?,
-            cardinality: row.get(4)?,
-        })
-    })?;
-    rows.collect()
-}
-
-/// A *candidate* declared valid-relationship rule, derived from a domain's
-/// existing `relationships` instances rather than authored by a human --
-/// see [`candidate_valid_relationships`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct ValidRelationshipCandidate {
-    pub rule: ValidRelationshipRule,
-    /// How many relationship instances support this candidate.
-    pub instance_count: usize,
-    /// Other cardinality values seen among instances of this same
-    /// `(from_type, to_type, relationship_type)` triple, sorted, when they
-    /// weren't unanimous. `rule.cardinality` is whichever value appeared
-    /// most often; this field exists so a reviewer sees the disagreement
-    /// rather than it being silently resolved. Empty when every instance
-    /// agreed.
-    pub other_cardinalities_seen: Vec<String>,
-}
-
-/// Derives *candidate* declared valid-relationship rules from a domain's
-/// existing `relationships` instances, grouped by `(from_type, to_type,
-/// relationship_type)` via each endpoint's `construct_type`.
-///
-/// Read-only: never writes to `valid_relationships` itself. Each candidate
-/// still needs an explicit [`insert_valid_relationship`] call from a human
-/// reviewer to become a *declared* rule -- silently promoting inferred
-/// candidates straight into `valid_relationships` would reintroduce the
-/// exact anti-pattern `RM-KNOWLEDGE-MODEL-0004` exists to avoid, the same
-/// reasoning already applied when the `knowledge-mcp` importer
-/// (rusty_knowledge#38/#39) chose to leave `valid_relationships` empty
-/// rather than infer it from imported instances.
-pub fn candidate_valid_relationships(
-    conn: &Connection,
-    domain_id: &str,
-) -> rusqlite::Result<Vec<ValidRelationshipCandidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT fc.construct_type, tc.construct_type, r.relationship_type, r.cardinality
-         FROM relationships r
-         JOIN constructs fc ON fc.id = r.from_construct_id
-         JOIN constructs tc ON tc.id = r.to_construct_id
-         WHERE r.domain_id = ?1",
-    )?;
-    let rows = stmt
-        .query_map([domain_id], |row| {
-            let from_type: String = row.get(0)?;
-            let to_type: String = row.get(1)?;
-            let relationship_type: String = row.get(2)?;
-            let cardinality: String = row.get(3)?;
-            Ok((from_type, to_type, relationship_type, cardinality))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut groups: std::collections::BTreeMap<
-        (String, String, String),
-        std::collections::HashMap<String, usize>,
-    > = std::collections::BTreeMap::new();
-    for (from_type, to_type, relationship_type, cardinality) in rows {
-        *groups
-            .entry((from_type, to_type, relationship_type))
-            .or_default()
-            .entry(cardinality)
-            .or_insert(0) += 1;
-    }
-
-    let mut candidates = Vec::with_capacity(groups.len());
-    for ((from_type, to_type, relationship_type), cardinality_counts) in groups {
-        let instance_count = cardinality_counts.values().sum();
-        let chosen_cardinality = cardinality_counts
-            .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
-            .map(|(cardinality, _)| cardinality.clone())
-            .expect("group is non-empty by construction (only built from at least one row)");
-        let mut other_cardinalities_seen: Vec<String> = cardinality_counts
-            .into_keys()
-            .filter(|cardinality| *cardinality != chosen_cardinality)
-            .collect();
-        other_cardinalities_seen.sort();
-
-        candidates.push(ValidRelationshipCandidate {
-            rule: ValidRelationshipRule {
-                domain_id: domain_id.to_string(),
-                from_type,
-                to_type,
-                relationship_type,
-                cardinality: chosen_cardinality,
-            },
-            instance_count,
-            other_cardinalities_seen,
-        });
-    }
-    Ok(candidates)
-}
-
-pub fn insert_conflict(conn: &Connection, conflict: &Conflict) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO conflicts
-             (id, domain_id, construct_id, layer_a, layer_b, conflict_type, description, resolution, rationale, review_date)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        (
-            &conflict.id,
-            &conflict.domain_id,
-            &conflict.construct_id,
-            conflict.layer_a.as_str(),
-            conflict.layer_b.as_str(),
-            &conflict.conflict_type,
-            &conflict.description,
-            &conflict.resolution,
-            &conflict.rationale,
-            &conflict.review_date,
-        ),
-    )?;
-    Ok(())
-}
-
-/// Conflict-registry entries for a domain, optionally narrowed to one
-/// construct. Matching `knowledge-mcp`'s `get_conflicts`: when a
-/// `construct_id` is given, this returns both that construct's own
-/// conflicts *and* the domain's construct-independent (`construct_id IS
-/// NULL`) ones -- a domain-level conflict is relevant no matter which
-/// construct you asked about.
-pub fn conflicts_for(
-    conn: &Connection,
-    domain_id: &str,
-    construct_id: Option<&str>,
-) -> rusqlite::Result<Vec<Conflict>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, domain_id, construct_id, layer_a, layer_b, conflict_type, description, resolution, rationale, review_date
-         FROM conflicts
-         WHERE domain_id = ?1 AND (?2 IS NULL OR construct_id = ?2 OR construct_id IS NULL)",
-    )?;
-    let rows = stmt.query_map((domain_id, construct_id), |row| {
-        let layer_a_text: String = row.get(3)?;
-        let layer_b_text: String = row.get(4)?;
-        Ok(Conflict {
-            id: row.get(0)?,
-            domain_id: row.get(1)?,
-            construct_id: row.get(2)?,
-            layer_a: AuthorityLayer::from_str(&layer_a_text),
-            layer_b: AuthorityLayer::from_str(&layer_b_text),
-            conflict_type: row.get(5)?,
-            description: row.get(6)?,
-            resolution: row.get(7)?,
-            rationale: row.get(8)?,
-            review_date: row.get(9)?,
-        })
-    })?;
-    rows.collect()
-}
-
-pub fn insert_cross_domain_relationship(
-    conn: &Connection,
-    rel: &CrossDomainRelationship,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO cross_domain_relationships
-             (id, from_domain_id, from_construct_id, to_domain_id, to_construct_id, relationship_type, description, rationale)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        (
-            &rel.id,
-            &rel.from_domain_id,
-            &rel.from_construct_id,
-            &rel.to_domain_id,
-            &rel.to_construct_id,
-            &rel.relationship_type,
-            &rel.description,
-            &rel.rationale,
-        ),
-    )?;
-    Ok(())
-}
-
-/// Cross-domain relationships from a specific construct, optionally
-/// narrowed to one target domain. Unlike same-domain `Relationship`s, the
-/// target construct is never resolved against a live `constructs` row here
-/// -- `knowledge-mcp`'s own `crosscut.cross_domain` doesn't do so either,
-/// since the target domain (e.g. an external framework like RMF) may not be
-/// loaded at all.
-pub fn cross_domain_relationships_from(
-    conn: &Connection,
-    from_domain_id: &str,
-    from_construct_id: &str,
-    to_domain_id: Option<&str>,
-) -> rusqlite::Result<Vec<CrossDomainRelationship>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, from_domain_id, from_construct_id, to_domain_id, to_construct_id, relationship_type, description, rationale
-         FROM cross_domain_relationships
-         WHERE from_domain_id = ?1 AND from_construct_id = ?2
-           AND (?3 IS NULL OR to_domain_id = ?3)",
-    )?;
-    let rows = stmt.query_map((from_domain_id, from_construct_id, to_domain_id), |row| {
-        Ok(CrossDomainRelationship {
-            id: row.get(0)?,
-            from_domain_id: row.get(1)?,
-            from_construct_id: row.get(2)?,
-            to_domain_id: row.get(3)?,
-            to_construct_id: row.get(4)?,
-            relationship_type: row.get(5)?,
-            description: row.get(6)?,
-            rationale: row.get(7)?,
-        })
-    })?;
-    rows.collect()
-}
-
-/// How a search response was produced. `RM-KNOWLEDGE-MODEL-0005` requires
-/// this be declared on every search response, not silently omitted or
-/// substituted -- there is deliberately no `Default` impl, so a caller can't
-/// forget to pick one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetrievalMode {
-    /// FTS5 keyword match only -- the mode when no real `Embedder` is
-    /// configured (a `NullEmbedder`, `dimension() == 0`), or when a
-    /// configured embedder's vector search fails or has no index to query
-    /// yet. Never silently upgraded to `Hybrid` in that case.
-    LexicalOnly,
-    /// FTS5 keyword match fused with `vec0` cosine-similarity search via
-    /// Reciprocal Rank Fusion, matching `knowledge-mcp`'s `hybrid_search`.
-    /// Only ever returned when a real embedder actually produced vectors
-    /// for this query.
-    Hybrid,
-}
-
-impl RetrievalMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RetrievalMode::LexicalOnly => "lexical-only",
-            RetrievalMode::Hybrid => "hybrid",
-        }
-    }
-}
-
-/// One ranked search hit: a rule plus its FTS5 rank (more negative = better
-/// match, per SQLite's bm25-derived `rank` auxiliary column -- ascending
-/// order is already best-first).
-pub struct SearchHit {
-    pub rule: Rule,
-    pub rank: f64,
-}
-
-/// Domain/layer-scoped, ranked search — the `RM-KNOWLEDGE-MODEL-0005`-conforming
-/// upgrade to plain `search`. `domain_id`/`layer` are optional filters; `None`
-/// means unfiltered on that axis, matching the previous unscoped behavior when
-/// both are `None`. Always returns `RetrievalMode::LexicalOnly` -- this is the
-/// FTS-only half of [`hybrid_search`], which is what actually declares `Hybrid`
-/// when a real embedder is in play.
-pub fn search_scoped(
-    conn: &Connection,
-    query: &str,
-    domain_id: Option<&str>,
-    layer: Option<AuthorityLayer>,
-) -> rusqlite::Result<(Vec<SearchHit>, RetrievalMode)> {
-    let layer_str = layer.map(AuthorityLayer::as_str);
-    let mut stmt = conn.prepare(
-        "SELECT domain_id, construct_id, construct, text, layer, rule_type, rank
-         FROM rules_fts
-         WHERE rules_fts MATCH ?1
-           AND (?2 IS NULL OR domain_id = ?2)
-           AND (?3 IS NULL OR layer = ?3)
-         ORDER BY rank",
-    )?;
-    let rows = stmt.query_map((query, domain_id, layer_str), |row| {
-        Ok(SearchHit {
-            rule: rule_from_row(row)?,
-            rank: row.get(6)?,
-        })
-    })?;
-    Ok((
-        rows.collect::<rusqlite::Result<Vec<_>>>()?,
-        RetrievalMode::LexicalOnly,
-    ))
-}
-
-/// Errors from the embedding/vector-search path -- unifies SQLite errors
-/// with `rusty_embedder_core::EmbedError` so callers get one `Result` type
-/// regardless of whether the storage step or the embedder itself failed.
-#[derive(Debug)]
-pub enum EmbeddingError {
-    Sqlite(rusqlite::Error),
-    Embed(rusty_embedder_core::EmbedError),
-}
-
-impl std::fmt::Display for EmbeddingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EmbeddingError::Sqlite(err) => write!(f, "{err}"),
-            EmbeddingError::Embed(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for EmbeddingError {}
-
-impl From<rusqlite::Error> for EmbeddingError {
-    fn from(err: rusqlite::Error) -> Self {
-        EmbeddingError::Sqlite(err)
-    }
-}
-
-impl From<rusty_embedder_core::EmbedError> for EmbeddingError {
-    fn from(err: rusty_embedder_core::EmbedError) -> Self {
-        EmbeddingError::Embed(err)
-    }
-}
-
-/// Stores a single pre-existing embedding (raw little-endian f32 bytes,
-/// already `serialize_f32`-shaped) directly into `construct_embeddings` --
-/// the counterpart to [`build_construct_embeddings`] for vectors that
-/// already exist elsewhere (e.g. imported from another store) rather than
-/// ones this crate generates itself via an [`Embedder`]. Does not touch
-/// `vec_constructs`; call [`sync_vector_index`] afterward to pick up new
-/// rows, same as after [`build_construct_embeddings`].
-pub fn insert_construct_embedding(
-    conn: &Connection,
-    construct_id: &str,
-    domain_id: &str,
-    model: &str,
-    embedding: &[u8],
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO construct_embeddings (construct_id, domain_id, model, embedding)
-         VALUES (?1, ?2, ?3, ?4)",
-        (construct_id, domain_id, model, embedding),
-    )?;
-    Ok(())
-}
-
-/// Embeds every construct's `description` and stores the result in
-/// `construct_embeddings`, matching `knowledge-mcp`'s ingestion-time
-/// `_build_embeddings` -- one vector per construct (not per rule), skipping
-/// constructs with an empty description.
-///
-/// A no-op returning `Ok(0)` when `embedder.dimension() == 0` (the
-/// `NullEmbedder` case): matches `knowledge-mcp`'s own early return, so
-/// calling this with no real embedder configured is always safe and free.
-pub fn build_construct_embeddings(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-) -> Result<usize, EmbeddingError> {
-    if embedder.dimension() == 0 {
-        return Ok(0);
-    }
-
-    let mut stmt =
-        conn.prepare("SELECT id, domain_id, description FROM constructs WHERE description != ''")?;
-    let eligible = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let domain_id: String = row.get(1)?;
-            let description: String = row.get(2)?;
-            Ok((id, domain_id, description))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if eligible.is_empty() {
-        return Ok(0);
-    }
-
-    let texts: Vec<String> = eligible.iter().map(|(_, _, text)| text.clone()).collect();
-    let vectors = embedder.embed(&texts)?;
-
-    for ((construct_id, domain_id, _), vector) in eligible.iter().zip(vectors.iter()) {
-        conn.execute(
-            "INSERT OR REPLACE INTO construct_embeddings (construct_id, domain_id, model, embedding)
-             VALUES (?1, ?2, ?3, ?4)",
-            (
-                construct_id,
-                domain_id,
-                embedder.model_name(),
-                serialize_f32(vector),
-            ),
-        )?;
-    }
-    Ok(eligible.len())
-}
-
-/// (Re)builds the `vec_constructs` `vec0` virtual table from
-/// `construct_embeddings`, sizing it to whatever dimension the stored
-/// vectors actually are -- matching `knowledge-mcp`'s `_init_vec`/
-/// `_sync_vec_table`, which detects dimension from the first stored row
-/// rather than baking a fixed size into the schema up front (a single
-/// server may switch embedder/model between runs).
-///
-/// Returns `Ok(false)` with no table created if `construct_embeddings` is
-/// still empty (no embedder has run yet) -- the vector-search path stays
-/// unavailable, and callers should fall back to lexical-only, exactly the
-/// same "vec not ready" case `knowledge-mcp`'s `_vec_available` flag covers.
-pub fn sync_vector_index(conn: &Connection) -> rusqlite::Result<bool> {
-    let sample: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT embedding FROM construct_embeddings LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(sample) = sample else {
-        return Ok(false);
-    };
-    let dimension = sample.len() / 4;
-
+/// Inserts a Rule. When `supersedes_rule_id` is set, every `RuleRelation`
+/// touching the superseded rule is flipped from `active` to `stale`
+/// automatically -- the confirmed judgment was about text that no longer
+/// exists, so it needs re-review rather than silently continuing to read
+/// as current. The stale row itself is kept, not deleted or rewritten.
+pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
     conn.execute(
         &format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_constructs \
-             USING vec0(construct_id TEXT PRIMARY KEY, embedding float[{dimension}] distance_metric=cosine)"
+            "INSERT INTO rules ({RULE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         ),
-        [],
+        params![
+            rule.id,
+            rule.source_id,
+            rule.subject_id,
+            rule.related_subject_id,
+            rule.relationship_type,
+            rule.cardinality,
+            rule.statement,
+            rule.machine_check,
+            rule.binding_strength.as_str(),
+            rule.supersedes_rule_id,
+        ],
     )?;
-    conn.execute("DELETE FROM vec_constructs", [])?;
+
+    if let Some(superseded_id) = &rule.supersedes_rule_id {
+        conn.execute(
+            "UPDATE rule_relations SET status = 'stale'
+             WHERE (rule_a_id = ?1 OR rule_b_id = ?1) AND status = 'active'",
+            params![superseded_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every rule about `subject_id` -- either as its primary subject or as
+/// the target of a relationship claim (`related_subject_id`) -- alongside
+/// the `Source` that issued it. Deliberately not scoped to any one
+/// authority chain: a Subject can be the target of claims from Sources
+/// anywhere in the DAG, and a caller needs the full picture (what the
+/// standard says, what each layer under it adds) to make sense of it.
+pub fn rules_for_subject(
+    conn: &Connection,
+    subject_id: &str,
+) -> rusqlite::Result<Vec<(Rule, Source)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM rules WHERE subject_id = ?1 OR related_subject_id = ?1 ORDER BY id",
+        cols = RULE_COLUMNS
+            .split(", ")
+            .map(|c| format!("rules.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
+    let rules: Vec<Rule> = stmt
+        .query_map(params![subject_id], rule_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let source = source_by_id(conn, &rule.source_id)?.ok_or_else(|| {
+            rusqlite::Error::QueryReturnedNoRows // a Rule's source_id is a required FK; absence is a data-integrity bug, not a normal empty result
+        })?;
+        out.push((rule, source));
+    }
+    Ok(out)
+}
+
+pub fn insert_rule_relation(conn: &Connection, relation: &RuleRelation) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO vec_constructs (construct_id, embedding)
-         SELECT construct_id, embedding FROM construct_embeddings",
-        [],
+        "INSERT INTO rule_relations (rule_a_id, rule_b_id, relation_type, status, confirmed_by)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            relation.rule_a_id,
+            relation.rule_b_id,
+            relation.relation_type.as_str(),
+            relation.status.as_str(),
+            relation.confirmed_by,
+        ],
     )?;
-    Ok(true)
+    Ok(())
 }
 
-/// KNN vector search: embeds `query`, matches it against `vec_constructs`,
-/// and returns `(construct_id, distance)` pairs ordered by distance
-/// ascending (smaller = more similar, matching cosine-distance semantics).
-/// `domain_id` is a post-filter, same as `knowledge-mcp`'s `_vector_search`
-/// -- `vec0` itself has no domain column to filter on.
-pub fn vector_search(
+fn active_relation_exists(conn: &Connection, rule_a: &str, rule_b: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM rule_relations
+         WHERE status = 'active'
+           AND ((rule_a_id = ?1 AND rule_b_id = ?2) OR (rule_a_id = ?2 AND rule_b_id = ?1))",
+        params![rule_a, rule_b],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// Confirmed, active `conflicts_with` relations among rules about
+/// `subject_id`.
+pub fn confirmed_conflicts_for_subject(
     conn: &Connection,
-    embedder: &dyn Embedder,
-    query: &str,
-    domain_id: Option<&str>,
-    limit: usize,
-) -> Result<Vec<(String, f64)>, EmbeddingError> {
-    let query_vec = embedder.embed(std::slice::from_ref(&query.to_string()))?;
-    let Some(query_vec) = query_vec.into_iter().next() else {
-        return Ok(Vec::new());
-    };
-    let query_blob = serialize_f32(&query_vec);
-
-    let mut stmt = conn.prepare(
-        "SELECT construct_id, distance FROM vec_constructs WHERE embedding MATCH ?1 AND k = ?2",
-    )?;
-    let rows = stmt
-        .query_map((query_blob, limit as i64), |row| {
-            let construct_id: String = row.get(0)?;
-            let distance: f64 = row.get(1)?;
-            Ok((construct_id, distance))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let results = match domain_id {
-        None => rows,
-        Some(domain_id) => {
-            let mut stmt = conn.prepare("SELECT id FROM constructs WHERE domain_id = ?1")?;
-            let allowed: std::collections::HashSet<String> = stmt
-                .query_map([domain_id], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            rows.into_iter()
-                .filter(|(construct_id, _)| allowed.contains(construct_id))
-                .collect()
-        }
-    };
-    Ok(results)
-}
-
-/// One result from [`hybrid_search`]: either a lexical hit (a rule matched
-/// by FTS5), a vector-only hit (a construct whose *description* matched
-/// semantically but produced no FTS5 hit of its own -- `knowledge-mcp`'s
-/// `content_type="vector_match"`), or a construct that hit on both, fused
-/// into a single relevance score.
-pub struct HybridHit {
-    pub construct_id: String,
-    pub domain_id: String,
-    pub construct_name: String,
-    /// `Some` for a lexical hit (the matched rule's layer). `None` for a
-    /// vector-only hit -- a construct's *description* matched semantically,
-    /// and (same as `search.constructs`, rusty_knowledge#12) a construct
-    /// itself isn't layered, only the rules attached to it are.
-    pub layer: Option<AuthorityLayer>,
-    pub text: String,
-    pub is_vector_match: bool,
-    pub score: f64,
-}
-
-/// Fuses ranked FTS hits with ranked vector hits via Reciprocal Rank Fusion
-/// (RRF), matching `knowledge-mcp`'s `_reciprocal_rank_fusion`: each list
-/// contributes `1 / (k + rank_position + 1)` to a construct's fused score,
-/// so a construct appearing in both lists is naturally boosted. `k = 60` is
-/// the standard RRF constant, the same default Python uses. Vector-only
-/// hits are backfilled from the `constructs` table (domain, description),
-/// since they have no FTS row of their own to source `domain_id`/`text` from.
-fn reciprocal_rank_fusion(
-    conn: &Connection,
-    fts_hits: &[SearchHit],
-    vec_hits: &[(String, f64)],
-) -> rusqlite::Result<Vec<HybridHit>> {
-    const K: f64 = 60.0;
-
-    let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    let mut fts_by_construct: std::collections::HashMap<&str, &SearchHit> =
-        std::collections::HashMap::new();
-
-    for (pos, hit) in fts_hits.iter().enumerate() {
-        *scores.entry(hit.rule.construct_id.clone()).or_insert(0.0) += 1.0 / (K + pos as f64 + 1.0);
-        fts_by_construct.insert(hit.rule.construct_id.as_str(), hit);
-    }
-    for (pos, (construct_id, _distance)) in vec_hits.iter().enumerate() {
-        *scores.entry(construct_id.clone()).or_insert(0.0) += 1.0 / (K + pos as f64 + 1.0);
-    }
-
-    let mut ordered: Vec<(String, f64)> = scores.into_iter().collect();
-    ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut merged = Vec::with_capacity(ordered.len());
-    for (construct_id, score) in ordered {
-        if let Some(hit) = fts_by_construct.get(construct_id.as_str()) {
-            merged.push(HybridHit {
-                construct_id,
-                domain_id: hit.rule.domain_id.clone(),
-                construct_name: hit.rule.construct.clone(),
-                layer: Some(hit.rule.layer),
-                text: hit.rule.text.clone(),
-                is_vector_match: false,
-                score,
-            });
-        } else {
-            let found: Option<(String, String, String)> = conn
+    subject_id: &str,
+) -> rusqlite::Result<Vec<(Rule, Rule, RuleRelation)>> {
+    let rules = rules_for_subject(conn, subject_id)?;
+    let mut out = Vec::new();
+    for i in 0..rules.len() {
+        for j in (i + 1)..rules.len() {
+            let (rule_a, _) = &rules[i];
+            let (rule_b, _) = &rules[j];
+            let relation = conn
                 .query_row(
-                    "SELECT domain_id, short_name, description FROM constructs WHERE id = ?1",
-                    [&construct_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    "SELECT rule_a_id, rule_b_id, relation_type, status, confirmed_by
+                     FROM rule_relations
+                     WHERE status = 'active' AND relation_type = 'conflicts_with'
+                       AND ((rule_a_id = ?1 AND rule_b_id = ?2) OR (rule_a_id = ?2 AND rule_b_id = ?1))",
+                    params![rule_a.id, rule_b.id],
+                    |row| {
+                        Ok(RuleRelation {
+                            rule_a_id: row.get(0)?,
+                            rule_b_id: row.get(1)?,
+                            relation_type: RelationType::from_str(&row.get::<_, String>(2)?),
+                            status: RelationStatus::from_str(&row.get::<_, String>(3)?),
+                            confirmed_by: row.get(4)?,
+                        })
+                    },
                 )
-                .ok();
-            if let Some((domain_id, short_name, description)) = found {
-                merged.push(HybridHit {
-                    construct_id,
-                    domain_id,
-                    construct_name: short_name,
-                    layer: None,
-                    text: description,
-                    is_vector_match: true,
-                    score,
-                });
+                .optional()?;
+            if let Some(relation) = relation {
+                out.push((rule_a.clone(), rule_b.clone(), relation));
             }
         }
     }
-    Ok(merged)
+    Ok(out)
 }
 
-fn lexical_only_hits(fts_hits: Vec<SearchHit>) -> Vec<HybridHit> {
-    fts_hits
-        .into_iter()
-        .map(|hit| HybridHit {
-            construct_id: hit.rule.construct_id.clone(),
-            domain_id: hit.rule.domain_id.clone(),
-            construct_name: hit.rule.construct.clone(),
-            layer: Some(hit.rule.layer),
-            text: hit.rule.text.clone(),
-            is_vector_match: false,
-            score: hit.rank,
-        })
-        .collect()
-}
-
-/// Combined FTS + vector search with Reciprocal Rank Fusion -- the
-/// `RM-KNOWLEDGE-MODEL-0005`-conforming entry point `search_knowledge`
-/// calls. Always runs FTS first. If `embedder.dimension() > 0` and a vector
-/// index is available (`sync_vector_index` finds embeddings to build one
-/// from), also runs vector search and fuses the two; falls back to
-/// FTS-only -- honestly declared as `RetrievalMode::LexicalOnly`, not
-/// silently -- on any vector-search error, matching `knowledge-mcp`'s own
-/// try/except fallback in `hybrid_search`.
-pub fn hybrid_search(
+/// Pairs of same-subject rules from different Sources with no confirmed
+/// `RuleRelation` yet -- candidates needing human review, per the
+/// two-tier conflict-gate design (subject_id is the primary, exact
+/// correlation key; this covers both ancestor/descendant pairs *and*
+/// siblings under a shared parent, which a pure ancestor-chain walk would
+/// miss entirely).
+///
+/// One exclusion: a pair where one rule is `Delegated` and the other's
+/// Source is a descendant of the delegating rule's Source is *not*
+/// surfaced -- that's the parent explicitly handing the decision down,
+/// working as intended, not an ambiguity needing review. A pair of
+/// *siblings* both fulfilling the same delegation differently (neither
+/// ancestor of the other) is not covered by this exclusion and still
+/// surfaces -- that's a real unresolved conflict between cousins.
+pub fn conflict_candidates_for_subject(
     conn: &Connection,
-    embedder: &dyn Embedder,
-    query: &str,
-    domain_id: Option<&str>,
-    layer: Option<AuthorityLayer>,
-    limit: usize,
-) -> rusqlite::Result<(Vec<HybridHit>, RetrievalMode)> {
-    let (fts_hits, _) = search_scoped(conn, query, domain_id, layer)?;
-
-    let vector_ready = embedder.dimension() > 0 && sync_vector_index(conn)?;
-    if vector_ready && let Ok(vec_hits) = vector_search(conn, embedder, query, domain_id, limit) {
-        let mut fused = reciprocal_rank_fusion(conn, &fts_hits, &vec_hits)?;
-        fused.truncate(limit);
-        return Ok((fused, RetrievalMode::Hybrid));
+    subject_id: &str,
+) -> rusqlite::Result<Vec<(Rule, Rule)>> {
+    let rules = rules_for_subject(conn, subject_id)?;
+    let mut out = Vec::new();
+    for i in 0..rules.len() {
+        for j in (i + 1)..rules.len() {
+            let (rule_a, source_a) = &rules[i];
+            let (rule_b, source_b) = &rules[j];
+            if rule_a.source_id == rule_b.source_id {
+                continue;
+            }
+            if active_relation_exists(conn, &rule_a.id, &rule_b.id)? {
+                continue;
+            }
+            let delegation_fulfillment = (rule_a.binding_strength == BindingStrength::Delegated
+                && is_ancestor(conn, &source_a.id, &source_b.id)?)
+                || (rule_b.binding_strength == BindingStrength::Delegated
+                    && is_ancestor(conn, &source_b.id, &source_a.id)?);
+            if delegation_fulfillment {
+                continue;
+            }
+            out.push((rule_a.clone(), rule_b.clone()));
+        }
     }
-
-    Ok((lexical_only_hits(fts_hits), RetrievalMode::LexicalOnly))
+    Ok(out)
 }
 
-/// Constructs belonging to exactly one domain — proves `RM-KNOWLEDGE-MODEL-0001`
-/// (no cross-domain leakage) at the store level, ahead of the `meta.list_domains`
-/// and `search.constructs` tools that will eventually wrap this query.
-// Exercised by tests today; by `meta.list_domains`/`search.constructs`
-// (rusty_knowledge#12/#16) next.
-#[allow(dead_code)]
-/// Constructs in a domain, optionally narrowed to one `construct_type`.
-/// `knowledge-mcp`'s `search.constructs` also filters by `layer_num`, but
-/// this crate's `Construct` doesn't carry an authority layer (only `Rule`
-/// does) -- not modeled here, since a construct itself isn't layered, only
-/// the rules attached to it are.
-pub fn constructs_in_domain(
-    conn: &Connection,
-    domain_id: &str,
-    construct_type: Option<&str>,
-) -> rusqlite::Result<Vec<Construct>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, domain_id, short_name, construct_type, description
-         FROM constructs
-         WHERE domain_id = ?1 AND (?2 IS NULL OR construct_type = ?2)",
-    )?;
-    let rows = stmt.query_map((domain_id, construct_type), construct_from_row)?;
-    rows.collect()
-}
+/// Seeds a real UDRA authority chain: a data mesh standard (root) ->
+/// Army UDRA -> the org's UDRA implementation -> two subordinate orgs
+/// (siblings) implementing under it. Exercises `DELEGATED` (the schema
+/// format decision), a genuine sibling conflict (two subordinate orgs
+/// independently choosing incompatible schema formats -- neither is an
+/// ancestor of the other, so the two-tier conflict gate is what catches
+/// it), and one `machine_check`.
+pub fn seed_udra(conn: &Connection) -> Result<(), String> {
+    let to_string_err = |e: rusqlite::Error| e.to_string();
 
-/// Seed data spanning two domains — matching `knowledge-mcp`'s own real (UAF 1.3)
-/// plus stub (data mesh) domains — specifically so a cross-domain-leakage test has
-/// more than one domain to exercise, per `RM-KNOWLEDGE-MODEL-0001`.
-pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
-    insert_domain(
+    insert_source(
         conn,
-        &Domain {
-            id: "uaf-1.3".into(),
-            name: "UAF 1.3".into(),
+        &Source {
+            id: "src.data-mesh-principles".into(),
+            name: "Data Mesh Principles".into(),
+            kind: "external-standard".into(),
+            domain_tags: vec!["udra".into()],
+            steward: Some("Zhamak Dehghani / community".into()),
+            citation: Some("Data Mesh: Delivering Data-Driven Value at Scale".into()),
+            supersedes_source_id: None,
         },
-    )?;
-    insert_domain(
+    )
+    .map_err(to_string_err)?;
+    insert_source(
         conn,
-        &Domain {
-            id: "data-mesh".into(),
-            name: "Data Mesh".into(),
+        &Source {
+            id: "src.army-udra".into(),
+            name: "Army Unified Data Reference Architecture".into(),
+            kind: "army-construct".into(),
+            domain_tags: vec![],
+            steward: Some("Army CDO".into()),
+            citation: None,
+            supersedes_source_id: None,
         },
-    )?;
+    )
+    .map_err(to_string_err)?;
+    insert_source(
+        conn,
+        &Source {
+            id: "src.org-udra-impl".into(),
+            name: "Our Org's UDRA Implementation".into(),
+            kind: "org-implementation".into(),
+            domain_tags: vec![],
+            steward: Some("Org Data Governance Board".into()),
+            citation: None,
+            supersedes_source_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_source(
+        conn,
+        &Source {
+            id: "src.suborg-a-impl".into(),
+            name: "Subordinate Org A Implementation".into(),
+            kind: "practitioner-implementation".into(),
+            domain_tags: vec![],
+            steward: Some("Org A Data Team".into()),
+            citation: None,
+            supersedes_source_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_source(
+        conn,
+        &Source {
+            id: "src.suborg-b-impl".into(),
+            name: "Subordinate Org B Implementation".into(),
+            kind: "practitioner-implementation".into(),
+            domain_tags: vec![],
+            steward: Some("Org B Data Team".into()),
+            citation: None,
+            supersedes_source_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
 
-    insert_construct(
+    insert_source_authority_edge(conn, "src.army-udra", "src.data-mesh-principles")?;
+    insert_source_authority_edge(conn, "src.org-udra-impl", "src.army-udra")?;
+    insert_source_authority_edge(conn, "src.suborg-a-impl", "src.org-udra-impl")?;
+    insert_source_authority_edge(conn, "src.suborg-b-impl", "src.org-udra-impl")?;
+
+    insert_subject(
         conn,
-        &Construct {
-            id: "uaf-1.3:AuthorityGrant".into(),
-            domain_id: "uaf-1.3".into(),
-            short_name: "AuthorityGrant".into(),
-            construct_type: "entity".into(),
-            description: "A scoped, time-bounded grant of authority to act within a domain.".into(),
-        },
-    )?;
-    insert_construct(
-        conn,
-        &Construct {
-            id: "uaf-1.3:ConflictRegistryEntry".into(),
-            domain_id: "uaf-1.3".into(),
-            short_name: "ConflictRegistryEntry".into(),
-            construct_type: "entity".into(),
-            description: "A recorded contradiction between two rules across authority layers."
-                .into(),
-        },
-    )?;
-    insert_construct(
-        conn,
-        &Construct {
-            id: "data-mesh:DataProduct".into(),
-            domain_id: "data-mesh".into(),
+        &Subject {
+            id: "udra.DataProduct".into(),
+            domain_tag: "udra".into(),
+            subject_type: "concept".into(),
+            name: "Data Product".into(),
             short_name: "DataProduct".into(),
-            construct_type: "entity".into(),
-            description: "A discoverable, owned unit of data published by a domain team.".into(),
-        },
-    )?;
-
-    let authority_grant_scope_rule_id = insert_rule(
-        conn,
-        &Rule {
-            domain_id: "uaf-1.3".into(),
-            construct_id: "uaf-1.3:AuthorityGrant".into(),
-            construct: "AuthorityGrant".into(),
-            text: "An AuthorityGrant MUST declare an explicit scope and expiry.".into(),
-            layer: AuthorityLayer::Standard,
-            rule_type: RuleType::Must,
-        },
-    )?;
-    insert_machine_check(
-        conn,
-        authority_grant_scope_rule_id,
-        &MachineRule::RequiredProperty {
-            property: "scope".into(),
-        },
-    )?;
-    insert_rule(
-        conn,
-        &Rule {
-            domain_id: "uaf-1.3".into(),
-            construct_id: "uaf-1.3:AuthorityGrant".into(),
-            construct: "AuthorityGrant".into(),
-            text: "In practice, teams often omit expiry for internal-only grants.".into(),
-            layer: AuthorityLayer::Conventions,
-            rule_type: RuleType::May,
-        },
-    )?;
-    insert_rule(
-        conn,
-        &Rule {
-            domain_id: "uaf-1.3".into(),
-            construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
-            construct: "ConflictRegistryEntry".into(),
-            text: "A ConflictRegistryEntry MUST record both contradicting rules' layers.".into(),
-            layer: AuthorityLayer::Standard,
-            rule_type: RuleType::Must,
-        },
-    )?;
-    let data_product_owning_team_rule_id = insert_rule(
-        conn,
-        &Rule {
-            domain_id: "data-mesh".into(),
-            construct_id: "data-mesh:DataProduct".into(),
-            construct: "DataProduct".into(),
-            text: "A DataProduct MUST declare an owning domain team.".into(),
-            layer: AuthorityLayer::Standard,
-            rule_type: RuleType::Must,
-        },
-    )?;
-    insert_machine_check(
-        conn,
-        data_product_owning_team_rule_id,
-        &MachineRule::Pattern {
-            property: "owning_team".into(),
-            pattern: "[a-z][a-z0-9-]*".into(),
-        },
-    )?;
-
-    insert_relationship(
-        conn,
-        &Relationship {
-            id: "uaf-1.3:AuthorityGrant-records-ConflictRegistryEntry".into(),
-            domain_id: "uaf-1.3".into(),
-            from_construct_id: "uaf-1.3:AuthorityGrant".into(),
-            to_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
-            relationship_type: "records".into(),
-            cardinality: "0..*".into(),
-            layer: AuthorityLayer::Standard,
-            rule_type: RuleType::Must,
-        },
-    )?;
-
-    insert_valid_relationship(
-        conn,
-        &ValidRelationshipRule {
-            domain_id: "uaf-1.3".into(),
-            from_type: "entity".into(),
-            to_type: "entity".into(),
-            relationship_type: "records".into(),
-            cardinality: "0..*".into(),
-        },
-    )?;
-
-    // Documents the exact contradiction the two AuthorityGrant rules above
-    // already imply: Standard requires expiry, Conventions tolerates
-    // omitting it. This is what a ConflictRegistryEntry (the construct these
-    // rules reference) exists to record.
-    insert_conflict(
-        conn,
-        &Conflict {
-            id: "uaf-1.3:AuthorityGrant-standard-vs-conventions-expiry".into(),
-            domain_id: "uaf-1.3".into(),
-            construct_id: Some("uaf-1.3:AuthorityGrant".into()),
-            layer_a: AuthorityLayer::Standard,
-            layer_b: AuthorityLayer::Conventions,
-            conflict_type: "contradiction".into(),
-            description: "Standard requires every AuthorityGrant to declare an explicit expiry; \
-                          convention in practice omits it for internal-only grants."
-                .into(),
-            resolution: "Standard wins: expiry is required regardless of convention.".into(),
-            rationale: Some("Ungoverned indefinite grants are a security risk.".into()),
-            review_date: Some("2027-01-01".into()),
-        },
-    )?;
-
-    insert_cross_domain_relationship(
-        conn,
-        &CrossDomainRelationship {
-            id: "uaf-1.3:AuthorityGrant-governs-data-mesh:DataProduct".into(),
-            from_domain_id: "uaf-1.3".into(),
-            from_construct_id: "uaf-1.3:AuthorityGrant".into(),
-            to_domain_id: "data-mesh".into(),
-            to_construct_id: "data-mesh:DataProduct".into(),
-            relationship_type: "governs".into(),
             description: Some(
-                "The scoped authority an AuthorityGrant confers is what permits a team to \
-                 publish a DataProduct in the first place."
+                "A domain-oriented, self-contained unit of data ownership with a clear owner, \
+                 discoverable in the enterprise catalog."
                     .into(),
             ),
-            rationale: Some("Cross-domain compliance link between UAF and Data Mesh.".into()),
+            is_deprecated: false,
+            parent_subject_id: None,
+            supersedes_subject_id: None,
         },
-    )?;
+    )
+    .map_err(to_string_err)?;
+    insert_subject(
+        conn,
+        &Subject {
+            id: "udra.DataContract".into(),
+            domain_tag: "udra".into(),
+            subject_type: "concept".into(),
+            name: "Data Contract".into(),
+            short_name: "DataContract".into(),
+            description: Some(
+                "The schema and quality agreement a data product exposes to its consumers.".into(),
+            ),
+            is_deprecated: false,
+            parent_subject_id: None,
+            supersedes_subject_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.dm.001".into(),
+            source_id: "src.data-mesh-principles".into(),
+            subject_id: "udra.DataProduct".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "A data product must have a clearly defined, accountable owner.".into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.army-udra.001".into(),
+            source_id: "src.army-udra".into(),
+            subject_id: "udra.DataProduct".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "Each Army UDRA data product must be registered in the enterprise \
+                        data catalog."
+                .into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.org.001".into(),
+            source_id: "src.org-udra-impl".into(),
+            subject_id: "udra.DataProduct".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "A data product's owner must be identified by a valid organizational \
+                        email address."
+                .into(),
+            machine_check: Some(
+                r#"{"check":"pattern","property":"owner_email","pattern":"^[^@]+@[^@]+\\.[^@]+$"}"#
+                    .into(),
+            ),
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.org.002".into(),
+            source_id: "src.org-udra-impl".into(),
+            subject_id: "udra.DataContract".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "The specific schema format for data contracts is delegated to \
+                        implementing organizations."
+                .into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Delegated,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.suborg-a.001".into(),
+            source_id: "src.suborg-a-impl".into(),
+            subject_id: "udra.DataContract".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "Subordinate Org A data contracts must use JSON Schema.".into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.suborg-b.001".into(),
+            source_id: "src.suborg-b-impl".into(),
+            subject_id: "udra.DataContract".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "Subordinate Org B data contracts must use Avro schema.".into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+
+    // A human reviewer has already confirmed that Org A's JSON Schema
+    // choice fulfills the parent's DELEGATED rule -- realistic seed data,
+    // and it's what makes `insert_rule_relation` a real production path
+    // rather than something only exercised by tests.
+    insert_rule_relation(
+        conn,
+        &RuleRelation {
+            rule_a_id: "rule.org.002".into(),
+            rule_b_id: "rule.suborg-a.001".into(),
+            relation_type: RelationType::Implements,
+            status: RelationStatus::Active,
+            confirmed_by: "org-data-governance-board@example.org".into(),
+        },
+    )
+    .map_err(to_string_err)?;
 
     Ok(())
 }
@@ -1785,950 +878,222 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn constructs_in_domain_do_not_leak_across_domains() {
+    fn seeded() -> Connection {
         let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let uaf = constructs_in_domain(&conn, "uaf-1.3", None).unwrap();
-        assert_eq!(uaf.len(), 2);
-        assert!(uaf.iter().all(|c| c.domain_id == "uaf-1.3"));
-        assert!(uaf.iter().any(|c| c.short_name == "AuthorityGrant"));
-        assert!(uaf.iter().any(|c| c.short_name == "ConflictRegistryEntry"));
-        assert!(!uaf.iter().any(|c| c.short_name == "DataProduct"));
-
-        let data_mesh = constructs_in_domain(&conn, "data-mesh", None).unwrap();
-        assert_eq!(data_mesh.len(), 1);
-        assert_eq!(data_mesh[0].short_name, "DataProduct");
+        seed_udra(&conn).unwrap();
+        conn
     }
 
     #[test]
-    fn constructs_in_domain_unknown_domain_returns_empty() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let none = constructs_in_domain(&conn, "does-not-exist", None).unwrap();
-        assert!(none.is_empty());
+    fn ancestors_of_walks_full_chain() {
+        let conn = seeded();
+        let ancestors = ancestors_of(&conn, "src.suborg-a-impl").unwrap();
+        assert!(ancestors.contains("src.org-udra-impl"));
+        assert!(ancestors.contains("src.army-udra"));
+        assert!(ancestors.contains("src.data-mesh-principles"));
+        assert_eq!(ancestors.len(), 3);
     }
 
     #[test]
-    fn constructs_in_domain_filters_by_construct_type() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let entities = constructs_in_domain(&conn, "uaf-1.3", Some("entity")).unwrap();
-        assert_eq!(entities.len(), 2);
-
-        let none = constructs_in_domain(&conn, "uaf-1.3", Some("viewpoint")).unwrap();
-        assert!(none.is_empty());
+    fn sibling_sources_are_not_ancestors_of_each_other() {
+        let conn = seeded();
+        assert!(!is_ancestor(&conn, "src.suborg-a-impl", "src.suborg-b-impl").unwrap());
+        assert!(!is_ancestor(&conn, "src.suborg-b-impl", "src.suborg-a-impl").unwrap());
     }
 
     #[test]
-    fn relationships_from_returns_seeded_relationship() {
+    fn self_loop_edge_is_rejected() {
         let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels =
-            relationships_from(&conn, "uaf-1.3:AuthorityGrant", None, None, None, None).unwrap();
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].to_construct_id, "uaf-1.3:ConflictRegistryEntry");
-        assert_eq!(rels[0].relationship_type, "records");
-    }
-
-    #[test]
-    fn relationships_from_filters_by_to_construct_and_type() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels = relationships_from(
+        insert_source(
             &conn,
-            "uaf-1.3:AuthorityGrant",
-            Some("uaf-1.3:ConflictRegistryEntry"),
-            Some("records"),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(rels.len(), 1);
-
-        let none = relationships_from(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            None,
-            Some("does-not-exist"),
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn relationships_from_filters_by_rule_type() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let must_only = relationships_from(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            None,
-            None,
-            Some(RuleType::Must),
-            None,
-        )
-        .unwrap();
-        assert_eq!(must_only.len(), 1);
-
-        let should_only = relationships_from(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            None,
-            None,
-            Some(RuleType::Should),
-            None,
-        )
-        .unwrap();
-        assert!(should_only.is_empty());
-    }
-
-    #[test]
-    fn relationships_from_filters_by_layer() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let standard_only = relationships_from(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            None,
-            None,
-            None,
-            Some(AuthorityLayer::Standard),
-        )
-        .unwrap();
-        assert_eq!(standard_only.len(), 1);
-
-        let process_only = relationships_from(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            None,
-            None,
-            None,
-            Some(AuthorityLayer::Process),
-        )
-        .unwrap();
-        assert!(process_only.is_empty());
-    }
-
-    #[test]
-    fn relationships_from_construct_with_no_relationships_is_empty() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels =
-            relationships_from(&conn, "data-mesh:DataProduct", None, None, None, None).unwrap();
-        assert!(rels.is_empty());
-    }
-
-    #[test]
-    fn relationships_to_returns_seeded_relationship() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels = relationships_to(
-            &conn,
-            "uaf-1.3:ConflictRegistryEntry",
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].from_construct_id, "uaf-1.3:AuthorityGrant");
-    }
-
-    #[test]
-    fn relationships_to_construct_with_no_incoming_relationships_is_empty() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels =
-            relationships_to(&conn, "uaf-1.3:AuthorityGrant", None, None, None, None).unwrap();
-        assert!(rels.is_empty());
-    }
-
-    #[test]
-    fn valid_relationships_between_returns_seeded_rule() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rules = valid_relationships_between(&conn, "uaf-1.3", "entity", "entity").unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].relationship_type, "records");
-    }
-
-    #[test]
-    fn valid_relationships_between_unknown_type_pair_is_empty() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rules = valid_relationships_between(&conn, "uaf-1.3", "entity", "viewpoint").unwrap();
-        assert!(rules.is_empty());
-    }
-
-    #[test]
-    fn evaluate_completeness_missing_vs_present() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let complete = evaluate_completeness(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            &["uaf-1.3:ConflictRegistryEntry".to_string()],
-        )
-        .unwrap();
-        assert!(complete.is_complete);
-        assert!(complete.missing_required.is_empty());
-        assert!(
-            complete
-                .required_rule_texts
-                .iter()
-                .any(|t| t.contains("scope and expiry"))
-        );
-
-        let incomplete = evaluate_completeness(&conn, "uaf-1.3:AuthorityGrant", &[]).unwrap();
-        assert!(!incomplete.is_complete);
-        assert_eq!(
-            incomplete.missing_required,
-            vec!["uaf-1.3:ConflictRegistryEntry".to_string()]
-        );
-    }
-
-    #[test]
-    fn evaluate_completeness_extra_present_does_not_block_completeness() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let report = evaluate_completeness(
-            &conn,
-            "uaf-1.3:AuthorityGrant",
-            &[
-                "uaf-1.3:ConflictRegistryEntry".to_string(),
-                "something-unexpected".to_string(),
-            ],
-        )
-        .unwrap();
-        assert!(report.is_complete);
-        assert_eq!(
-            report.extra_present,
-            vec!["something-unexpected".to_string()]
-        );
-    }
-
-    #[test]
-    fn evaluate_completeness_construct_with_no_required_relationships() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        // ConflictRegistryEntry has no outgoing MUST relationships seeded --
-        // trivially complete regardless of what's present.
-        let report = evaluate_completeness(&conn, "uaf-1.3:ConflictRegistryEntry", &[]).unwrap();
-        assert!(report.is_complete);
-        assert!(report.required_element_types.is_empty());
-    }
-
-    #[test]
-    fn domain_by_id_returns_seeded_domain() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let domain = domain_by_id(&conn, "uaf-1.3").unwrap().unwrap();
-        assert_eq!(domain.name, "UAF 1.3");
-
-        assert!(domain_by_id(&conn, "does-not-exist").unwrap().is_none());
-    }
-
-    #[test]
-    fn list_domains_returns_all_seeded_domains_ordered_by_name() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let domains = list_domains(&conn).unwrap();
-        let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["Data Mesh", "UAF 1.3"]);
-    }
-
-    #[test]
-    fn layers_present_in_domain_matches_seeded_rules() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let layers = layers_present_in_domain(&conn, "uaf-1.3").unwrap();
-        assert!(layers.contains(&AuthorityLayer::Standard));
-        assert!(layers.contains(&AuthorityLayer::Conventions));
-        assert!(!layers.contains(&AuthorityLayer::Process));
-    }
-
-    #[test]
-    fn rules_with_checks_for_construct_returns_seeded_machine_check() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rules = rules_with_checks_for_construct(&conn, "uaf-1.3:AuthorityGrant", None).unwrap();
-        assert_eq!(rules.len(), 2);
-        let with_check = rules.iter().filter(|(_, m)| m.is_some()).count();
-        assert_eq!(with_check, 1);
-
-        let (_, machine_rule) = rules.iter().find(|(_, m)| m.is_some()).unwrap();
-        assert_eq!(
-            machine_rule,
-            &Some(MachineRule::RequiredProperty {
-                property: "scope".into()
-            })
-        );
-    }
-
-    #[test]
-    fn evaluate_machine_rule_required_property() {
-        let check = MachineRule::RequiredProperty {
-            property: "scope".into(),
-        };
-        let empty = std::collections::HashMap::new();
-        let (outcome, _) = evaluate_machine_rule(&check, &empty);
-        assert_eq!(outcome, ValidationOutcome::Fail);
-
-        let present = std::collections::HashMap::from([("scope".to_string(), "org".to_string())]);
-        let (outcome, _) = evaluate_machine_rule(&check, &present);
-        assert_eq!(outcome, ValidationOutcome::Pass);
-    }
-
-    #[test]
-    fn evaluate_machine_rule_enum_value() {
-        let check = MachineRule::EnumValue {
-            property: "status".into(),
-            values: vec!["active".into(), "revoked".into()],
-        };
-        let valid = std::collections::HashMap::from([("status".to_string(), "active".to_string())]);
-        assert_eq!(
-            evaluate_machine_rule(&check, &valid).0,
-            ValidationOutcome::Pass
-        );
-
-        let invalid =
-            std::collections::HashMap::from([("status".to_string(), "pending".to_string())]);
-        assert_eq!(
-            evaluate_machine_rule(&check, &invalid).0,
-            ValidationOutcome::Fail
-        );
-    }
-
-    #[test]
-    fn evaluate_machine_rule_range() {
-        let check = MachineRule::Range {
-            property: "priority".into(),
-            min: Some(1.0),
-            max: Some(5.0),
-        };
-        let in_range = std::collections::HashMap::from([("priority".to_string(), "3".to_string())]);
-        assert_eq!(
-            evaluate_machine_rule(&check, &in_range).0,
-            ValidationOutcome::Pass
-        );
-
-        let out_of_range =
-            std::collections::HashMap::from([("priority".to_string(), "9".to_string())]);
-        assert_eq!(
-            evaluate_machine_rule(&check, &out_of_range).0,
-            ValidationOutcome::Fail
-        );
-
-        let non_numeric =
-            std::collections::HashMap::from([("priority".to_string(), "high".to_string())]);
-        assert_eq!(
-            evaluate_machine_rule(&check, &non_numeric).0,
-            ValidationOutcome::Fail
-        );
-    }
-
-    #[test]
-    fn evaluate_machine_rule_pattern_matches() {
-        let check = MachineRule::Pattern {
-            property: "id".into(),
-            pattern: "[A-Z]+".into(),
-        };
-        let matching = std::collections::HashMap::from([("id".to_string(), "ABC".to_string())]);
-        assert_eq!(
-            evaluate_machine_rule(&check, &matching).0,
-            ValidationOutcome::Pass
-        );
-    }
-
-    #[test]
-    fn evaluate_machine_rule_pattern_mismatch_is_warning_not_fail() {
-        let check = MachineRule::Pattern {
-            property: "id".into(),
-            pattern: "[A-Z]+".into(),
-        };
-        // Doesn't match at position 0 -- rusty_regx's unanchored `find` would
-        // otherwise find "ABC" mid-string; requiring start()==0 replicates
-        // Python's re.match (anchored-at-start) semantics.
-        let mismatch = std::collections::HashMap::from([("id".to_string(), "1ABC".to_string())]);
-        let (outcome, message) = evaluate_machine_rule(&check, &mismatch);
-        assert_eq!(outcome, ValidationOutcome::Warning);
-        assert!(message.contains("does not match"));
-
-        let absent = std::collections::HashMap::new();
-        assert_eq!(
-            evaluate_machine_rule(&check, &absent).0,
-            ValidationOutcome::Warning
-        );
-    }
-
-    #[test]
-    fn evaluate_machine_rule_invalid_pattern_is_warning_not_a_panic() {
-        let check = MachineRule::Pattern {
-            property: "id".into(),
-            pattern: "[unclosed".into(),
-        };
-        let (outcome, message) = evaluate_machine_rule(&check, &std::collections::HashMap::new());
-        assert_eq!(outcome, ValidationOutcome::Warning);
-        assert!(message.contains("invalid"));
-    }
-
-    #[test]
-    fn search_scoped_unfiltered_matches_plain_search() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let (hits, mode) = search_scoped(&conn, "AuthorityGrant", None, None).unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(mode, RetrievalMode::LexicalOnly);
-    }
-
-    #[test]
-    fn search_scoped_filters_by_domain() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let (hits, _) = search_scoped(&conn, "DataProduct", Some("uaf-1.3"), None).unwrap();
-        assert!(
-            hits.is_empty(),
-            "data-mesh's DataProduct must not leak into a uaf-1.3-scoped search"
-        );
-
-        let (hits, _) = search_scoped(&conn, "DataProduct", Some("data-mesh"), None).unwrap();
-        assert_eq!(hits.len(), 1);
-    }
-
-    #[test]
-    fn search_scoped_filters_by_layer() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let (hits, _) = search_scoped(
-            &conn,
-            "AuthorityGrant",
-            None,
-            Some(AuthorityLayer::Conventions),
-        )
-        .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].rule.layer, AuthorityLayer::Conventions);
-    }
-
-    #[test]
-    fn search_scoped_always_declares_lexical_only_today() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        // RM-KNOWLEDGE-MODEL-0005: the mode must be declared, never silently
-        // substituted -- until rusty_knowledge#18 wires vector retrieval in,
-        // every response is lexical-only, and this test pins that down.
-        let (_, mode) = search_scoped(&conn, "AuthorityGrant", None, None).unwrap();
-        assert_eq!(mode, RetrievalMode::LexicalOnly);
-    }
-
-    #[test]
-    fn conflicts_for_returns_seeded_conflict() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let conflicts = conflicts_for(&conn, "uaf-1.3", None).unwrap();
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].conflict_type, "contradiction");
-        assert_eq!(
-            conflicts[0].construct_id.as_deref(),
-            Some("uaf-1.3:AuthorityGrant")
-        );
-    }
-
-    #[test]
-    fn conflicts_for_returns_construct_level_and_domain_level() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        // A second, domain-level conflict on top of the seeded
-        // construct-level one.
-        insert_conflict(
-            &conn,
-            &Conflict {
-                id: "conflict-domain-wide".into(),
-                domain_id: "uaf-1.3".into(),
-                construct_id: None,
-                layer_a: AuthorityLayer::Standard,
-                layer_b: AuthorityLayer::Process,
-                conflict_type: "gap".into(),
-                description: "Domain-wide gap between spec and process.".into(),
-                resolution: "Process to be updated.".into(),
-                rationale: None,
-                review_date: None,
+            &Source {
+                id: "s1".into(),
+                name: "S1".into(),
+                kind: "external-standard".into(),
+                domain_tags: vec![],
+                steward: None,
+                citation: None,
+                supersedes_source_id: None,
             },
         )
         .unwrap();
-
-        // Unscoped: both conflicts for the domain.
-        let all = conflicts_for(&conn, "uaf-1.3", None).unwrap();
-        assert_eq!(all.len(), 2);
-
-        // Scoped to the construct with its own conflict: both apply.
-        let scoped = conflicts_for(&conn, "uaf-1.3", Some("uaf-1.3:AuthorityGrant")).unwrap();
-        assert_eq!(scoped.len(), 2);
-
-        // Scoped to a construct with no conflicts of its own: only the
-        // domain-level one still applies.
-        let other = conflicts_for(&conn, "uaf-1.3", Some("uaf-1.3:ConflictRegistryEntry")).unwrap();
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].id, "conflict-domain-wide");
+        assert!(insert_source_authority_edge(&conn, "s1", "s1").is_err());
     }
 
     #[test]
-    fn conflicts_for_domain_with_no_conflicts_is_empty() {
+    fn cyclic_edge_is_rejected() {
         let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let none = conflicts_for(&conn, "data-mesh", None).unwrap();
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn cross_domain_relationships_from_returns_seeded_relationship() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels =
-            cross_domain_relationships_from(&conn, "uaf-1.3", "uaf-1.3:AuthorityGrant", None)
-                .unwrap();
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].to_domain_id, "data-mesh");
-        assert_eq!(rels[0].to_construct_id, "data-mesh:DataProduct");
-        assert_eq!(rels[0].relationship_type, "governs");
-    }
-
-    #[test]
-    fn cross_domain_relationships_from_filters_by_to_domain() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let matching = cross_domain_relationships_from(
-            &conn,
-            "uaf-1.3",
-            "uaf-1.3:AuthorityGrant",
-            Some("data-mesh"),
-        )
-        .unwrap();
-        assert_eq!(matching.len(), 1);
-
-        let none = cross_domain_relationships_from(
-            &conn,
-            "uaf-1.3",
-            "uaf-1.3:AuthorityGrant",
-            Some("does-not-exist"),
-        )
-        .unwrap();
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn cross_domain_relationships_from_construct_with_none_is_empty() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let rels =
-            cross_domain_relationships_from(&conn, "data-mesh", "data-mesh:DataProduct", None)
-                .unwrap();
-        assert!(rels.is_empty());
-    }
-
-    /// A deterministic test double for [`Embedder`]: maps each exact input
-    /// text to a hand-picked vector via a lookup table (falling back to the
-    /// origin for anything unlisted), so nearest-neighbor results in these
-    /// tests are fully predictable rather than depending on a real model.
-    struct FakeEmbedder {
-        dimension: usize,
-        vectors: std::collections::HashMap<String, Vec<f32>>,
-    }
-
-    impl FakeEmbedder {
-        fn new(dimension: usize) -> Self {
-            Self {
-                dimension,
-                vectors: std::collections::HashMap::new(),
-            }
-        }
-
-        fn with_vector(mut self, text: &str, vector: Vec<f32>) -> Self {
-            self.vectors.insert(text.to_string(), vector);
-            self
-        }
-    }
-
-    impl Embedder for FakeEmbedder {
-        fn dimension(&self) -> usize {
-            self.dimension
-        }
-
-        fn model_name(&self) -> &str {
-            "fake-test-embedder"
-        }
-
-        fn embed(&self, texts: &[String]) -> rusty_embedder_core::Result<Vec<Vec<f32>>> {
-            Ok(texts
-                .iter()
-                .map(|t| {
-                    self.vectors
-                        .get(t)
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; self.dimension])
-                })
-                .collect())
-        }
-    }
-
-    /// The three seeded constructs' descriptions, placed on distinct axes
-    /// of a 2D space so cosine-nearest-neighbor is unambiguous by
-    /// construction: `AuthorityGrant` on +x, `ConflictRegistryEntry` on +y,
-    /// `DataProduct` on -x.
-    fn fake_embedder_for_seed_descriptions() -> FakeEmbedder {
-        FakeEmbedder::new(2)
-            .with_vector(
-                "A scoped, time-bounded grant of authority to act within a domain.",
-                vec![1.0, 0.0],
+        for id in ["s1", "s2"] {
+            insert_source(
+                &conn,
+                &Source {
+                    id: id.into(),
+                    name: id.into(),
+                    kind: "external-standard".into(),
+                    domain_tags: vec![],
+                    steward: None,
+                    citation: None,
+                    supersedes_source_id: None,
+                },
             )
-            .with_vector(
-                "A recorded contradiction between two rules across authority layers.",
-                vec![0.0, 1.0],
+            .unwrap();
+        }
+        // s2 answers to s1.
+        insert_source_authority_edge(&conn, "s2", "s1").unwrap();
+        // s1 answering to s2 would close a cycle -- must be rejected.
+        assert!(insert_source_authority_edge(&conn, "s1", "s2").is_err());
+    }
+
+    #[test]
+    fn multi_parent_source_has_two_independent_ancestors() {
+        let conn = open_store().unwrap();
+        for id in ["rmf", "overlay", "system"] {
+            insert_source(
+                &conn,
+                &Source {
+                    id: id.into(),
+                    name: id.into(),
+                    kind: "external-standard".into(),
+                    domain_tags: vec![],
+                    steward: None,
+                    citation: None,
+                    supersedes_source_id: None,
+                },
             )
-            .with_vector(
-                "A discoverable, owned unit of data published by a domain team.",
-                vec![-1.0, 0.0],
-            )
+            .unwrap();
+        }
+        insert_source_authority_edge(&conn, "system", "rmf").unwrap();
+        insert_source_authority_edge(&conn, "system", "overlay").unwrap();
+        let ancestors = ancestors_of(&conn, "system").unwrap();
+        assert!(ancestors.contains("rmf"));
+        assert!(ancestors.contains("overlay"));
     }
 
     #[test]
-    fn build_construct_embeddings_with_null_embedder_is_a_noop() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let embedded =
-            build_construct_embeddings(&conn, &rusty_embedder_core::NullEmbedder::new()).unwrap();
-        assert_eq!(embedded, 0);
-        assert!(!sync_vector_index(&conn).unwrap());
-    }
-
-    #[test]
-    fn build_construct_embeddings_stores_one_row_per_described_construct() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let embedder = fake_embedder_for_seed_descriptions();
-        let embedded = build_construct_embeddings(&conn, &embedder).unwrap();
-        // All three seeded constructs (uaf-1.3:AuthorityGrant,
-        // uaf-1.3:ConflictRegistryEntry, data-mesh:DataProduct) have
-        // non-empty descriptions.
-        assert_eq!(embedded, 3);
-    }
-
-    #[test]
-    fn sync_vector_index_with_no_embeddings_is_unavailable() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        assert!(!sync_vector_index(&conn).unwrap());
-    }
-
-    #[test]
-    fn sync_vector_index_builds_table_sized_to_stored_dimension() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        build_construct_embeddings(&conn, &fake_embedder_for_seed_descriptions()).unwrap();
-        assert!(sync_vector_index(&conn).unwrap());
-    }
-
-    #[test]
-    fn vector_search_returns_nearest_by_cosine_distance() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let embedder = fake_embedder_for_seed_descriptions()
-            .with_vector("query near AuthorityGrant", vec![0.9, 0.1]);
-        build_construct_embeddings(&conn, &embedder).unwrap();
-        sync_vector_index(&conn).unwrap();
-
-        let results =
-            vector_search(&conn, &embedder, "query near AuthorityGrant", None, 3).unwrap();
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0, "uaf-1.3:AuthorityGrant");
-    }
-
-    #[test]
-    fn vector_search_domain_filter_excludes_other_domains() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let embedder = fake_embedder_for_seed_descriptions()
-            .with_vector("query near AuthorityGrant", vec![0.9, 0.1]);
-        build_construct_embeddings(&conn, &embedder).unwrap();
-        sync_vector_index(&conn).unwrap();
-
-        let results = vector_search(
-            &conn,
-            &embedder,
-            "query near AuthorityGrant",
-            Some("data-mesh"),
-            3,
-        )
-        .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "data-mesh:DataProduct");
-    }
-
-    #[test]
-    fn hybrid_search_with_null_embedder_stays_lexical_only() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let (hits, mode) = hybrid_search(
-            &conn,
-            &rusty_embedder_core::NullEmbedder::new(),
-            "AuthorityGrant",
-            None,
-            None,
-            20,
-        )
-        .unwrap();
-        assert_eq!(mode, RetrievalMode::LexicalOnly);
-        assert!(!hits.is_empty());
-        assert!(hits.iter().all(|h| !h.is_vector_match));
-    }
-
-    #[test]
-    fn hybrid_search_fuses_lexical_and_vector_hits() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        // "AuthorityGrant" is both an FTS keyword hit (matches the
-        // construct/rule text) and, via the fake embedder, the nearest
-        // vector hit -- present in both ranked lists, so RRF should surface
-        // it first with a lexical (non-vector-only) hit.
-        let embedder =
-            fake_embedder_for_seed_descriptions().with_vector("AuthorityGrant", vec![1.0, 0.0]);
-        build_construct_embeddings(&conn, &embedder).unwrap();
-
-        let (hits, mode) =
-            hybrid_search(&conn, &embedder, "AuthorityGrant", None, None, 20).unwrap();
-        assert_eq!(mode, RetrievalMode::Hybrid);
-        assert!(!hits.is_empty());
-        assert_eq!(hits[0].construct_id, "uaf-1.3:AuthorityGrant");
-        assert!(!hits[0].is_vector_match);
-    }
-
-    #[test]
-    fn hybrid_search_surfaces_vector_only_hit_with_no_keyword_match() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        // This query string appears in no rule's FTS-indexed text, but the
-        // fake embedder places it nearest ConflictRegistryEntry's
-        // description vector -- a vector-only hit.
-        let embedder = fake_embedder_for_seed_descriptions()
-            .with_vector("zzznotinanyrule zzzalsomissing", vec![0.1, 0.9]);
-        build_construct_embeddings(&conn, &embedder).unwrap();
-
-        let (hits, mode) = hybrid_search(
-            &conn,
-            &embedder,
-            "zzznotinanyrule zzzalsomissing",
-            None,
-            None,
-            20,
-        )
-        .unwrap();
-        assert_eq!(mode, RetrievalMode::Hybrid);
+    fn resolve_subject_finds_by_short_name_then_id() {
+        let conn = seeded();
+        assert_eq!(
+            resolve_subject(&conn, "udra", "DataProduct")
+                .unwrap()
+                .unwrap()
+                .id,
+            "udra.DataProduct"
+        );
+        assert_eq!(
+            resolve_subject(&conn, "udra", "udra.DataContract")
+                .unwrap()
+                .unwrap()
+                .id,
+            "udra.DataContract"
+        );
         assert!(
-            hits.iter()
-                .any(|h| h.construct_id == "uaf-1.3:ConflictRegistryEntry" && h.is_vector_match)
+            resolve_subject(&conn, "udra", "NoSuchThing")
+                .unwrap()
+                .is_none()
         );
     }
 
-    /// A fresh path in the OS temp dir, unique per test (by test name +
-    /// thread ID) so concurrently-running tests never collide on the same
-    /// file. Removes any file already there, so each test starts from
-    /// "path does not exist" regardless of a previous run's leftovers.
-    fn db_fixture_path(test_name: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "rusty_knowledge_open_store_test_{test_name}_{:?}.db",
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        path
+    #[test]
+    fn rules_for_subject_spans_the_whole_authority_chain() {
+        let conn = seeded();
+        let rules = rules_for_subject(&conn, "udra.DataProduct").unwrap();
+        let source_ids: HashSet<_> = rules.iter().map(|(_, s)| s.id.clone()).collect();
+        assert!(source_ids.contains("src.data-mesh-principles"));
+        assert!(source_ids.contains("src.army-udra"));
+        assert!(source_ids.contains("src.org-udra-impl"));
     }
 
     #[test]
-    fn open_store_at_path_creates_fresh_file_and_seeds_normally() {
-        let path = db_fixture_path("fresh");
-        let (conn, is_fresh) = open_store_at_path(&path).unwrap();
-        assert!(is_fresh);
-        seed(&conn).unwrap();
-        assert!(domain_by_id(&conn, "uaf-1.3").unwrap().is_some());
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn open_store_at_path_reopening_same_file_is_not_fresh_and_keeps_data() {
-        let path = db_fixture_path("reopen");
-        let (conn, is_fresh) = open_store_at_path(&path).unwrap();
-        assert!(is_fresh);
-        seed(&conn).unwrap();
-        drop(conn);
-
-        let (conn, is_fresh) = open_store_at_path(&path).unwrap();
-        assert!(!is_fresh);
-        // The domain seeded on the first open is still there -- this is
-        // real persistence, not just "didn't error the second time".
-        assert!(domain_by_id(&conn, "uaf-1.3").unwrap().is_some());
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn open_store_at_path_empty_existing_file_is_still_fresh() {
-        let path = db_fixture_path("empty_file");
-        // Simulates `touch`: a zero-byte file already at the path before
-        // rusty_knowledge ever opens it.
-        std::fs::write(&path, []).unwrap();
-
-        let (_conn, is_fresh) = open_store_at_path(&path).unwrap();
-        assert!(is_fresh);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn candidate_valid_relationships_reports_seeded_relationship() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        let candidates = candidate_valid_relationships(&conn, "uaf-1.3").unwrap();
-        assert_eq!(candidates.len(), 1);
-        let candidate = &candidates[0];
-        assert_eq!(candidate.rule.from_type, "entity");
-        assert_eq!(candidate.rule.to_type, "entity");
-        assert_eq!(candidate.rule.relationship_type, "records");
-        assert_eq!(candidate.rule.cardinality, "0..*");
-        assert_eq!(candidate.instance_count, 1);
-        assert!(candidate.other_cardinalities_seen.is_empty());
-    }
-
-    #[test]
-    fn candidate_valid_relationships_picks_majority_cardinality_and_discloses_others() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        // Two more "records" instances between the same two construct
-        // types, both with a different cardinality than the seeded one --
-        // makes "1..1" the majority (2 vs 1) and "0..*" the disclosed
-        // disagreement.
-        insert_relationship(
-            &conn,
-            &Relationship {
-                id: "extra-records-1".into(),
-                domain_id: "uaf-1.3".into(),
-                from_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
-                to_construct_id: "uaf-1.3:AuthorityGrant".into(),
-                relationship_type: "records".into(),
-                cardinality: "1..1".into(),
-                layer: AuthorityLayer::Standard,
-                rule_type: RuleType::Must,
-            },
-        )
-        .unwrap();
-        insert_relationship(
-            &conn,
-            &Relationship {
-                id: "extra-records-2".into(),
-                domain_id: "uaf-1.3".into(),
-                from_construct_id: "uaf-1.3:AuthorityGrant".into(),
-                to_construct_id: "uaf-1.3:AuthorityGrant".into(),
-                relationship_type: "records".into(),
-                cardinality: "1..1".into(),
-                layer: AuthorityLayer::Standard,
-                rule_type: RuleType::Must,
-            },
-        )
-        .unwrap();
-
-        let candidates = candidate_valid_relationships(&conn, "uaf-1.3").unwrap();
-        assert_eq!(candidates.len(), 1);
-        let candidate = &candidates[0];
-        assert_eq!(candidate.instance_count, 3);
-        assert_eq!(candidate.rule.cardinality, "1..1");
-        assert_eq!(candidate.other_cardinalities_seen, vec!["0..*".to_string()]);
-    }
-
-    #[test]
-    fn candidate_valid_relationships_distinguishes_relationship_types() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
-
-        insert_relationship(
-            &conn,
-            &Relationship {
-                id: "extra-governs".into(),
-                domain_id: "uaf-1.3".into(),
-                from_construct_id: "uaf-1.3:AuthorityGrant".into(),
-                to_construct_id: "uaf-1.3:ConflictRegistryEntry".into(),
-                relationship_type: "governs".into(),
-                cardinality: "0..1".into(),
-                layer: AuthorityLayer::Standard,
-                rule_type: RuleType::May,
-            },
-        )
-        .unwrap();
-
-        let candidates = candidate_valid_relationships(&conn, "uaf-1.3").unwrap();
-        assert_eq!(candidates.len(), 2);
+    fn delegated_parent_and_fulfilling_child_are_not_surfaced_as_candidates() {
+        let conn = seeded();
+        let candidates = conflict_candidates_for_subject(&conn, "udra.DataContract").unwrap();
+        let has_delegation_pair = candidates.iter().any(|(a, b)| {
+            (a.id == "rule.org.002" && b.id == "rule.suborg-a.001")
+                || (b.id == "rule.org.002" && a.id == "rule.suborg-a.001")
+        });
         assert!(
-            candidates
+            !has_delegation_pair,
+            "a DELEGATED rule and its fulfilling descendant should not need review"
+        );
+    }
+
+    #[test]
+    fn sibling_orgs_fulfilling_the_same_delegation_differently_is_a_real_candidate() {
+        let conn = seeded();
+        let candidates = conflict_candidates_for_subject(&conn, "udra.DataContract").unwrap();
+        let has_sibling_pair = candidates.iter().any(|(a, b)| {
+            (a.id == "rule.suborg-a.001" && b.id == "rule.suborg-b.001")
+                || (b.id == "rule.suborg-a.001" && a.id == "rule.suborg-b.001")
+        });
+        assert!(
+            has_sibling_pair,
+            "two sibling orgs independently choosing incompatible schema formats is exactly \
+             what the two-tier conflict gate exists to catch"
+        );
+    }
+
+    #[test]
+    fn confirmed_conflict_relation_surfaces_via_confirmed_conflicts_and_drops_from_candidates() {
+        let conn = seeded();
+        insert_rule_relation(
+            &conn,
+            &RuleRelation {
+                rule_a_id: "rule.suborg-a.001".into(),
+                rule_b_id: "rule.suborg-b.001".into(),
+                relation_type: RelationType::ConflictsWith,
+                status: RelationStatus::Active,
+                confirmed_by: "reviewer@example.org".into(),
+            },
+        )
+        .unwrap();
+
+        let confirmed = confirmed_conflicts_for_subject(&conn, "udra.DataContract").unwrap();
+        assert_eq!(confirmed.len(), 1);
+
+        let candidates = conflict_candidates_for_subject(&conn, "udra.DataContract").unwrap();
+        assert!(
+            !candidates
                 .iter()
-                .any(|c| c.rule.relationship_type == "records")
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|c| c.rule.relationship_type == "governs")
+                .any(|(a, b)| a.id == "rule.suborg-a.001" && b.id == "rule.suborg-b.001")
         );
     }
 
     #[test]
-    fn candidate_valid_relationships_domain_with_no_relationships_is_empty() {
-        let conn = open_store().unwrap();
-        seed(&conn).unwrap();
+    fn superseding_a_rule_stales_its_active_relations() {
+        let conn = seeded();
+        insert_rule_relation(
+            &conn,
+            &RuleRelation {
+                rule_a_id: "rule.suborg-a.001".into(),
+                rule_b_id: "rule.suborg-b.001".into(),
+                relation_type: RelationType::ConflictsWith,
+                status: RelationStatus::Active,
+                confirmed_by: "reviewer@example.org".into(),
+            },
+        )
+        .unwrap();
 
-        // data-mesh has no seeded relationships.
-        let candidates = candidate_valid_relationships(&conn, "data-mesh").unwrap();
-        assert!(candidates.is_empty());
+        insert_rule(
+            &conn,
+            &Rule {
+                id: "rule.suborg-a.002".into(),
+                source_id: "src.suborg-a-impl".into(),
+                subject_id: "udra.DataContract".into(),
+                related_subject_id: None,
+                relationship_type: None,
+                cardinality: None,
+                statement: "Subordinate Org A data contracts must use Protobuf.".into(),
+                machine_check: None,
+                binding_strength: BindingStrength::Must,
+                supersedes_rule_id: Some("rule.suborg-a.001".into()),
+            },
+        )
+        .unwrap();
+
+        let confirmed = confirmed_conflicts_for_subject(&conn, "udra.DataContract").unwrap();
+        assert!(
+            confirmed.is_empty(),
+            "the relation should have gone stale, not stayed active, once its rule was superseded"
+        );
     }
 }

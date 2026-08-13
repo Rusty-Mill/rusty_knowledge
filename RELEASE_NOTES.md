@@ -5,6 +5,48 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #51 — Knowledge model v2: Source/Subject/Rule replaces AuthorityLayer/Construct
+**2026-08-13** · [#51](https://github.com/Rusty-Mill/rusty_knowledge/pull/51)
+
+- **Replaced** the fixed 4-layer `AuthorityLayer` (Standard/Tool
+  Implementation/Conventions/Process) and `Construct`-based model with a
+  seven-table design: `Source` (an authority node -- anything that can
+  issue a rule), `SourceAuthority` (a DAG of "child answers to parent"
+  edges -- a Source can answer to more than one independent parent),
+  `Subject` (canonical, exact-lookup identity for what a rule is about,
+  independent of who's making claims about it), `Rule` (the ground-truth
+  statement, now carrying `binding_strength` including `DELEGATED`, and
+  an optional `machine_check` for rules that need to be checked against a
+  real system's state, not just read by a human), `RuleRelation` (the
+  human-confirmed conflict gate, with a `status` that goes `stale`
+  automatically when a superseded rule invalidates a prior confirmation),
+  `SelectionGroup`, and `RuleDerivation`.
+- **Why:** the old model's fixed Standard/Tool/Convention/Process
+  taxonomy categorizes rules by *type* of authority and doesn't fit
+  domains whose authority is nested *organizationally* instead (e.g. a
+  data-mesh architecture implemented by a service, then an org within it,
+  then a subordinate org within that) -- forcing that shape into 4 fixed
+  slots either mislabels content or runs out of room past 4 levels. The
+  new model separates authority-type (`Source.kind`, a tag),
+  authority-scope (`Source`/`SourceAuthority`, arbitrary-depth and
+  -breadth), subject identity (`Subject`), and derivation
+  (`RuleDerivation`) as independent axes.
+- **This is a vertical slice**, not a full port: two MCP tools
+  (`lookup_subject`, `crosscut_conflicts`) are wired end-to-end against
+  real seeded UDRA data (a four-level authority chain, a `DELEGATED` rule
+  with a confirmed fulfillment, and a genuine sibling conflict between
+  two subordinate orgs that only the two-tier conflict gate catches,
+  since neither is an ancestor of the other). The previous 15-tool
+  surface, the `knowledge-mcp` importer, file-backed persistence
+  (`KNOWLEDGE_DB_PATH`), and search (`search_knowledge`,
+  `EMBEDDING_BACKEND`) were all built around the model this replaces and
+  are removed in this pass, not carried forward -- re-porting them onto
+  the new schema is follow-up work, tracked separately.
+- **Breaking**: every existing MCP tool name from the previous surface is
+  gone in this build. Anything integrating against `rusty_knowledge`
+  today will need to move to the new two-tool surface (or wait for the
+  rest of the old surface to be re-ported).
+
 ## PR #50 — RuleType gains RECOMMENDED/FORBIDDEN
 **2026-08-12** · [#50](https://github.com/Rusty-Mill/rusty_knowledge/pull/50)
 
