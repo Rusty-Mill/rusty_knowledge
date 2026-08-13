@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Knowledge model v2: Source/Subject/Rule replaces AuthorityLayer/Construct
-**2026-08-13** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #51 — Knowledge model v2: Source/Subject/Rule replaces AuthorityLayer/Construct
+**2026-08-13** · [#51](https://github.com/Rusty-Mill/rusty_knowledge/pull/51)
 
 - **Replaced** the fixed 4-layer `AuthorityLayer` (Standard/Tool
   Implementation/Conventions/Process) and `Construct`-based model with a
