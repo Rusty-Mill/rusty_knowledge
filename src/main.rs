@@ -2,12 +2,20 @@
 //! knowledge-model-v2 store (`Source`/`SourceAuthority`/`Subject`/`Rule`/
 //! `RuleRelation`/`SelectionGroup`/`RuleDerivation`).
 //!
-//! This is a vertical slice proving the redesigned model end-to-end
-//! against real UDRA data (see `store::seed_udra`), not a full port of
-//! the previous 15-tool surface. That surface, and the `knowledge-mcp`
-//! importer, were both built around the model this replaces
-//! (`AuthorityLayer`/`Construct`/a fixed 4-layer taxonomy) and are
-//! deferred to follow-up work, not silently dropped.
+//! This is a vertical slice proving the redesigned model end-to-end, not
+//! a full port of the previous 15-tool surface. That surface was built
+//! around the model this replaces (`AuthorityLayer`/`Construct`/a fixed
+//! 4-layer taxonomy) and is deferred to follow-up work, not silently
+//! dropped.
+//!
+//! Setting `KNOWLEDGE_MCP_IMPORT_PATH` at startup imports a real
+//! `knowledge-mcp` SQLite file (see `knowledge_mcp_import_v2`'s module
+//! doc for exactly what does and doesn't translate) instead of the small
+//! hand-seeded illustrative UDRA dataset (`store::seed_udra`) -- the two
+//! aren't run together, since the reference data's `udra` domain and the
+//! hand-seeded one use overlapping ids (e.g. both define
+//! `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
+//! default.
 //!
 //! Two tools are wired end-to-end:
 //! - `lookup_subject` — everything a Subject's authority chain says about
@@ -19,6 +27,7 @@
 //!   pairs are excluded from the review queue, since that's the
 //!   authority working as intended, not an ambiguity).
 
+mod knowledge_mcp_import_v2;
 mod store;
 
 use rmcp::{
@@ -102,8 +111,12 @@ impl KnowledgeServer {
                 .join("\n")
         };
 
+        let section_note = match &subject.source_section {
+            Some(section) => format!(" (source: Section {section})"),
+            None => String::new(),
+        };
         format!(
-            "{} ({}) [{}]\n{}\nRules:\n{rules_block}",
+            "{} ({}) [{}]{section_note}\n{}\nRules:\n{rules_block}",
             subject.name,
             subject.id,
             subject.subject_type,
@@ -178,11 +191,43 @@ impl KnowledgeServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let conn = store::open_store()?;
-    store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
+
+    match std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
+        Ok(path) => {
+            match knowledge_mcp_import_v2::import_knowledge_mcp_db(
+                &conn,
+                std::path::Path::new(&path),
+            ) {
+                Ok(report) => {
+                    eprintln!(
+                        "Imported {path:?}: {} source(s), {} authority edge(s), {} subject(s), \
+                         {} rule(s), {} row(s) skipped.",
+                        report.sources_imported,
+                        report.source_authority_edges_imported,
+                        report.subjects_imported,
+                        report.rules_imported,
+                        report.rows_skipped,
+                    );
+                    for disclosure in &report.disclosures {
+                        eprintln!("  {disclosure}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to import {path:?} ({err}); falling back to seeded UDRA data."
+                    );
+                    store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
+                }
+            }
+        }
+        Err(_) => {
+            store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
+        }
+    }
 
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: lookup_subject, crosscut_conflicts; \
-         knowledge-model-v2 vertical slice over seeded UDRA data)"
+         knowledge-model-v2 vertical slice)"
     );
 
     let server = KnowledgeServer {
