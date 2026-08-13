@@ -5,6 +5,50 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — knowledge-mcp importer for the v2 model, seeded with real data
+**2026-08-13** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `knowledge_mcp_import_v2` -- a row-by-row translation of a
+  real `knowledge-mcp` (Python) SQLite file into the v2 store. `domains` +
+  `domain_layers` become a straight `Source`/`SourceAuthority` chain per
+  domain (layer N answers to layer N-1); `constructs` become `Subject`
+  (a null `short_name` falls back to the id's suffix rather than being
+  dropped); `rules` become `Rule`; `relationships` become `Rule` with
+  `related_subject_id`/`relationship_type`/`cardinality` set (a null
+  `rule_type` becomes `binding_strength: May`, the weakest level, not a
+  guess at MUST/SHOULD).
+- **Disclosed, not force-fit:** the old schema's `conflicts` are
+  layer-vs-layer or domain-wide observations, never tied to two specific
+  rule ids the way `RuleRelation` requires -- counted and disclosed per
+  domain rather than guessed at. `properties`, `embeddings`,
+  `ingestion_log`, `schema_version`, `knowledge_fts` have no destination
+  concept in the current model and are disclosed as not imported.
+- **One inferred addition, clearly disclosed:** if both a `udra` and a
+  `data_mesh` domain are present, one `SourceAuthority` edge is added
+  from `udra`'s root Source to `data_mesh`'s root Source. The old schema
+  has no way to express "this whole domain builds on that whole domain"
+  (no `cross_domain_relationships` row exists for it in the reference
+  data), but UDRA's own domain description says exactly this
+  ("introduces data mesh principles..."). This is the one thing in the
+  import that isn't a literal transcription of source data -- reported in
+  `ImportReport.disclosures` so it's never mistaken for one.
+- **`KNOWLEDGE_MCP_IMPORT_PATH`** now runs this importer instead of the
+  small hand-seeded illustrative UDRA dataset (`store::seed_udra`) added
+  in #51 -- the two aren't run together, since the reference data's real
+  `udra` domain and the hand-seeded one use overlapping ids (both define
+  `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
+  default.
+- Verified against real reference data (3 domains -- UAF 1.3, Data Mesh,
+  UDRA -- 214 constructs, 124 rules, 38 relationships): imports cleanly
+  with 0 rows skipped, correct multi-level `SourceAuthority` ancestry,
+  and the `udra` -> `data_mesh` lineage edge confirmed reachable via
+  `ancestors_of`.
+- `Subject` gained one field driven by real data: `source_section`
+  (populated on 177 of 214 reference constructs, e.g. UAF spec section
+  references) -- dropped from #51's minimal vertical slice, but real
+  content here, so it's back and now surfaced in `lookup_subject`'s
+  output.
+
 ## PR #51 — Knowledge model v2: Source/Subject/Rule replaces AuthorityLayer/Construct
 **2026-08-13** · [#51](https://github.com/Rusty-Mill/rusty_knowledge/pull/51)
 

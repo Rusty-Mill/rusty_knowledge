@@ -65,10 +65,19 @@ impl BindingStrength {
         }
     }
 
-    // No untrusted-input `parse` yet -- neither of this slice's two tools
-    // takes a binding_strength filter param. Add it (matching the
-    // trusted-vs-untrusted parser split used elsewhere in this file) when
-    // a real tool actually needs one, not speculatively.
+    /// Untrusted-input parser: used by `knowledge_mcp_import_v2` reading
+    /// an external SQLite file. Never panics.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "MUST" => Some(BindingStrength::Must),
+            "MUST_NOT" => Some(BindingStrength::MustNot),
+            "SHOULD" => Some(BindingStrength::Should),
+            "SHOULD_NOT" => Some(BindingStrength::ShouldNot),
+            "MAY" => Some(BindingStrength::May),
+            "DELEGATED" => Some(BindingStrength::Delegated),
+            _ => None,
+        }
+    }
 }
 
 /// The fixed vocabulary for rule-to-rule relations (`RuleRelation`).
@@ -174,6 +183,10 @@ pub struct Subject {
     pub is_deprecated: bool,
     pub parent_subject_id: Option<String>,
     pub supersedes_subject_id: Option<String>,
+    /// Section reference in the Subject's originating source document,
+    /// e.g. "6.2" for a UAF 1.3 spec section. Optional -- most domains
+    /// won't have this, but real UAF/UDRA/Data Mesh content does.
+    pub source_section: Option<String>,
 }
 
 /// The ground-truth requirement/statement. A relationship claim between
@@ -236,7 +249,8 @@ fn schema_ddl() -> &'static str {
         description TEXT,
         is_deprecated INTEGER NOT NULL DEFAULT 0,
         parent_subject_id TEXT REFERENCES subjects(id),
-        supersedes_subject_id TEXT REFERENCES subjects(id)
+        supersedes_subject_id TEXT REFERENCES subjects(id),
+        source_section TEXT
     );
     CREATE INDEX idx_subjects_short ON subjects(domain_tag, short_name);
 
@@ -369,6 +383,9 @@ pub fn insert_source_authority_edge(
     Ok(())
 }
 
+const SUBJECT_COLUMNS: &str = "id, domain_tag, subject_type, name, short_name, description, \
+     is_deprecated, parent_subject_id, supersedes_subject_id, source_section";
+
 fn subject_from_row(row: &rusqlite::Row) -> rusqlite::Result<Subject> {
     Ok(Subject {
         id: row.get(0)?,
@@ -380,15 +397,13 @@ fn subject_from_row(row: &rusqlite::Row) -> rusqlite::Result<Subject> {
         is_deprecated: row.get::<_, i64>(6)? != 0,
         parent_subject_id: row.get(7)?,
         supersedes_subject_id: row.get(8)?,
+        source_section: row.get(9)?,
     })
 }
 
 pub fn insert_subject(conn: &Connection, subject: &Subject) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO subjects
-             (id, domain_tag, subject_type, name, short_name, description, is_deprecated,
-              parent_subject_id, supersedes_subject_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        &format!("INSERT INTO subjects ({SUBJECT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
         params![
             subject.id,
             subject.domain_tag,
@@ -399,6 +414,7 @@ pub fn insert_subject(conn: &Connection, subject: &Subject) -> rusqlite::Result<
             subject.is_deprecated as i64,
             subject.parent_subject_id,
             subject.supersedes_subject_id,
+            subject.source_section,
         ],
     )?;
     Ok(())
@@ -406,9 +422,7 @@ pub fn insert_subject(conn: &Connection, subject: &Subject) -> rusqlite::Result<
 
 pub fn subject_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<Subject>> {
     conn.query_row(
-        "SELECT id, domain_tag, subject_type, name, short_name, description, is_deprecated,
-                parent_subject_id, supersedes_subject_id
-         FROM subjects WHERE id = ?1",
+        &format!("SELECT {SUBJECT_COLUMNS} FROM subjects WHERE id = ?1"),
         params![id],
         subject_from_row,
     )
@@ -425,9 +439,9 @@ pub fn resolve_subject(
 ) -> rusqlite::Result<Option<Subject>> {
     let by_short_name = conn
         .query_row(
-            "SELECT id, domain_tag, subject_type, name, short_name, description, is_deprecated,
-                    parent_subject_id, supersedes_subject_id
-             FROM subjects WHERE domain_tag = ?1 AND short_name = ?2",
+            &format!(
+                "SELECT {SUBJECT_COLUMNS} FROM subjects WHERE domain_tag = ?1 AND short_name = ?2"
+            ),
             params![domain_tag, subject_ref],
             subject_from_row,
         )
@@ -728,6 +742,7 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
             is_deprecated: false,
             parent_subject_id: None,
             supersedes_subject_id: None,
+            source_section: None,
         },
     )
     .map_err(to_string_err)?;
@@ -745,6 +760,7 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
             is_deprecated: false,
             parent_subject_id: None,
             supersedes_subject_id: None,
+            source_section: None,
         },
     )
     .map_err(to_string_err)?;
