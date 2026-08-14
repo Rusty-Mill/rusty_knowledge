@@ -1,6 +1,12 @@
-//! The knowledge-model-v2 store: seven tables (`Source`, `SourceAuthority`,
-//! `Subject`, `Rule`, `RuleRelation`, `SelectionGroup`, `RuleDerivation`)
-//! replacing the earlier `AuthorityLayer`/`Construct`/fixed-4-layer model.
+//! The knowledge-model-v2 store: five tables (`Source`, `SourceAuthority`,
+//! `Subject`, `Rule`, `RuleRelation`) replacing the earlier
+//! `AuthorityLayer`/`Construct`/fixed-4-layer model. The fuller
+//! seven-table design this was built from also specifies
+//! `SelectionGroup` (cardinality constraints over a set of Rules) and
+//! `RuleDerivation` (firewalled, non-authoritative rollup views) -- both
+//! deliberately not implemented yet, since nothing in this vertical
+//! slice's two tools needs them. Add them when a real case does, not
+//! speculatively.
 //!
 //! This redesign came out of stress-testing the original design against
 //! UDRA (a nested-organization authority chain that doesn't fit a fixed
