@@ -1951,6 +1951,131 @@ mod tests {
         assert!(ancestors.contains("overlay"));
     }
 
+    /// Builds a deeper multi-parent DAG than the minimal one-edge case
+    /// above: two entirely independent, two-level-deep root lineages
+    /// (`root-a` -> `mid-a`, `root-b` -> `mid-b`) that share no common
+    /// ancestor at all, converging only at `leaf` (which answers to both
+    /// `mid-a` and `mid-b`). Stresses the recursive ancestor walk across
+    /// a genuine DAG shape, not just a single extra parent edge.
+    fn multi_parent_dag_stress_fixture() -> Connection {
+        let conn = open_store().unwrap();
+        for id in ["root-a", "mid-a", "root-b", "mid-b", "leaf"] {
+            insert_source(
+                &conn,
+                &Source {
+                    id: id.into(),
+                    name: id.into(),
+                    kind: "external-standard".into(),
+                    domain_tags: vec![],
+                    steward: None,
+                    citation: None,
+                    supersedes_source_id: None,
+                },
+            )
+            .unwrap();
+        }
+        insert_source_authority_edge(&conn, "mid-a", "root-a").unwrap();
+        insert_source_authority_edge(&conn, "mid-b", "root-b").unwrap();
+        insert_source_authority_edge(&conn, "leaf", "mid-a").unwrap();
+        insert_source_authority_edge(&conn, "leaf", "mid-b").unwrap();
+        conn
+    }
+
+    #[test]
+    fn multi_parent_dag_stress_ancestors_span_two_independent_root_lineages() {
+        let conn = multi_parent_dag_stress_fixture();
+        let ancestors = ancestors_of(&conn, "leaf").unwrap();
+        assert_eq!(ancestors.len(), 4);
+        for expected in ["mid-a", "root-a", "mid-b", "root-b"] {
+            assert!(
+                ancestors.contains(expected),
+                "expected {expected:?} in ancestors of \"leaf\", got {ancestors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_parent_dag_stress_independent_roots_are_not_ancestors_of_each_other() {
+        let conn = multi_parent_dag_stress_fixture();
+        assert!(!is_ancestor(&conn, "root-a", "root-b").unwrap());
+        assert!(!is_ancestor(&conn, "root-b", "root-a").unwrap());
+        assert!(!is_ancestor(&conn, "mid-a", "mid-b").unwrap());
+        assert!(!is_ancestor(&conn, "mid-b", "mid-a").unwrap());
+    }
+
+    #[test]
+    fn multi_parent_dag_stress_rules_from_both_independent_lineages_surface_together() {
+        let conn = multi_parent_dag_stress_fixture();
+        insert_subject(
+            &conn,
+            &Subject {
+                id: "sys.Boundary".into(),
+                domain_tag: "rmf".into(),
+                subject_type: "concept".into(),
+                name: "System Boundary".into(),
+                short_name: "Boundary".into(),
+                description: None,
+                is_deprecated: false,
+                parent_subject_id: None,
+                supersedes_subject_id: None,
+                source_section: None,
+            },
+        )
+        .unwrap();
+        insert_rule(
+            &conn,
+            &Rule {
+                id: "rule.root-a.001".into(),
+                source_id: "root-a".into(),
+                subject_id: "sys.Boundary".into(),
+                related_subject_id: None,
+                relationship_type: None,
+                cardinality: None,
+                statement: "Root A requires an annual boundary review.".into(),
+                machine_check: None,
+                binding_strength: BindingStrength::Must,
+                supersedes_rule_id: None,
+            },
+        )
+        .unwrap();
+        insert_rule(
+            &conn,
+            &Rule {
+                id: "rule.root-b.001".into(),
+                source_id: "root-b".into(),
+                subject_id: "sys.Boundary".into(),
+                related_subject_id: None,
+                relationship_type: None,
+                cardinality: None,
+                statement: "Root B requires a quarterly boundary review.".into(),
+                machine_check: None,
+                binding_strength: BindingStrength::Must,
+                supersedes_rule_id: None,
+            },
+        )
+        .unwrap();
+
+        // Both rules come from Sources that share no ancestor with each
+        // other at all -- they converge only at "leaf", a shared
+        // descendant. `rules_for_subject` must still surface both.
+        let rules = rules_for_subject(&conn, "sys.Boundary").unwrap();
+        assert_eq!(rules.len(), 2);
+        let rule_ids: Vec<&str> = rules.iter().map(|(r, _)| r.id.as_str()).collect();
+        assert!(rule_ids.contains(&"rule.root-a.001"));
+        assert!(rule_ids.contains(&"rule.root-b.001"));
+
+        // And the conflict gate must surface them as a candidate needing
+        // review -- disagreeing frequency requirements from two entirely
+        // independent standards is exactly the case the two-tier gate
+        // exists for.
+        let candidates = conflict_candidates_for_subject(&conn, "sys.Boundary").unwrap();
+        assert_eq!(candidates.len(), 1);
+        let (rule_a, rule_b) = &candidates[0];
+        let candidate_ids = [rule_a.id.as_str(), rule_b.id.as_str()];
+        assert!(candidate_ids.contains(&"rule.root-a.001"));
+        assert!(candidate_ids.contains(&"rule.root-b.001"));
+    }
+
     #[test]
     fn resolve_subject_finds_by_short_name_then_id() {
         let conn = seeded();
