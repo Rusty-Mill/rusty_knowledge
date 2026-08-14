@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Six more tools ported onto the v2 model (rusty_knowledge#55, part 1)
-**2026-08-14** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #56 — Six more tools ported onto the v2 model (rusty_knowledge#55, part 1)
+**2026-08-14** · [#56](https://github.com/Rusty-Mill/rusty_knowledge/pull/56)
 
 - **Added:** `lookup_rules`, `lookup_relationships`, `lookup_domain_summary`,
   `search_constructs`, `meta_list_domains`, `meta_routing_guide` — six of
