@@ -18,12 +18,11 @@
 //! `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
 //! default.
 //!
-//! Tools wired end-to-end -- 13 so far. rusty_knowledge#55 tracks the
-//! rest: `validate_element` and `validate_completeness` are blocked on
-//! model capability that's specified but not built yet (a `machine_check`
-//! evaluator, `SelectionGroup`); `search_knowledge` needs a fresh design
-//! decision, since its old FTS5/`sqlite-vec` infrastructure was removed
-//! entirely along with the schema this replaces.
+//! Tools wired end-to-end -- 14 so far. rusty_knowledge#55 tracks the
+//! rest: `validate_completeness` is blocked on `SelectionGroup`, specified
+//! but not built yet; `search_knowledge` needs a fresh design decision,
+//! since its old FTS5/`sqlite-vec` infrastructure was removed entirely
+//! along with the schema this replaces.
 //! - `lookup_subject` — everything a Subject's authority chain says about
 //!   it, across every Source that makes a claim, with provenance.
 //! - `lookup_rules` — plain statement rules for a subject (excludes
@@ -47,6 +46,12 @@
 //!   human to review (no `knowledge-mcp` equivalent; never auto-commits).
 //! - `validate_relationship` — whether a relationship between two
 //!   subjects is declared by an existing rule.
+//! - `validate_element` — PASS/FAIL/WARNING per machine-checkable rule
+//!   against a set of real property values (`Rule.machine_check`, e.g.
+//!   `required_property`/`enum_value`/`pattern`/`range`/`custom`). A
+//!   missing property always fails; a pattern *mismatch* (value present,
+//!   just doesn't match) is a warning, not a fail -- pattern/format
+//!   guidance is advisory, structural presence isn't.
 //! - `crosscut_conflicts` — confirmed conflicts plus unconfirmed
 //!   candidates needing review, via the two-tier conflict gate (exact
 //!   `subject_id` correlation catches sibling/cousin conflicts a pure
@@ -61,6 +66,7 @@ use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
 };
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use store::Source;
 
@@ -162,6 +168,17 @@ struct ValidateRelationshipParams {
     relationship_type: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateElementParams {
+    /// Domain tag the subject belongs to, e.g. "udra".
+    domain_tag: String,
+    /// The construct type being validated (short name or full ID).
+    subject_ref: String,
+    /// Property name -> value pairs of the actual element being checked.
+    #[serde(default)]
+    properties: HashMap<String, String>,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -206,6 +223,7 @@ fn routing_guide() -> String {
      - \"What valid-relationship rules should I declare for this domain?\" -> \
        crosscut_valid_relationship_candidates\n\
      - \"Is this relationship permitted?\" -> validate_relationship\n\
+     - \"Is X valid/conformant?\" -> validate_element\n\
      - \"Where do sources disagree about X?\" -> crosscut_conflicts"
         .to_string()
 }
@@ -811,6 +829,90 @@ impl KnowledgeServer {
             from_subject.id, relationship_type, to_subject.id
         )
     }
+
+    #[tool(
+        description = "Validate an element's properties against a subject's machine-checkable rules. Returns PASS/FAIL/WARNING per rule with citations -- rules with no machine_check are listed as not machine-checkable, not silently skipped."
+    )]
+    fn validate_element(
+        &self,
+        Parameters(ValidateElementParams {
+            domain_tag,
+            subject_ref,
+            properties,
+        }): Parameters<ValidateElementParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let rules = match store::statement_rules_for_subject(&conn, &subject.id, None) {
+            Ok(rules) => rules,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let checkable: Vec<_> = rules
+            .iter()
+            .filter(|(rule, _)| rule.machine_check.is_some())
+            .collect();
+        if checkable.is_empty() {
+            return format!(
+                "{} ({}) has no machine-checkable rules; nothing to validate.",
+                subject.name, subject.id
+            );
+        }
+
+        let mut fail_count = 0;
+        let mut warning_count = 0;
+        let findings = checkable
+            .iter()
+            .map(|(rule, source)| {
+                let check_json = rule.machine_check.as_deref().unwrap();
+                let result = store::evaluate_machine_check(check_json, &properties);
+                let (label, detail) = match &result {
+                    store::CheckResult::Pass => ("PASS", None),
+                    store::CheckResult::Fail(reason) => {
+                        fail_count += 1;
+                        ("FAIL", Some(reason.clone()))
+                    }
+                    store::CheckResult::Warning(reason) => {
+                        warning_count += 1;
+                        ("WARNING", Some(reason.clone()))
+                    }
+                };
+                match detail {
+                    Some(detail) => format!(
+                        "  [{label}] {} -- {detail} ({})",
+                        rule.statement,
+                        format_source(source)
+                    ),
+                    None => format!(
+                        "  [{label}] {} -- ({})",
+                        rule.statement,
+                        format_source(source)
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let overall = if fail_count > 0 {
+            "FAIL"
+        } else if warning_count > 0 {
+            "WARNING"
+        } else {
+            "PASS"
+        };
+
+        format!(
+            "{} ({}): {overall} ({fail_count} fail, {warning_count} warning)\n{findings}",
+            subject.name, subject.id
+        )
+    }
 }
 
 #[tokio::main]
@@ -855,7 +957,7 @@ async fn main() -> anyhow::Result<()> {
          lookup_relationships, lookup_valid_relationships, lookup_domain_summary, \
          search_constructs, meta_list_domains, meta_routing_guide, crosscut_traceability, \
          crosscut_cross_domain, crosscut_valid_relationship_candidates, validate_relationship, \
-         crosscut_conflicts; knowledge-model-v2)"
+         validate_element, crosscut_conflicts; knowledge-model-v2)"
     );
 
     let server = KnowledgeServer {
@@ -1131,5 +1233,54 @@ mod tests {
             relationship_type: "no-such-type".into(),
         }));
         assert!(invalid.starts_with("INVALID"));
+    }
+
+    #[test]
+    fn validate_element_passes_when_property_matches_pattern() {
+        let server = test_server();
+        let mut properties = HashMap::new();
+        properties.insert("owner_email".to_string(), "alice@example.org".to_string());
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            properties,
+        }));
+        assert!(response.contains("PASS"));
+        assert!(!response.contains("FAIL"));
+    }
+
+    #[test]
+    fn validate_element_fails_when_required_property_missing() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            properties: HashMap::new(),
+        }));
+        assert!(response.starts_with("Data Product (udra.DataProduct): FAIL"));
+    }
+
+    #[test]
+    fn validate_element_warns_on_pattern_mismatch_not_fail() {
+        let server = test_server();
+        let mut properties = HashMap::new();
+        properties.insert("owner_email".to_string(), "not-an-email".to_string());
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            properties,
+        }));
+        assert!(response.starts_with("Data Product (udra.DataProduct): WARNING"));
+    }
+
+    #[test]
+    fn validate_element_no_machine_checkable_rules_says_so() {
+        let server = test_server();
+        let response = server.validate_element(Parameters(ValidateElementParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataContract".into(),
+            properties: HashMap::new(),
+        }));
+        assert!(response.contains("no machine-checkable rules"));
     }
 }

@@ -5,6 +5,29 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — machine_check evaluator + validate_element (rusty_knowledge#55)
+**2026-08-14**
+
+- **Added:** `validate_element` -- checks a real element's properties
+  against a subject's machine-checkable rules and reports PASS/FAIL/WARNING
+  per rule, with citations. Rules with no `machine_check` are listed as not
+  machine-checkable, never silently skipped. Tool surface goes from 13 to
+  14; only `validate_completeness` (blocked on `SelectionGroup`) and
+  `search_knowledge` (needs a fresh design decision) remain of #55's
+  original 16-tool scope.
+- New `store.rs` types/function backing it: `MachineCheck` (serde-tagged
+  enum over the `required_property`/`enum_value`/`pattern`/`range`/`custom`
+  shapes a `Rule.machine_check` JSON blob can take), `CheckResult`
+  (`Pass`/`Fail`/`Warning`), `evaluate_machine_check`. Design decision: a
+  missing property is always `Fail` regardless of check type (the check
+  literally couldn't run); a `pattern` mismatch on a present property is
+  `Warning`, not `Fail` -- format/style guidance is advisory, unlike
+  structural presence, enum membership, or numeric range, which are hard
+  violations. Invalid JSON or an invalid regex pattern is `Warning`, never
+  a panic.
+- Re-added the `rusty_regx` dependency (removed in #54 as unused) -- it
+  now has a real caller in the `pattern` check.
+
 ## PR #57 — Crosscut + validate_relationship tools ported (rusty_knowledge#55, part 2)
 **2026-08-14** · [#57](https://github.com/Rusty-Mill/rusty_knowledge/pull/57)
 
