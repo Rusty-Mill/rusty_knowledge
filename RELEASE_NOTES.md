@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Live-verify OllamaEmbedder against a real Ollama server
-**2026-08-14** · PR TBD
+## PR #69 — Live-verify OllamaEmbedder against a real Ollama server
+**2026-08-14** · [#69](https://github.com/Rusty-Mill/rusty_knowledge/pull/69)
 
 - **Verified, not just implemented:** installed a real Ollama server in
   this development environment, pulled `all-minilm`, and confirmed
