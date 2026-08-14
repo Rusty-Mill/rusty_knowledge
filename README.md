@@ -31,11 +31,9 @@ goal.
 Growing incrementally from the original two-tool vertical slice toward the
 previous model's full surface (tracked in
 [rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)).
-13 MCP tools so far — `validate_element`, `validate_completeness`, and
-`search_knowledge` remain: the first two are blocked on model capability
-that's specified but not built yet (a `machine_check` evaluator,
-`SelectionGroup`), and the third needs a fresh design decision since its old
-search infrastructure was removed along with the schema this replaces.
+15 MCP tools so far — only `search_knowledge` remains, and it needs a fresh
+design decision since its old FTS5/`sqlite-vec` search infrastructure was
+removed along with the schema this replaces.
 
 - `lookup_subject` — everything the full authority chain says about a
   subject: every `Rule` that names it (directly, or as the target of a
@@ -61,6 +59,12 @@ search infrastructure was removed along with the schema this replaces.
   human to review (no `knowledge-mcp` equivalent; never auto-commits).
 - `validate_relationship` — whether a relationship between two subjects is
   declared by an existing rule.
+- `validate_element` — PASS/FAIL/WARNING per machine-checkable rule against
+  a set of real property values.
+- `validate_completeness` — evaluates every `SelectionGroup` (a cardinality
+  constraint over a set of relationship-shaped rules) defined on a
+  container/viewpoint subject against the element types actually present,
+  reporting which groups are satisfied and which member rules are missing.
 - `crosscut_conflicts` — conflict-registry status for a subject: confirmed,
   active `conflicts_with` relations between its rules, plus candidate pairs
   (same subject, different Sources, no confirmed relation yet) needing human

@@ -18,11 +18,10 @@
 //! `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
 //! default.
 //!
-//! Tools wired end-to-end -- 14 so far. rusty_knowledge#55 tracks the
-//! rest: `validate_completeness` is blocked on `SelectionGroup`, specified
-//! but not built yet; `search_knowledge` needs a fresh design decision,
-//! since its old FTS5/`sqlite-vec` infrastructure was removed entirely
-//! along with the schema this replaces.
+//! Tools wired end-to-end -- 15 so far. rusty_knowledge#55 tracks the
+//! rest: `search_knowledge` needs a fresh design decision, since its old
+//! FTS5/`sqlite-vec` infrastructure was removed entirely along with the
+//! schema this replaces.
 //! - `lookup_subject` — everything a Subject's authority chain says about
 //!   it, across every Source that makes a claim, with provenance.
 //! - `lookup_rules` — plain statement rules for a subject (excludes
@@ -58,6 +57,12 @@
 //!   ancestor-chain walk can't see; `DELEGATED` parent/fulfilling-child
 //!   pairs are excluded from the review queue, since that's the
 //!   authority working as intended, not an ambiguity).
+//! - `validate_completeness` — evaluates every `SelectionGroup` (a
+//!   cardinality constraint over a set of relationship-shaped rules, e.g.
+//!   "must have both X and Y") defined on a container/viewpoint subject
+//!   against a caller-supplied set of element types actually present,
+//!   reporting which groups are satisfied, which member rules are
+//!   missing, and the overall verdict.
 
 mod knowledge_mcp_import_v2;
 mod store;
@@ -66,7 +71,7 @@ use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
 };
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use store::Source;
 
@@ -179,6 +184,18 @@ struct ValidateElementParams {
     properties: HashMap<String, String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateCompletenessParams {
+    /// Domain tag the subject belongs to, e.g. "udra".
+    domain_tag: String,
+    /// The container/viewpoint subject being validated (short name or
+    /// full ID), e.g. "DataProduct".
+    subject_ref: String,
+    /// The subject IDs or short names actually present in the model being
+    /// checked, e.g. ["DataContract"].
+    present_element_types: Vec<String>,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -224,6 +241,7 @@ fn routing_guide() -> String {
        crosscut_valid_relationship_candidates\n\
      - \"Is this relationship permitted?\" -> validate_relationship\n\
      - \"Is X valid/conformant?\" -> validate_element\n\
+     - \"Is this model/container complete? What's missing?\" -> validate_completeness\n\
      - \"Where do sources disagree about X?\" -> crosscut_conflicts"
         .to_string()
 }
@@ -913,6 +931,75 @@ impl KnowledgeServer {
             subject.name, subject.id
         )
     }
+
+    #[tool(
+        description = "Check whether a container/viewpoint subject is complete, given the element types actually present in the model. Evaluates every SelectionGroup defined on the subject (a cardinality constraint over a set of relationship-shaped rules, e.g. \"must have both a DataContract and realize DataProduct\") and reports which are satisfied, which are missing, and the overall verdict."
+    )]
+    fn validate_completeness(
+        &self,
+        Parameters(ValidateCompletenessParams {
+            domain_tag,
+            subject_ref,
+            present_element_types,
+        }): Parameters<ValidateCompletenessParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let present: HashSet<String> = present_element_types.into_iter().collect();
+        let findings = match store::evaluate_completeness(&conn, &subject.id, &present) {
+            Ok(findings) => findings,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if findings.is_empty() {
+            return format!(
+                "{} ({}) has no completeness constraints defined; nothing to validate.",
+                subject.name, subject.id
+            );
+        }
+
+        let mut findings_report = String::new();
+        for finding in &findings {
+            let group_label = if finding.is_satisfied {
+                "COMPLETE"
+            } else {
+                "INCOMPLETE"
+            };
+            findings_report.push_str(&format!(
+                "  [{group_label}] {} ({}/{} satisfied)\n",
+                finding.group.description,
+                finding.satisfied_count,
+                finding.members.len()
+            ));
+            for (rule, source, satisfied) in &finding.members {
+                let member_label = if *satisfied { "present" } else { "MISSING" };
+                findings_report.push_str(&format!(
+                    "    [{member_label}] {} -- ({})\n",
+                    rule.statement,
+                    format_source(source)
+                ));
+            }
+        }
+
+        let overall = if findings.iter().all(|f| f.is_satisfied) {
+            "COMPLETE"
+        } else {
+            "INCOMPLETE"
+        };
+        format!(
+            "{} ({}): {overall}\n{}",
+            subject.name,
+            subject.id,
+            findings_report.trim_end()
+        )
+    }
 }
 
 #[tokio::main]
@@ -957,7 +1044,7 @@ async fn main() -> anyhow::Result<()> {
          lookup_relationships, lookup_valid_relationships, lookup_domain_summary, \
          search_constructs, meta_list_domains, meta_routing_guide, crosscut_traceability, \
          crosscut_cross_domain, crosscut_valid_relationship_candidates, validate_relationship, \
-         validate_element, crosscut_conflicts; knowledge-model-v2)"
+         validate_element, validate_completeness, crosscut_conflicts; knowledge-model-v2)"
     );
 
     let server = KnowledgeServer {
@@ -1282,5 +1369,52 @@ mod tests {
             properties: HashMap::new(),
         }));
         assert!(response.contains("no machine-checkable rules"));
+    }
+
+    #[test]
+    fn validate_completeness_reports_complete_when_all_members_present() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            present_element_types: vec!["DataContract".into(), "DataProduct".into()],
+        }));
+        assert!(response.starts_with("Data Product (udra.DataProduct): COMPLETE"));
+        assert!(!response.contains("MISSING"));
+    }
+
+    #[test]
+    fn validate_completeness_reports_incomplete_and_names_the_missing_rule() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            present_element_types: vec!["DataContract".into()],
+        }));
+        assert!(response.starts_with("Data Product (udra.DataProduct): INCOMPLETE"));
+        assert!(response.contains("MISSING"));
+        assert!(response.contains("Data Mesh data product concept"));
+    }
+
+    #[test]
+    fn validate_completeness_no_constraints_defined_says_so() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataContract".into(),
+            present_element_types: vec![],
+        }));
+        assert!(response.contains("no completeness constraints defined"));
+    }
+
+    #[test]
+    fn validate_completeness_unknown_subject_reports_not_found() {
+        let server = test_server();
+        let response = server.validate_completeness(Parameters(ValidateCompletenessParams {
+            domain_tag: "udra".into(),
+            subject_ref: "NoSuchSubject".into(),
+            present_element_types: vec![],
+        }));
+        assert!(response.contains("not found"));
     }
 }

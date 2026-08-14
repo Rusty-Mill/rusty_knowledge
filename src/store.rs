@@ -1,12 +1,12 @@
-//! The knowledge-model-v2 store: five tables (`Source`, `SourceAuthority`,
-//! `Subject`, `Rule`, `RuleRelation`) replacing the earlier
+//! The knowledge-model-v2 store: `Source`, `SourceAuthority`, `Subject`,
+//! `Rule`, `RuleRelation`, and `SelectionGroup` (a cardinality constraint
+//! over a set of relationship-shaped Rules, e.g. "must have both X and Y"
+//! -- backs `validate_completeness`), replacing the earlier
 //! `AuthorityLayer`/`Construct`/fixed-4-layer model. The fuller
-//! seven-table design this was built from also specifies
-//! `SelectionGroup` (cardinality constraints over a set of Rules) and
-//! `RuleDerivation` (firewalled, non-authoritative rollup views) -- both
-//! deliberately not implemented yet, since nothing in this vertical
-//! slice's two tools needs them. Add them when a real case does, not
-//! speculatively.
+//! seven-table design this was built from also specifies `RuleDerivation`
+//! (firewalled, non-authoritative rollup views), deliberately not
+//! implemented yet since nothing in the current tool surface needs it.
+//! Add it when a real case does, not speculatively.
 //!
 //! This redesign came out of stress-testing the original design against
 //! UDRA (a nested-organization authority chain that doesn't fit a fixed
@@ -19,14 +19,15 @@
 //! NIST RMF (rules that need to be machine-checked against a real system's
 //! state, not just read by a human -- `Rule.machine_check`).
 //!
-//! This vertical slice proves the model against real UDRA data end-to-end:
-//! schema, insert-time invariants (DAG cycle rejection, supersession
-//! cascade), the two-tier conflict-candidate query, and two MCP tools
-//! (`lookup_subject`, `crosscut_conflicts` -- see `main.rs`). It does not
-//! yet carry forward the previous model's full 15-tool surface, the
-//! `knowledge-mcp` importer, file-backed persistence, or search -- those
-//! were all built around the schema this replaces and are deferred to
-//! follow-up work, not silently dropped.
+//! This started as a vertical slice proving the model against real UDRA
+//! data end-to-end: schema, insert-time invariants (DAG cycle rejection,
+//! supersession cascade), the two-tier conflict-candidate query, and two
+//! MCP tools (`lookup_subject`, `crosscut_conflicts` -- see `main.rs`).
+//! It's since grown to 15 tools (tracked in rusty_knowledge#55); only
+//! `search_knowledge` remains, needing a fresh design decision rather than
+//! a direct re-port, since its old FTS5/`sqlite-vec` search infrastructure
+//! was removed entirely along with the schema this replaces. File-backed
+//! persistence is likewise not carried forward yet.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
@@ -338,6 +339,62 @@ pub struct RuleRelation {
     pub confirmed_by: String,
 }
 
+/// How many of a `SelectionGroup`'s member Rules must be satisfied for the
+/// group as a whole to be satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionConstraint {
+    /// Every member rule must be satisfied.
+    All,
+    /// At least `n` of the member rules must be satisfied.
+    AtLeast(u32),
+}
+
+impl SelectionConstraint {
+    fn as_str(self) -> &'static str {
+        match self {
+            SelectionConstraint::All => "all",
+            SelectionConstraint::AtLeast(_) => "at_least",
+        }
+    }
+
+    fn threshold(self) -> Option<i64> {
+        match self {
+            SelectionConstraint::All => None,
+            SelectionConstraint::AtLeast(n) => Some(n as i64),
+        }
+    }
+
+    fn from_row(constraint_type: &str, threshold: Option<i64>) -> Self {
+        match constraint_type {
+            "all" => SelectionConstraint::All,
+            "at_least" => {
+                SelectionConstraint::AtLeast(threshold.unwrap_or_else(|| {
+                    panic!("stored \"at_least\" selection_group has no threshold")
+                }) as u32)
+            }
+            other => panic!(
+                "stored selection_group constraint_type {other:?} is not \"all\" or \"at_least\""
+            ),
+        }
+    }
+}
+
+/// A cardinality constraint over a set of relationship-shaped Rules on one
+/// Subject -- e.g. "a complete DataProduct must satisfy every rule in this
+/// group" (`All`) or "at least 2 of these 3" (`AtLeast(2)`). Backs
+/// `validate_completeness`. Distinct from a single Rule's own
+/// `cardinality` field, which constrains how many *instances* of one
+/// relationship must exist -- a `SelectionGroup` instead picks out which
+/// subset of several *different* rules must hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionGroup {
+    pub id: String,
+    pub subject_id: String,
+    pub description: String,
+    pub constraint: SelectionConstraint,
+    pub member_rule_ids: Vec<String>,
+}
+
 fn schema_ddl() -> &'static str {
     "
     CREATE TABLE sources (
@@ -393,6 +450,21 @@ fn schema_ddl() -> &'static str {
         status TEXT NOT NULL DEFAULT 'active',
         confirmed_by TEXT NOT NULL,
         PRIMARY KEY (rule_a_id, rule_b_id)
+    );
+
+    CREATE TABLE selection_groups (
+        id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL REFERENCES subjects(id),
+        description TEXT NOT NULL,
+        constraint_type TEXT NOT NULL,
+        threshold INTEGER
+    );
+    CREATE INDEX idx_selection_groups_subject ON selection_groups(subject_id);
+
+    CREATE TABLE selection_group_members (
+        group_id TEXT NOT NULL REFERENCES selection_groups(id),
+        rule_id TEXT NOT NULL REFERENCES rules(id),
+        PRIMARY KEY (group_id, rule_id)
     );
     "
 }
@@ -627,6 +699,16 @@ pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub fn rule_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<Rule>> {
+    let cols = qualified_rule_columns();
+    conn.query_row(
+        &format!("SELECT {cols} FROM rules WHERE rules.id = ?1"),
+        params![id],
+        rule_from_row,
+    )
+    .optional()
 }
 
 /// Every rule about `subject_id` -- either as its primary subject or as
@@ -1165,6 +1247,129 @@ pub fn validate_relationship(
     with_sources(conn, rules)
 }
 
+const SELECTION_GROUP_COLUMNS: &str = "id, subject_id, description, constraint_type, threshold";
+
+fn selection_group_from_row(row: &rusqlite::Row) -> rusqlite::Result<SelectionGroup> {
+    let constraint_type: String = row.get(3)?;
+    let threshold: Option<i64> = row.get(4)?;
+    Ok(SelectionGroup {
+        id: row.get(0)?,
+        subject_id: row.get(1)?,
+        description: row.get(2)?,
+        constraint: SelectionConstraint::from_row(&constraint_type, threshold),
+        member_rule_ids: Vec::new(),
+    })
+}
+
+/// Inserts a `SelectionGroup` and its member-rule links in one call --
+/// there's no standalone "add a member later" path since every group this
+/// model needs so far has its membership fixed at authoring time.
+pub fn insert_selection_group(conn: &Connection, group: &SelectionGroup) -> rusqlite::Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO selection_groups ({SELECTION_GROUP_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)"
+        ),
+        params![
+            group.id,
+            group.subject_id,
+            group.description,
+            group.constraint.as_str(),
+            group.constraint.threshold(),
+        ],
+    )?;
+    for rule_id in &group.member_rule_ids {
+        conn.execute(
+            "INSERT INTO selection_group_members (group_id, rule_id) VALUES (?1, ?2)",
+            params![group.id, rule_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every `SelectionGroup` defined on `subject_id`, with member rule ids
+/// populated (ordered by rule id).
+pub fn selection_groups_for_subject(
+    conn: &Connection,
+    subject_id: &str,
+) -> rusqlite::Result<Vec<SelectionGroup>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECTION_GROUP_COLUMNS} FROM selection_groups WHERE subject_id = ?1 ORDER BY id"
+    ))?;
+    let mut groups: Vec<SelectionGroup> = stmt
+        .query_map(params![subject_id], selection_group_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut members_stmt = conn.prepare(
+        "SELECT rule_id FROM selection_group_members WHERE group_id = ?1 ORDER BY rule_id",
+    )?;
+    for group in &mut groups {
+        group.member_rule_ids = members_stmt
+            .query_map(params![group.id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    Ok(groups)
+}
+
+/// One `SelectionGroup`'s outcome against a supplied set of "present"
+/// element references -- both the raw per-member satisfaction (so a
+/// caller can report *which* members are missing, not just pass/fail) and
+/// the group's overall verdict per its `SelectionConstraint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletenessFinding {
+    pub group: SelectionGroup,
+    /// Each member rule, the Source that issued it, and whether its
+    /// related subject was found in the presence set.
+    pub members: Vec<(Rule, Source, bool)>,
+    pub satisfied_count: usize,
+    pub is_satisfied: bool,
+}
+
+/// Evaluates every `SelectionGroup` defined on `subject_id` against
+/// `present`, a caller-supplied set of what's actually present in the
+/// model being checked. Each member rule's `related_subject_id` is
+/// matched against `present` by id first, then by short name -- whichever
+/// the caller happens to know. A member rule with no `related_subject_id`
+/// can't be checked this way and always counts as satisfied, since
+/// there's nothing external for the caller to have supplied.
+pub fn evaluate_completeness(
+    conn: &Connection,
+    subject_id: &str,
+    present: &HashSet<String>,
+) -> rusqlite::Result<Vec<CompletenessFinding>> {
+    let groups = selection_groups_for_subject(conn, subject_id)?;
+    let mut findings = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut members = Vec::with_capacity(group.member_rule_ids.len());
+        for rule_id in &group.member_rule_ids {
+            let rule = rule_by_id(conn, rule_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let source =
+                source_by_id(conn, &rule.source_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let satisfied = match &rule.related_subject_id {
+                None => true,
+                Some(related_id) if present.contains(related_id) => true,
+                Some(related_id) => {
+                    let related = subject_by_id(conn, related_id)?
+                        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                    present.contains(&related.short_name)
+                }
+            };
+            members.push((rule, source, satisfied));
+        }
+        let satisfied_count = members.iter().filter(|(_, _, ok)| *ok).count();
+        let is_satisfied = match group.constraint {
+            SelectionConstraint::All => satisfied_count == members.len(),
+            SelectionConstraint::AtLeast(n) => satisfied_count >= n as usize,
+        };
+        findings.push(CompletenessFinding {
+            group,
+            members,
+            satisfied_count,
+            is_satisfied,
+        });
+    }
+    Ok(findings)
+}
+
 /// Seeds a real UDRA authority chain: a data mesh standard (root) ->
 /// Army UDRA -> the org's UDRA implementation -> two subordinate orgs
 /// (siblings) implementing under it. Exercises `DELEGATED` (the schema
@@ -1471,6 +1676,24 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
             relation_type: RelationType::Implements,
             status: RelationStatus::Active,
             confirmed_by: "org-data-governance-board@example.org".into(),
+        },
+    )
+    .map_err(to_string_err)?;
+
+    // A complete Data Product must both expose a Data Contract and realize
+    // the Data Mesh concept it specializes -- `All`, not just "one or the
+    // other". Reuses the two existing relationship-shaped rules on
+    // `udra.DataProduct` rather than inventing test-only fixtures.
+    insert_selection_group(
+        conn,
+        &SelectionGroup {
+            id: "selgrp.data-product-complete".into(),
+            subject_id: "udra.DataProduct".into(),
+            description: "A complete Data Product exposes a Data Contract and realizes the \
+                           Data Mesh Data Product concept."
+                .into(),
+            constraint: SelectionConstraint::All,
+            member_rule_ids: vec!["rule.dm.002".into(), "rule.dm.003".into()],
         },
     )
     .map_err(to_string_err)?;
@@ -2008,5 +2231,98 @@ mod tests {
             evaluate_machine_check("not json", &props),
             CheckResult::Warning(_)
         ));
+    }
+
+    #[test]
+    fn selection_groups_for_subject_returns_seeded_group_with_members() {
+        let conn = seeded();
+        let groups = selection_groups_for_subject(&conn, "udra.DataProduct").unwrap();
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.id, "selgrp.data-product-complete");
+        assert_eq!(group.constraint, SelectionConstraint::All);
+        assert_eq!(
+            group.member_rule_ids,
+            vec!["rule.dm.002".to_string(), "rule.dm.003".to_string()]
+        );
+    }
+
+    #[test]
+    fn selection_groups_for_subject_empty_when_none_defined() {
+        let conn = seeded();
+        let groups = selection_groups_for_subject(&conn, "udra.DataContract").unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn evaluate_completeness_all_satisfied_when_present_set_covers_every_member() {
+        let conn = seeded();
+        let present: HashSet<String> = ["udra.DataContract".to_string(), "DataProduct".to_string()]
+            .into_iter()
+            .collect();
+        let findings = evaluate_completeness(&conn, "udra.DataProduct", &present).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].is_satisfied);
+        assert_eq!(findings[0].satisfied_count, 2);
+    }
+
+    #[test]
+    fn evaluate_completeness_matches_present_set_by_short_name_too() {
+        let conn = seeded();
+        // "DataContract" (short name) instead of "udra.DataContract" (id),
+        // and the data_mesh DataProduct's short name for the other member.
+        let present: HashSet<String> = ["DataContract".to_string(), "DataProduct".to_string()]
+            .into_iter()
+            .collect();
+        let findings = evaluate_completeness(&conn, "udra.DataProduct", &present).unwrap();
+        assert!(findings[0].is_satisfied);
+    }
+
+    #[test]
+    fn evaluate_completeness_reports_missing_member_and_group_not_satisfied() {
+        let conn = seeded();
+        let present: HashSet<String> = ["udra.DataContract".to_string()].into_iter().collect();
+        let findings = evaluate_completeness(&conn, "udra.DataProduct", &present).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].is_satisfied);
+        assert_eq!(findings[0].satisfied_count, 1);
+        let unsatisfied: Vec<_> = findings[0]
+            .members
+            .iter()
+            .filter(|(_, _, ok)| !ok)
+            .collect();
+        assert_eq!(unsatisfied.len(), 1);
+        assert_eq!(unsatisfied[0].0.id, "rule.dm.003");
+    }
+
+    #[test]
+    fn evaluate_completeness_no_groups_defined_is_empty_not_an_error() {
+        let conn = seeded();
+        let findings = evaluate_completeness(&conn, "udra.DataContract", &HashSet::new()).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn evaluate_completeness_at_least_constraint_satisfied_by_a_subset() {
+        let conn = seeded();
+        insert_selection_group(
+            &conn,
+            &SelectionGroup {
+                id: "selgrp.test-at-least".into(),
+                subject_id: "udra.DataProduct".into(),
+                description: "test-only: at least one of the two relationship rules".into(),
+                constraint: SelectionConstraint::AtLeast(1),
+                member_rule_ids: vec!["rule.dm.002".into(), "rule.dm.003".into()],
+            },
+        )
+        .unwrap();
+        let present: HashSet<String> = ["udra.DataContract".to_string()].into_iter().collect();
+        let findings = evaluate_completeness(&conn, "udra.DataProduct", &present).unwrap();
+        let at_least_finding = findings
+            .iter()
+            .find(|f| f.group.id == "selgrp.test-at-least")
+            .unwrap();
+        assert!(at_least_finding.is_satisfied);
+        assert_eq!(at_least_finding.satisfied_count, 1);
     }
 }

@@ -13,7 +13,7 @@ gate). This started as a vertical slice proving that model end-to-end with
 two MCP tools and is growing incrementally toward the previous model's full
 surface (tracked in
 [rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)) —
-13 tools so far. See `src/store.rs`'s own module doc comment for the full
+15 tools so far. See `src/store.rs`'s own module doc comment for the full
 account of what forced this design and `src/main.rs`'s for the exact,
 currently-maintained tool list — it's kept current as tools land; this file
 summarizes it rather than duplicating it in detail.
@@ -58,10 +58,12 @@ Single binary crate, three modules:
   seed/import selection.
 - `store.rs` — everything persistence and domain-logic: schema setup
   (`open_store`), every `insert_*`/query function, the `Source`/`Subject`/
-  `Rule`/`RuleRelation`/etc. types, DAG traversal and cycle rejection
-  (`ancestors_of`, `insert_source_authority_edge`), the two-tier
-  conflict-candidate query, supersession-cascade logic, and the hand-seeded
-  illustrative UDRA dataset (`seed_udra`).
+  `Rule`/`RuleRelation`/`SelectionGroup`/etc. types, DAG traversal and cycle
+  rejection (`ancestors_of`, `insert_source_authority_edge`), the two-tier
+  conflict-candidate query, supersession-cascade logic, machine-check
+  evaluation (`evaluate_machine_check`), completeness evaluation
+  (`evaluate_completeness`), and the hand-seeded illustrative UDRA dataset
+  (`seed_udra`).
 - `knowledge_mcp_import_v2.rs` — translates a real `knowledge-mcp` SQLite
   file's rows into `store.rs`'s own `insert_*` functions, since the two
   on-disk schemas don't match (the old schema's `domain_layers` has no
@@ -116,22 +118,23 @@ tradeoffs.
 ## Non-goals
 Deliberately out of scope, not silently dropped:
 - The previous model's full 15-tool surface (`lookup_construct`,
-  `validate_element`, `search_knowledge`, etc.) — built around the schema
-  this replaces; re-porting individual tools onto the new model is
-  follow-up work, tracked separately, not assumed to happen automatically.
+  `search_knowledge`, etc.) — built around the schema this replaces;
+  re-porting individual tools onto the new model is follow-up work, tracked
+  separately, not assumed to happen automatically. `search_knowledge` is the
+  one tool left in #55, needing a fresh design decision rather than a
+  direct re-port, since its old FTS5/`sqlite-vec` infrastructure was removed
+  entirely along with the schema this replaces.
 - File-backed persistence (`KNOWLEDGE_DB_PATH`) — the previous model had
   this; the current one is in-memory only until a real case needs it back.
 - Search (FTS5/`sqlite-vec` hybrid retrieval, the `Embedder` trait) — same
   reasoning; nothing in the current tool surface needs it yet.
-- `SelectionGroup` (cardinality constraints over a set of Rules) and
-  `RuleDerivation` (firewalled, non-authoritative rollup views) — both
-  specified in the fuller seven-table design this was built from, neither
-  implemented, since nothing in the current tool surface needs them yet
-  (`validate_completeness`, tracked in #55, is the tool that will need
-  `SelectionGroup`). Not a gap discovered late — a deliberate "don't add a
-  construct before a second real case needs it" call, same as everything
-  else in this
-  model's design history.
+- `RuleDerivation` (firewalled, non-authoritative rollup views) — specified
+  in the fuller seven-table design this was built from, not implemented,
+  since nothing in the current tool surface needs it. (`SelectionGroup`,
+  specified alongside it, *is* now implemented — it backs
+  `validate_completeness`.) Not a gap discovered late — a deliberate "don't
+  add a construct before a real case needs it" call, same as everything
+  else in this model's design history.
 - A `Store` trait / port-adapter abstraction for persistence — see
   Boundaries above; introduce one when a second real implementation
   actually needs it, not before.
