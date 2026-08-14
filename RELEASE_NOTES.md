@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Implement RuleDerivation (firewalled, non-authoritative rollups)
-**2026-08-14**
+## PR #63 — Implement RuleDerivation (firewalled, non-authoritative rollups)
+**2026-08-14** · [#63](https://github.com/Rusty-Mill/rusty_knowledge/pull/63)
 
 - **Added:** `RuleDerivation` -- the last piece of the fuller seven-table
   design this model was built from, and a new `lookup_derived_summary`
