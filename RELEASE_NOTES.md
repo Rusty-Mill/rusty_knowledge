@@ -5,6 +5,24 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #62 — File-backed persistence (KNOWLEDGE_DB_PATH)
+**2026-08-14** · [#62](https://github.com/Rusty-Mill/rusty_knowledge/pull/62)
+
+- **Added:** `KNOWLEDGE_DB_PATH` env var -- when set, the server opens
+  (or creates) a SQLite file at that path instead of the default
+  in-memory store, so data survives process restarts. Unset behavior is
+  unchanged: fresh in-memory store every run.
+- New `store.rs` functions: `open_store_at(path)` (schema DDL is now
+  entirely `IF NOT EXISTS`, so reopening an existing file is safe and
+  doesn't touch data already there) and `is_empty(conn)`. Seed/import
+  only ever runs against an empty store -- reopening a file that already
+  has data from a previous run leaves it alone instead of re-seeding into
+  primary-key conflicts on `seed_udra`'s fixed illustrative ids.
+- README/ARCHITECTURE.md updated; this closes one of the two
+  previous-model capabilities `ARCHITECTURE.md`'s non-goals listed as
+  "not carried forward yet" (the other, vector/hybrid search, remains a
+  deliberate non-goal).
+
 ## PR #61 — Multi-parent-authority DAG stress test
 **2026-08-14** · [#61](https://github.com/Rusty-Mill/rusty_knowledge/pull/61)
 
