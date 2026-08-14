@@ -28,12 +28,24 @@ goal.
 
 ## What's implemented
 
-This is a vertical slice proving the model end-to-end, not a full tool
-surface. Two MCP tools:
+Growing incrementally from the original two-tool vertical slice toward the
+previous model's full surface (tracked in
+[rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)).
+Eight MCP tools so far:
 
 - `lookup_subject` — everything the full authority chain says about a
   subject: every `Rule` that names it (directly, or as the target of a
   relationship claim), each labeled with the `Source` that issued it.
+- `lookup_rules` — plain statement rules for a subject (excludes
+  relationship claims), optionally filtered by binding strength.
+- `lookup_relationships` — outgoing relationship claims from a subject,
+  optionally filtered by relationship type.
+- `lookup_domain_summary` — subject counts (overall and by type) and the
+  Source(s) that root a domain.
+- `search_constructs` — list/filter subjects within a domain by type.
+- `meta_list_domains` — every domain tag in use, with counts and root
+  Sources.
+- `meta_routing_guide` — query routing guidance.
 - `crosscut_conflicts` — conflict-registry status for a subject: confirmed,
   active `conflicts_with` relations between its rules, plus candidate pairs
   (same subject, different Sources, no confirmed relation yet) needing human

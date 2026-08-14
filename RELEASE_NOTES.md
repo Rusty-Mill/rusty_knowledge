@@ -5,6 +5,29 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Six more tools ported onto the v2 model (rusty_knowledge#55, part 1)
+**2026-08-14** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+
+- **Added:** `lookup_rules`, `lookup_relationships`, `lookup_domain_summary`,
+  `search_constructs`, `meta_list_domains`, `meta_routing_guide` — six of
+  the fourteen tools tracked by #55 as unblocked by the v2 model. Tool
+  surface goes from 2 to 8.
+- New `store.rs` query functions backing them: `all_sources`,
+  `list_domains`, `subjects_in_domain`, `domain_summary`,
+  `statement_rules_for_subject` (plain statement rules, excludes
+  relationship claims), `outgoing_relationships` (relationship claims
+  only, the complementary half).
+- `lookup_rules` filters by `binding_strength`, reusing the
+  `BindingStrength::parse`/`from_str` split already in `store.rs` (added
+  back after being trimmed for having no caller in the original vertical
+  slice — now it has one).
+- `seed_udra`'s illustrative dataset gained one relationship-shaped rule
+  (`udra.DataProduct` --exposes--> `udra.DataContract`) — previously zero
+  existed, which meant `lookup_relationships` would have had nothing real
+  to demonstrate or test against.
+- README/ARCHITECTURE.md updated for the 8-tool surface and to point at
+  #55 as the tracking issue for the rest.
+
 ## PR #54 — Remove unused Cargo.toml dependencies
 **2026-08-14** · [#54](https://github.com/Rusty-Mill/rusty_knowledge/pull/54)
 

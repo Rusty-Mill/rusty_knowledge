@@ -294,6 +294,8 @@ pub fn open_store() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+const SOURCE_COLUMNS: &str = "id, name, kind, domain_tags, steward, citation, supersedes_source_id";
+
 fn source_from_row(row: &rusqlite::Row) -> rusqlite::Result<Source> {
     let domain_tags_json: String = row.get(3)?;
     Ok(Source {
@@ -310,8 +312,7 @@ fn source_from_row(row: &rusqlite::Row) -> rusqlite::Result<Source> {
 pub fn insert_source(conn: &Connection, source: &Source) -> rusqlite::Result<()> {
     let domain_tags_json = serde_json::to_string(&source.domain_tags).unwrap_or_default();
     conn.execute(
-        "INSERT INTO sources (id, name, kind, domain_tags, steward, citation, supersedes_source_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        &format!("INSERT INTO sources ({SOURCE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
         params![
             source.id,
             source.name,
@@ -325,10 +326,17 @@ pub fn insert_source(conn: &Connection, source: &Source) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// Every `Source`, ordered by id -- backs `meta_list_domains` and
+/// `lookup_domain_summary`'s "which Sources root this domain" question,
+/// since `domain_tags` is only ever populated on root Sources.
+pub fn all_sources(conn: &Connection) -> rusqlite::Result<Vec<Source>> {
+    let mut stmt = conn.prepare(&format!("SELECT {SOURCE_COLUMNS} FROM sources ORDER BY id"))?;
+    stmt.query_map([], source_from_row)?.collect()
+}
+
 pub fn source_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<Source>> {
     conn.query_row(
-        "SELECT id, name, kind, domain_tags, steward, citation, supersedes_source_id
-         FROM sources WHERE id = ?1",
+        &format!("SELECT {SOURCE_COLUMNS} FROM sources WHERE id = ?1"),
         params![id],
         source_from_row,
     )
@@ -523,21 +531,31 @@ pub fn rules_for_subject(
 ) -> rusqlite::Result<Vec<(Rule, Source)>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {cols} FROM rules WHERE subject_id = ?1 OR related_subject_id = ?1 ORDER BY id",
-        cols = RULE_COLUMNS
-            .split(", ")
-            .map(|c| format!("rules.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        cols = qualified_rule_columns()
     ))?;
     let rules: Vec<Rule> = stmt
         .query_map(params![subject_id], rule_from_row)?
         .collect::<rusqlite::Result<_>>()?;
+    with_sources(conn, rules)
+}
 
+fn qualified_rule_columns() -> String {
+    RULE_COLUMNS
+        .split(", ")
+        .map(|c| format!("rules.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Joins each `Rule` with the `Source` that issued it. A Rule's
+/// `source_id` is a required FK -- an absent Source is a data-integrity
+/// bug, not a normal empty result, so this errors rather than silently
+/// dropping the row.
+fn with_sources(conn: &Connection, rules: Vec<Rule>) -> rusqlite::Result<Vec<(Rule, Source)>> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
-        let source = source_by_id(conn, &rule.source_id)?.ok_or_else(|| {
-            rusqlite::Error::QueryReturnedNoRows // a Rule's source_id is a required FK; absence is a data-integrity bug, not a normal empty result
-        })?;
+        let source =
+            source_by_id(conn, &rule.source_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         out.push((rule, source));
     }
     Ok(out)
@@ -649,6 +667,175 @@ pub fn conflict_candidates_for_subject(
         }
     }
     Ok(out)
+}
+
+/// A domain tag with its subject count and the Sources that root it
+/// (`domain_tags` is only ever populated on root Sources -- see `Source`'s
+/// own doc comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainInfo {
+    pub domain_tag: String,
+    pub subject_count: i64,
+    pub root_sources: Vec<Source>,
+}
+
+/// Every distinct `domain_tag` in use, derived from `subjects` (there's no
+/// `Domain` table in this model -- "Domain is a tag, not a table").
+pub fn list_domains(conn: &Connection) -> rusqlite::Result<Vec<DomainInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT domain_tag, COUNT(*) FROM subjects GROUP BY domain_tag ORDER BY domain_tag",
+    )?;
+    let counts: Vec<(String, i64)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let sources = all_sources(conn)?;
+    Ok(counts
+        .into_iter()
+        .map(|(domain_tag, subject_count)| {
+            let root_sources = sources
+                .iter()
+                .filter(|s| s.domain_tags.iter().any(|t| t == &domain_tag))
+                .cloned()
+                .collect();
+            DomainInfo {
+                domain_tag,
+                subject_count,
+                root_sources,
+            }
+        })
+        .collect())
+}
+
+/// Every `Subject` in `domain_tag`, optionally narrowed to one
+/// `subject_type`, ordered by short name.
+pub fn subjects_in_domain(
+    conn: &Connection,
+    domain_tag: &str,
+    subject_type: Option<&str>,
+) -> rusqlite::Result<Vec<Subject>> {
+    match subject_type {
+        Some(subject_type) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SUBJECT_COLUMNS} FROM subjects \
+                 WHERE domain_tag = ?1 AND subject_type = ?2 ORDER BY short_name"
+            ))?;
+            stmt.query_map(params![domain_tag, subject_type], subject_from_row)?
+                .collect()
+        }
+        None => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SUBJECT_COLUMNS} FROM subjects WHERE domain_tag = ?1 ORDER BY short_name"
+            ))?;
+            stmt.query_map(params![domain_tag], subject_from_row)?
+                .collect()
+        }
+    }
+}
+
+/// Overview of a domain: how many Subjects it has (broken down by
+/// `subject_type`) and which Sources root it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainSummary {
+    pub domain_tag: String,
+    pub subject_count: i64,
+    pub subject_count_by_type: Vec<(String, i64)>,
+    pub root_sources: Vec<Source>,
+}
+
+/// Always returns a summary, even for a `domain_tag` with zero subjects
+/// and zero root Sources -- `domain_tag` isn't a first-class, validated
+/// entity in this model (any string is a valid key), so "not found" is a
+/// call for the tool layer to make from an empty result, not this
+/// function.
+pub fn domain_summary(conn: &Connection, domain_tag: &str) -> rusqlite::Result<DomainSummary> {
+    let subject_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM subjects WHERE domain_tag = ?1",
+        params![domain_tag],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT subject_type, COUNT(*) FROM subjects WHERE domain_tag = ?1 \
+         GROUP BY subject_type ORDER BY subject_type",
+    )?;
+    let subject_count_by_type = stmt
+        .query_map(params![domain_tag], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let root_sources = all_sources(conn)?
+        .into_iter()
+        .filter(|s| s.domain_tags.iter().any(|t| t == domain_tag))
+        .collect();
+    Ok(DomainSummary {
+        domain_tag: domain_tag.to_string(),
+        subject_count,
+        subject_count_by_type,
+        root_sources,
+    })
+}
+
+/// Plain statement rules about `subject_id` -- excludes relationship
+/// claims (`related_subject_id` set; see `outgoing_relationships`) and
+/// rules where this subject is only the *target* of someone else's claim
+/// (see `rules_for_subject` for the union of both). Optionally filtered
+/// to one `binding_strength`.
+pub fn statement_rules_for_subject(
+    conn: &Connection,
+    subject_id: &str,
+    binding_strength: Option<BindingStrength>,
+) -> rusqlite::Result<Vec<(Rule, Source)>> {
+    let cols = qualified_rule_columns();
+    let rules: Vec<Rule> = match binding_strength {
+        Some(bs) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM rules \
+                 WHERE subject_id = ?1 AND related_subject_id IS NULL AND binding_strength = ?2 \
+                 ORDER BY id"
+            ))?;
+            stmt.query_map(params![subject_id, bs.as_str()], rule_from_row)?
+                .collect::<rusqlite::Result<_>>()?
+        }
+        None => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM rules \
+                 WHERE subject_id = ?1 AND related_subject_id IS NULL ORDER BY id"
+            ))?;
+            stmt.query_map(params![subject_id], rule_from_row)?
+                .collect::<rusqlite::Result<_>>()?
+        }
+    };
+    with_sources(conn, rules)
+}
+
+/// Outgoing relationship claims from `subject_id` (`related_subject_id`
+/// set), optionally filtered to one `relationship_type`.
+pub fn outgoing_relationships(
+    conn: &Connection,
+    subject_id: &str,
+    relationship_type: Option<&str>,
+) -> rusqlite::Result<Vec<(Rule, Source)>> {
+    let cols = qualified_rule_columns();
+    let rules: Vec<Rule> = match relationship_type {
+        Some(rel_type) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM rules \
+                 WHERE subject_id = ?1 AND related_subject_id IS NOT NULL \
+                 AND relationship_type = ?2 ORDER BY id"
+            ))?;
+            stmt.query_map(params![subject_id, rel_type], rule_from_row)?
+                .collect::<rusqlite::Result<_>>()?
+        }
+        None => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM rules \
+                 WHERE subject_id = ?1 AND related_subject_id IS NOT NULL ORDER BY id"
+            ))?;
+            stmt.query_map(params![subject_id], rule_from_row)?
+                .collect::<rusqlite::Result<_>>()?
+        }
+    };
+    with_sources(conn, rules)
 }
 
 /// Seeds a real UDRA authority chain: a data mesh standard (root) ->
@@ -781,6 +968,22 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
             relationship_type: None,
             cardinality: None,
             statement: "A data product must have a clearly defined, accountable owner.".into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.dm.002".into(),
+            source_id: "src.data-mesh-principles".into(),
+            subject_id: "udra.DataProduct".into(),
+            related_subject_id: Some("udra.DataContract".into()),
+            relationship_type: Some("exposes".into()),
+            cardinality: Some("1..*".into()),
+            statement: "A data product exposes one or more data contracts.".into(),
             machine_check: None,
             binding_strength: BindingStrength::Must,
             supersedes_rule_id: None,
@@ -1117,5 +1320,110 @@ mod tests {
             confirmed.is_empty(),
             "the relation should have gone stale, not stayed active, once its rule was superseded"
         );
+    }
+
+    #[test]
+    fn list_domains_reports_seeded_udra_domain() {
+        let conn = seeded();
+        let domains = list_domains(&conn).unwrap();
+        let udra = domains
+            .iter()
+            .find(|d| d.domain_tag == "udra")
+            .expect("udra domain should be present");
+        assert_eq!(udra.subject_count, 2);
+        assert!(
+            udra.root_sources
+                .iter()
+                .any(|s| s.id == "src.data-mesh-principles")
+        );
+    }
+
+    #[test]
+    fn subjects_in_domain_filters_by_subject_type() {
+        let conn = seeded();
+        let all = subjects_in_domain(&conn, "udra", None).unwrap();
+        assert_eq!(all.len(), 2);
+        let concepts = subjects_in_domain(&conn, "udra", Some("concept")).unwrap();
+        assert_eq!(concepts.len(), 2);
+        let none = subjects_in_domain(&conn, "udra", Some("no-such-type")).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn domain_summary_reports_counts_and_root_sources() {
+        let conn = seeded();
+        let summary = domain_summary(&conn, "udra").unwrap();
+        assert_eq!(summary.subject_count, 2);
+        assert!(
+            summary
+                .subject_count_by_type
+                .contains(&("concept".to_string(), 2))
+        );
+        assert!(
+            summary
+                .root_sources
+                .iter()
+                .any(|s| s.id == "src.data-mesh-principles")
+        );
+    }
+
+    #[test]
+    fn domain_summary_unknown_domain_is_empty_not_an_error() {
+        let conn = seeded();
+        let summary = domain_summary(&conn, "no-such-domain").unwrap();
+        assert_eq!(summary.subject_count, 0);
+        assert!(summary.root_sources.is_empty());
+    }
+
+    #[test]
+    fn statement_rules_for_subject_excludes_relationship_claims() {
+        let conn = seeded();
+        let rules = statement_rules_for_subject(&conn, "udra.DataProduct", None).unwrap();
+        assert!(rules.iter().all(|(r, _)| r.related_subject_id.is_none()));
+        assert!(!rules.iter().any(|(r, _)| r.id == "rule.dm.002"));
+    }
+
+    #[test]
+    fn statement_rules_for_subject_filters_by_binding_strength() {
+        let conn = seeded();
+        let must_rules =
+            statement_rules_for_subject(&conn, "udra.DataProduct", Some(BindingStrength::Must))
+                .unwrap();
+        assert!(
+            must_rules
+                .iter()
+                .all(|(r, _)| r.binding_strength == BindingStrength::Must)
+        );
+        let should_rules =
+            statement_rules_for_subject(&conn, "udra.DataProduct", Some(BindingStrength::Should))
+                .unwrap();
+        assert!(
+            should_rules
+                .iter()
+                .all(|(r, _)| r.binding_strength == BindingStrength::Should)
+        );
+        assert_ne!(must_rules.len(), should_rules.len());
+    }
+
+    #[test]
+    fn outgoing_relationships_returns_only_relationship_shaped_rules() {
+        let conn = seeded();
+        let relationships = outgoing_relationships(&conn, "udra.DataProduct", None).unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].0.id, "rule.dm.002");
+        assert_eq!(
+            relationships[0].0.related_subject_id.as_deref(),
+            Some("udra.DataContract")
+        );
+    }
+
+    #[test]
+    fn outgoing_relationships_filters_by_relationship_type() {
+        let conn = seeded();
+        let matching = outgoing_relationships(&conn, "udra.DataProduct", Some("exposes")).unwrap();
+        assert_eq!(matching.len(), 1);
+        let non_matching =
+            outgoing_relationships(&conn, "udra.DataProduct", Some("no-such-type")).unwrap();
+        assert!(non_matching.is_empty());
     }
 }

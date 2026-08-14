@@ -9,12 +9,14 @@ exact-lookup identity for what a rule is about, independent of who's making
 claims about it), `Rule` (the ground-truth statement — including
 relationship claims between two Subjects, and optional structured
 `machine_check` logic), and `RuleRelation` (the human-confirmed conflict
-gate). This is a vertical slice proving that model end-to-end, not a full
-tool surface: two MCP tools, `lookup_subject` and `crosscut_conflicts`. See
-`src/store.rs`'s own module doc comment for the full account of what forced
-this design and `src/main.rs`'s for the exact, currently-maintained tool
-list — it's kept current as tools land; this file summarizes it rather than
-duplicating it in detail.
+gate). This started as a vertical slice proving that model end-to-end with
+two MCP tools and is growing incrementally toward the previous model's full
+surface (tracked in
+[rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)) —
+eight tools so far. See `src/store.rs`'s own module doc comment for the full
+account of what forced this design and `src/main.rs`'s for the exact,
+currently-maintained tool list — it's kept current as tools land; this file
+summarizes it rather than duplicating it in detail.
 
 This replaces an earlier fixed 4-layer `AuthorityLayer`/`Construct` model
 (Standard / Tool Implementation / Conventions / Process), which categorized
@@ -52,7 +54,7 @@ and were not carried forward. Their `Cargo.toml` dependencies and the
 ## Structure
 Single binary crate, three modules:
 - `main.rs` — MCP transport and tool surface (`rmcp` over stdio): defines
-  `KnowledgeServer` and its two tools (`#[tool_router]`), and startup
+  `KnowledgeServer` and its tools (`#[tool_router]`), and startup
   seed/import selection.
 - `store.rs` — everything persistence and domain-logic: schema setup
   (`open_store`), every `insert_*`/query function, the `Source`/`Subject`/
@@ -120,13 +122,15 @@ Deliberately out of scope, not silently dropped:
 - File-backed persistence (`KNOWLEDGE_DB_PATH`) — the previous model had
   this; the current one is in-memory only until a real case needs it back.
 - Search (FTS5/`sqlite-vec` hybrid retrieval, the `Embedder` trait) — same
-  reasoning; nothing in the current two-tool surface needs it yet.
+  reasoning; nothing in the current tool surface needs it yet.
 - `SelectionGroup` (cardinality constraints over a set of Rules) and
   `RuleDerivation` (firewalled, non-authoritative rollup views) — both
   specified in the fuller seven-table design this was built from, neither
-  implemented, since nothing in this vertical slice's two tools needs them
-  yet. Not a gap discovered late — a deliberate "don't add a construct
-  before a second real case needs it" call, same as everything else in this
+  implemented, since nothing in the current tool surface needs them yet
+  (`validate_completeness`, tracked in #55, is the tool that will need
+  `SelectionGroup`). Not a gap discovered late — a deliberate "don't add a
+  construct before a second real case needs it" call, same as everything
+  else in this
   model's design history.
 - A `Store` trait / port-adapter abstraction for persistence — see
   Boundaries above; introduce one when a second real implementation
