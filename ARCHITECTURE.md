@@ -22,16 +22,23 @@ This replaces an earlier fixed 4-layer `AuthorityLayer`/`Construct` model
 (Standard / Tool Implementation / Conventions / Process), which categorized
 rules by *type* of authority and didn't fit domains — like UDRA — whose
 authority nests *organizationally* instead. That model's full 15-tool
-surface, file-backed persistence, and hybrid FTS5/`sqlite-vec` search are
-**not carried forward** — they were built around the schema this replaces
-and are deferred to follow-up work, not silently dropped.
+surface and hybrid FTS5/`sqlite-vec` search were **not carried forward
+as-is** — they were built around the schema this replaces; the tool
+surface has since been re-ported in full (see above), and lexical search
+was reintroduced (see Boundaries below), deliberately without the
+vector/hybrid component.
 
-The store is SQLite, in-memory only (no file-backed persistence option in
-this model yet). A real `knowledge-mcp` SQLite file can be imported via
-`knowledge_mcp_import_v2` — its schema isn't on-disk compatible with this
-crate's (see that module's doc comment for exactly what does and doesn't
-translate, and the one inferred cross-domain `SourceAuthority` edge it adds,
-explicitly disclosed rather than silently fabricated).
+The store is SQLite, either in-memory (default, fresh every run) or
+file-backed at `KNOWLEDGE_DB_PATH` (created if missing; reopening an
+existing file is safe since the schema DDL is idempotent). Seed/import
+only ever runs against an empty store (`store::is_empty`) — reopening a
+file that already has data from a previous run leaves it alone rather
+than re-seeding into primary-key conflicts. A real `knowledge-mcp` SQLite
+file can be imported via `knowledge_mcp_import_v2` — its schema isn't
+on-disk compatible with this crate's (see that module's doc comment for
+exactly what does and doesn't translate, and the one inferred cross-domain
+`SourceAuthority` edge it adds, explicitly disclosed rather than silently
+fabricated).
 
 ## Boundaries
 No port/adapter abstraction exists — `main.rs`'s `KnowledgeServer` calls
@@ -42,7 +49,7 @@ once a second backend actually needs one — none has, yet.
 
 | Port | Adapter(s) | Notes |
 | ---- | ---------- | ----- |
-| *(none)* | `store.rs` — SQLite via `rusqlite`, in-memory only | single implementation; not behind a trait |
+| *(none)* | `store.rs` — SQLite via `rusqlite`, in-memory or file-backed (`KNOWLEDGE_DB_PATH`) | single implementation; not behind a trait |
 
 There is no embedder boundary in this model -- the previous crate's
 `Embedder` trait (`rusty_embedder_core`, `NullEmbedder`/local/http backends)
@@ -109,10 +116,15 @@ need splitting further.
    Source (the authority working as intended, not an ambiguity).
 
 **Startup:**
-1. `store::open_store` creates a fresh in-memory schema.
-2. `KNOWLEDGE_MCP_IMPORT_PATH` set → `knowledge_mcp_import_v2::import_knowledge_mcp_db`
-   runs against that file; on failure, falls back to `store::seed_udra`.
-   Unset → `store::seed_udra` runs directly.
+1. `KNOWLEDGE_DB_PATH` set → `store::open_store_at` opens (or creates) that
+   file, with idempotent schema DDL. Unset → `store::open_store` creates a
+   fresh in-memory schema.
+2. `store::is_empty` decides whether to seed/import at all — a file
+   carrying data from a previous run is left alone. When the store is
+   empty: `KNOWLEDGE_MCP_IMPORT_PATH` set →
+   `knowledge_mcp_import_v2::import_knowledge_mcp_db` runs against that
+   file, falling back to `store::seed_udra` on failure; unset →
+   `store::seed_udra` runs directly.
 3. The MCP server starts serving over stdio.
 
 ## Key decisions
@@ -121,8 +133,6 @@ tradeoffs.
 
 ## Non-goals
 Deliberately out of scope, not silently dropped:
-- File-backed persistence (`KNOWLEDGE_DB_PATH`) — the previous model had
-  this; the current one is in-memory only until a real case needs it back.
 - Vector/hybrid search (the `Embedder` trait, `sqlite-vec`) — the previous
   model's hybrid FTS5+vector retrieval was built around the old schema and
   was not carried forward. `search_knowledge` is real in the current

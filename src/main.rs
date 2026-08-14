@@ -1070,41 +1070,63 @@ impl KnowledgeServer {
     }
 }
 
+/// `KNOWLEDGE_DB_PATH` set -> file-backed store at that path (created if
+/// it doesn't exist; reopening an existing file is safe, since
+/// `open_store_at`'s schema DDL is idempotent). Unset -> in-memory,
+/// exactly the previous behavior.
+fn open_store() -> rusqlite::Result<Connection> {
+    match std::env::var("KNOWLEDGE_DB_PATH") {
+        Ok(path) => {
+            let conn = store::open_store_at(std::path::Path::new(&path))?;
+            eprintln!("Using file-backed store at {path:?}.");
+            Ok(conn)
+        }
+        Err(_) => store::open_store(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let conn = store::open_store()?;
+    let conn = open_store()?;
 
-    match std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
-        Ok(path) => {
-            match knowledge_mcp_import_v2::import_knowledge_mcp_db(
-                &conn,
-                std::path::Path::new(&path),
-            ) {
-                Ok(report) => {
-                    eprintln!(
-                        "Imported {path:?}: {} source(s), {} authority edge(s), {} subject(s), \
-                         {} rule(s), {} row(s) skipped.",
-                        report.sources_imported,
-                        report.source_authority_edges_imported,
-                        report.subjects_imported,
-                        report.rules_imported,
-                        report.rows_skipped,
-                    );
-                    for disclosure in &report.disclosures {
-                        eprintln!("  {disclosure}");
+    if store::is_empty(&conn)? {
+        match std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
+            Ok(path) => {
+                match knowledge_mcp_import_v2::import_knowledge_mcp_db(
+                    &conn,
+                    std::path::Path::new(&path),
+                ) {
+                    Ok(report) => {
+                        eprintln!(
+                            "Imported {path:?}: {} source(s), {} authority edge(s), {} \
+                             subject(s), {} rule(s), {} row(s) skipped.",
+                            report.sources_imported,
+                            report.source_authority_edges_imported,
+                            report.subjects_imported,
+                            report.rules_imported,
+                            report.rows_skipped,
+                        );
+                        for disclosure in &report.disclosures {
+                            eprintln!("  {disclosure}");
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "Failed to import {path:?} ({err}); falling back to seeded UDRA data."
+                        );
+                        store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
                     }
                 }
-                Err(err) => {
-                    eprintln!(
-                        "Failed to import {path:?} ({err}); falling back to seeded UDRA data."
-                    );
-                    store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
-                }
+            }
+            Err(_) => {
+                store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
             }
         }
-        Err(_) => {
-            store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
-        }
+    } else {
+        eprintln!(
+            "Store already has data (file-backed persistence carried it over from a \
+             previous run); skipping seed/import."
+        );
     }
 
     eprintln!(
