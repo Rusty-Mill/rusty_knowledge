@@ -1,6 +1,7 @@
 //! Rusty Knowledge — an MCP server (via `rmcp`, stdio transport) over the
 //! knowledge-model-v2 store (`Source`/`SourceAuthority`/`Subject`/`Rule`/
-//! `RuleRelation`/`SelectionGroup`/`RuleDerivation`).
+//! `RuleRelation` -- see `store`'s module doc for the two tables the
+//! fuller design specifies but this doesn't implement yet).
 //!
 //! This is a vertical slice proving the redesigned model end-to-end, not
 //! a full port of the previous 15-tool surface. That surface was built
