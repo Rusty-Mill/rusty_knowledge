@@ -29,7 +29,7 @@
 //! follow-up work, not silently dropped.
 
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A rule or relationship's normative strength. `Delegated` means the
 /// issuing Source explicitly hands the decision to whichever Source(s)
@@ -217,6 +217,116 @@ pub struct Rule {
     pub machine_check: Option<String>,
     pub binding_strength: BindingStrength,
     pub supersedes_rule_id: Option<String>,
+}
+
+/// The structured shape a `Rule.machine_check` JSON blob can take.
+/// Internally tagged on `"check"`, e.g. `{"check":"pattern","property":
+/// "owner_email","pattern":"^[^@]+@[^@]+\\.[^@]+$"}`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "check", rename_all = "snake_case")]
+enum MachineCheck {
+    RequiredProperty {
+        property: String,
+    },
+    EnumValue {
+        property: String,
+        values: Vec<String>,
+    },
+    Pattern {
+        property: String,
+        pattern: String,
+    },
+    Range {
+        property: String,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+    },
+    /// Not evaluated -- always a `Warning`. `knowledge-mcp`'s own schema
+    /// allowed a `"custom"` check with no defined evaluation semantics;
+    /// this crate doesn't invent one, it just says so honestly rather
+    /// than silently treating it as a pass.
+    Custom,
+}
+
+/// The outcome of evaluating one `machine_check` against a real value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckResult {
+    Pass,
+    Fail(String),
+    Warning(String),
+}
+
+/// Evaluates a `Rule.machine_check` JSON blob against `properties` (a
+/// flat `name -> value` map of what's actually true for some real
+/// element). A missing property is always a `Fail` -- the check couldn't
+/// even run. A present-but-wrong value is a `Fail` for
+/// `required_property`/`enum_value`/`range` (hard structural violations)
+/// but only a `Warning` for `pattern` (style/format guidance is treated
+/// as advisory, not a hard block) -- same distinction `knowledge-mcp`'s
+/// own evaluator drew. An unparseable `machine_check` or an invalid regex
+/// pattern is a `Warning`, never a panic -- a malformed rule shouldn't
+/// take the whole validation call down.
+pub fn evaluate_machine_check(
+    check_json: &str,
+    properties: &HashMap<String, String>,
+) -> CheckResult {
+    let check: MachineCheck = match serde_json::from_str(check_json) {
+        Ok(check) => check,
+        Err(err) => return CheckResult::Warning(format!("machine_check is not valid JSON: {err}")),
+    };
+
+    match check {
+        MachineCheck::RequiredProperty { property } => {
+            if properties.contains_key(&property) {
+                CheckResult::Pass
+            } else {
+                CheckResult::Fail(format!("required property {property:?} is missing"))
+            }
+        }
+        MachineCheck::EnumValue { property, values } => match properties.get(&property) {
+            None => CheckResult::Fail(format!("required property {property:?} is missing")),
+            Some(value) if values.iter().any(|v| v == value) => CheckResult::Pass,
+            Some(value) => {
+                CheckResult::Fail(format!("{property:?} = {value:?} is not one of {values:?}"))
+            }
+        },
+        MachineCheck::Pattern { property, pattern } => match properties.get(&property) {
+            None => CheckResult::Fail(format!("required property {property:?} is missing")),
+            Some(value) => match rusty_regx::Regex::new(&pattern) {
+                Err(err) => CheckResult::Warning(format!("invalid pattern {pattern:?}: {err}")),
+                Ok(regex) if regex.is_match(value) => CheckResult::Pass,
+                Ok(_) => CheckResult::Warning(format!(
+                    "{property:?} = {value:?} does not match pattern {pattern:?}"
+                )),
+            },
+        },
+        MachineCheck::Range { property, min, max } => match properties.get(&property) {
+            None => CheckResult::Fail(format!("required property {property:?} is missing")),
+            Some(value) => match value.parse::<f64>() {
+                Err(_) => CheckResult::Fail(format!("{property:?} = {value:?} is not a number")),
+                Ok(number) => {
+                    if let Some(min) = min
+                        && number < min
+                    {
+                        return CheckResult::Fail(format!(
+                            "{property:?} = {number} is below minimum {min}"
+                        ));
+                    }
+                    if let Some(max) = max
+                        && number > max
+                    {
+                        return CheckResult::Fail(format!(
+                            "{property:?} = {number} is above maximum {max}"
+                        ));
+                    }
+                    CheckResult::Pass
+                }
+            },
+        },
+        MachineCheck::Custom => CheckResult::Warning("custom checks are not evaluated".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1776,5 +1886,127 @@ mod tests {
         )
         .unwrap();
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn evaluate_machine_check_required_property() {
+        let mut props = HashMap::new();
+        assert_eq!(
+            evaluate_machine_check(
+                r#"{"check":"required_property","property":"owner"}"#,
+                &props
+            ),
+            CheckResult::Fail("required property \"owner\" is missing".to_string())
+        );
+        props.insert("owner".to_string(), "alice".to_string());
+        assert_eq!(
+            evaluate_machine_check(
+                r#"{"check":"required_property","property":"owner"}"#,
+                &props
+            ),
+            CheckResult::Pass
+        );
+    }
+
+    #[test]
+    fn evaluate_machine_check_enum_value() {
+        let mut props = HashMap::new();
+        props.insert("status".to_string(), "active".to_string());
+        assert_eq!(
+            evaluate_machine_check(
+                r#"{"check":"enum_value","property":"status","values":["active","deprecated"]}"#,
+                &props
+            ),
+            CheckResult::Pass
+        );
+        props.insert("status".to_string(), "unknown".to_string());
+        assert!(matches!(
+            evaluate_machine_check(
+                r#"{"check":"enum_value","property":"status","values":["active","deprecated"]}"#,
+                &props
+            ),
+            CheckResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_machine_check_pattern_match_and_mismatch_is_warning_not_fail() {
+        let mut props = HashMap::new();
+        props.insert("email".to_string(), "a@b.com".to_string());
+        assert_eq!(
+            evaluate_machine_check(
+                r#"{"check":"pattern","property":"email","pattern":"^[^@]+@[^@]+\\.[^@]+$"}"#,
+                &props
+            ),
+            CheckResult::Pass
+        );
+        props.insert("email".to_string(), "not-an-email".to_string());
+        assert!(matches!(
+            evaluate_machine_check(
+                r#"{"check":"pattern","property":"email","pattern":"^[^@]+@[^@]+\\.[^@]+$"}"#,
+                &props
+            ),
+            CheckResult::Warning(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_machine_check_invalid_pattern_is_warning_not_a_panic() {
+        let mut props = HashMap::new();
+        props.insert("email".to_string(), "a@b.com".to_string());
+        assert!(matches!(
+            evaluate_machine_check(
+                r#"{"check":"pattern","property":"email","pattern":"(unclosed"}"#,
+                &props
+            ),
+            CheckResult::Warning(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_machine_check_range() {
+        let mut props = HashMap::new();
+        props.insert("priority".to_string(), "3".to_string());
+        assert_eq!(
+            evaluate_machine_check(
+                r#"{"check":"range","property":"priority","min":1,"max":5}"#,
+                &props
+            ),
+            CheckResult::Pass
+        );
+        props.insert("priority".to_string(), "10".to_string());
+        assert!(matches!(
+            evaluate_machine_check(
+                r#"{"check":"range","property":"priority","min":1,"max":5}"#,
+                &props
+            ),
+            CheckResult::Fail(_)
+        ));
+        props.insert("priority".to_string(), "not-a-number".to_string());
+        assert!(matches!(
+            evaluate_machine_check(
+                r#"{"check":"range","property":"priority","min":1,"max":5}"#,
+                &props
+            ),
+            CheckResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_machine_check_custom_is_warning() {
+        let props = HashMap::new();
+        assert!(matches!(
+            evaluate_machine_check(r#"{"check":"custom"}"#, &props),
+            CheckResult::Warning(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_machine_check_invalid_json_is_warning_not_a_panic() {
+        let props = HashMap::new();
+        assert!(matches!(
+            evaluate_machine_check("not json", &props),
+            CheckResult::Warning(_)
+        ));
     }
 }
