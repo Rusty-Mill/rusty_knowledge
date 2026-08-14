@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Real (Onyx) semantic embedder backend for search_knowledge
-**2026-08-14** · PR TBD
+## PR #67 — Real (Onyx) semantic embedder backend for search_knowledge
+**2026-08-14** · [#67](https://github.com/Rusty-Mill/rusty_knowledge/pull/67)
 
 - **Added:** `store::OnyxEmbedder`, a second, real `Embedder` implementation
   calling Onyx's cloud embeddings API (`POST /api/embeddings`, an
