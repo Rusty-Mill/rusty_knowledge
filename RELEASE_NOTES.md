@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Replace OnyxEmbedder with OllamaEmbedder (no API key needed)
-**2026-08-14** · PR TBD
+## PR #68 — Replace OnyxEmbedder with OllamaEmbedder (no API key needed)
+**2026-08-14** · [#68](https://github.com/Rusty-Mill/rusty_knowledge/pull/68)
 
 - **Corrected:** PR #67's `store::OnyxEmbedder` targeted Onyx's *cloud*
   embeddings API (`ai.onyx.dev`), which turned out to require
