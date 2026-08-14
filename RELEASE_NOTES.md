@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — SelectionGroup + validate_completeness (rusty_knowledge#55)
-**2026-08-14**
+## PR #59 — SelectionGroup + validate_completeness (rusty_knowledge#55)
+**2026-08-14** · [#59](https://github.com/Rusty-Mill/rusty_knowledge/pull/59)
 
 - **Added:** `validate_completeness` -- evaluates every `SelectionGroup`
   defined on a container/viewpoint subject against a caller-supplied set
