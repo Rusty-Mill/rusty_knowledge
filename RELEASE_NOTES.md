@@ -5,6 +5,29 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Live-verify OllamaEmbedder against a real Ollama server
+**2026-08-14** · PR TBD
+
+- **Verified, not just implemented:** installed a real Ollama server in
+  this development environment, pulled `all-minilm`, and confirmed
+  `store::OllamaEmbedder` end-to-end — both directly (a new
+  `ollama_embedder_live_semantic_similarity` test) and through the actual
+  MCP binary's `search_knowledge` tool over stdio, which returned real
+  results correctly labeled `"Ollama local embedding -- a real trained
+  semantic model"`.
+- New `ollama_embedder_live_semantic_similarity` test (`#[ignore]`d by
+  default, since CI and most dev environments don't have Ollama running):
+  embeds a sentence, a paraphrase, and an unrelated sentence, and asserts
+  the paraphrase scores a higher cosine similarity than the unrelated one
+  — a property `HashingEmbedder` structurally cannot have, and the actual
+  reason this backend exists. Opt in with `OLLAMA_EMBEDDING_MODEL=all-minilm
+  cargo test --all-features -- --ignored ollama_embedder_live`.
+- Doc comments (`OllamaEmbedder`'s own, and `ARCHITECTURE.md`'s former
+  "live-unverified" non-goal) updated to reflect that this has now
+  actually been proven to work, while staying honest that CI itself still
+  doesn't automate this check — the ignored test is a repeatable manual
+  verification, not a standing per-commit guarantee.
+
 ## PR #68 — Replace OnyxEmbedder with OllamaEmbedder (no API key needed)
 **2026-08-14** · [#68](https://github.com/Rusty-Mill/rusty_knowledge/pull/68)
 
