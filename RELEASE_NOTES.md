@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — File-backed persistence (KNOWLEDGE_DB_PATH)
-**2026-08-14**
+## PR #62 — File-backed persistence (KNOWLEDGE_DB_PATH)
+**2026-08-14** · [#62](https://github.com/Rusty-Mill/rusty_knowledge/pull/62)
 
 - **Added:** `KNOWLEDGE_DB_PATH` env var -- when set, the server opens
   (or creates) a SQLite file at that path instead of the default
