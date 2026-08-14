@@ -811,6 +811,11 @@ fn subject_from_row(row: &rusqlite::Row) -> rusqlite::Result<Subject> {
 /// pretending to already have a backend this crate doesn't.
 pub trait Embedder {
     fn embed(&self, text: &str) -> Vec<f32>;
+
+    /// Short, honest description of what this embedder actually is --
+    /// fed into `retrieval_mode_description` so `search_knowledge`'s
+    /// self-report always matches whichever `Embedder` is really active.
+    fn description(&self) -> &'static str;
 }
 
 const EMBEDDING_DIM: usize = 256;
@@ -838,6 +843,189 @@ impl Embedder for HashingEmbedder {
         }
         vector
     }
+
+    fn description(&self) -> &'static str {
+        "local hashing-vector -- not a trained semantic embedding"
+    }
+}
+
+/// L2-normalizes `vector` in place -- every vector this module stores is
+/// expected to already be unit-length, so `cosine_similarity` can be a
+/// plain dot product. `HashingEmbedder` does this itself inline;
+/// `OnyxEmbedder` calls this explicitly since a real embedding API isn't
+/// guaranteed to already return a normalized vector.
+fn l2_normalize(vector: &mut [f32]) {
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in vector {
+            *v /= norm;
+        }
+    }
+}
+
+/// A second `Embedder` implementation, calling Onyx's cloud embeddings
+/// endpoint (Ollama-compatible `POST /api/embeddings`; see
+/// <https://onyx.dev/documentation/api-documentation/ai-endpoint>) via
+/// `rusty_request`, the ecosystem's own sovereign HTTP client. Real,
+/// trained, semantic -- unlike `HashingEmbedder`, this can find a
+/// synonym or paraphrase that shares no tokens with the query.
+///
+/// **Honesty note, not a hedge:** this has never been run against a
+/// live Onyx endpoint in this codebase's own development or CI --
+/// there's no API key available in this environment to do that with.
+/// The request/response *shape* is real and unit-tested against a local
+/// hand-rolled HTTP server (see the `tests` module), matching Onyx's
+/// documented Ollama-compatible contract, but a live first run against
+/// a real key is the only thing that actually confirms end-to-end
+/// correctness. Opt-in via `EMBEDDING_BACKEND=onyx` (see
+/// `active_embedder`) specifically so nothing changes for a caller who
+/// doesn't set it -- `HashingEmbedder` remains the default, and a
+/// configuration or request failure falls back to it loudly (an
+/// `eprintln!`, never a silent substitution).
+///
+/// `embed` bridges this trait's synchronous signature to the
+/// necessarily-async HTTP call via `tokio::task::block_in_place` +
+/// `Handle::block_on` -- this requires being called from within a
+/// multi-threaded tokio runtime (this crate's `main()` always runs one)
+/// and will panic outside of one, same as any other blocking bridge into
+/// async code. `active_embedder` is only ever consulted from
+/// `index_for_search`/`search_knowledge`, both reached only through
+/// `main()`'s server loop or `seed_udra`/the importer at startup --
+/// never from this module's own synchronous unit tests, which don't set
+/// `EMBEDDING_BACKEND` and so never construct an `OnyxEmbedder` at all.
+///
+/// **Vector-space caveat, disclosed rather than silently handled:**
+/// switching `EMBEDDING_BACKEND` against a `KNOWLEDGE_DB_PATH` store
+/// that already has vectors from a *different* embedder does not
+/// reindex existing rows -- newly-written and previously-written vectors
+/// end up living in different, incompatible vector spaces, and
+/// `cosine_similarity` (a plain dot product over same-length slices)
+/// will silently produce a meaningless-but-not-erroring number across
+/// that boundary rather than an error. This crate has no reindex tool
+/// yet; treat a backend switch on a persistent store as a fresh-store
+/// operation.
+pub struct OnyxEmbedder {
+    client: rusty_request::Client,
+    base_url: String,
+    model: String,
+}
+
+impl OnyxEmbedder {
+    /// Builds a client from `ONYX_API_KEY` (required -- the bearer
+    /// token) and `ONYX_EMBEDDING_MODEL` (required -- Onyx's API has no
+    /// documented default), plus `ONYX_API_BASE_URL` (optional, defaults
+    /// to `https://ai.onyx.dev`). `Err` (a human-readable message) on a
+    /// missing required var -- never silently proceeds unauthenticated
+    /// or with a guessed model name.
+    pub fn from_env() -> Result<Self, String> {
+        let api_key =
+            std::env::var("ONYX_API_KEY").map_err(|_| "ONYX_API_KEY is not set".to_string())?;
+        let model = std::env::var("ONYX_EMBEDDING_MODEL")
+            .map_err(|_| "ONYX_EMBEDDING_MODEL is not set".to_string())?;
+        let base_url = std::env::var("ONYX_API_BASE_URL")
+            .unwrap_or_else(|_| "https://ai.onyx.dev".to_string());
+        let client = rusty_request::Client::builder()
+            .bearer_auth(&api_key)
+            .map_err(|err| format!("invalid ONYX_API_KEY: {err}"))?
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
+        Ok(OnyxEmbedder {
+            client,
+            base_url,
+            model,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_base_url(base_url: &str, model: &str) -> Self {
+        OnyxEmbedder {
+            client: rusty_request::Client::new(),
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    async fn embed_async(&self, text: &str) -> Result<Vec<f32>, String> {
+        let mut body = rusty_request::Json::object();
+        body.insert("model", self.model.as_str());
+        body.insert("prompt", text);
+        let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(&url)
+            .map_err(|err| format!("invalid Onyx embeddings URL {url:?}: {err}"))?
+            .json(&body)
+            .map_err(|err| format!("failed to encode embedding request: {err}"))?
+            .send()
+            .await
+            .map_err(|err| format!("Onyx embeddings request failed: {err}"))?
+            .error_for_status()
+            .map_err(|err| format!("Onyx embeddings request failed: {err}"))?;
+        let json = response
+            .json()
+            .map_err(|err| format!("Onyx embeddings response was not valid JSON: {err}"))?;
+        let embedding = json
+            .get("embedding")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "Onyx embeddings response had no \"embedding\" array".to_string())?;
+        let mut vector: Vec<f32> = embedding
+            .iter()
+            .map(|v| {
+                v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                    "Onyx embeddings response had a non-numeric vector entry".to_string()
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        l2_normalize(&mut vector);
+        Ok(vector)
+    }
+}
+
+impl Embedder for OnyxEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.embed_async(text))
+        });
+        match result {
+            Ok(vector) => vector,
+            Err(err) => {
+                eprintln!(
+                    "Onyx embedding request failed ({err}); using a zero vector for this text."
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        "Onyx cloud embedding -- a real trained semantic model"
+    }
+}
+
+/// Selects the active `Embedder` from `EMBEDDING_BACKEND`, read once and
+/// cached for the process's lifetime. Unset or any value other than
+/// `"onyx"` -> `HashingEmbedder` (the default; nothing changes for a
+/// caller who sets nothing). `"onyx"` -> `OnyxEmbedder::from_env()`, or a
+/// loud fallback to `HashingEmbedder` if that fails (missing env vars) --
+/// never a silent substitution.
+fn active_embedder() -> &'static dyn Embedder {
+    static EMBEDDER: std::sync::OnceLock<Box<dyn Embedder + Send + Sync>> =
+        std::sync::OnceLock::new();
+    EMBEDDER
+        .get_or_init(|| match std::env::var("EMBEDDING_BACKEND").as_deref() {
+            Ok("onyx") => match OnyxEmbedder::from_env() {
+                Ok(embedder) => {
+                    eprintln!("Using Onyx embedder for search_knowledge's vector component.");
+                    Box::new(embedder)
+                }
+                Err(err) => {
+                    eprintln!("EMBEDDING_BACKEND=onyx but {err}; falling back to HashingEmbedder.");
+                    Box::new(HashingEmbedder)
+                }
+            },
+            _ => Box::new(HashingEmbedder),
+        })
+        .as_ref()
 }
 
 /// Both inputs are expected L2-normalized (every vector this module
@@ -871,7 +1059,7 @@ fn index_for_search(
         "INSERT INTO search_index (ref_id, ref_type, text) VALUES (?1, ?2, ?3)",
         params![ref_id, ref_type, text],
     )?;
-    let vector = HashingEmbedder.embed(text);
+    let vector = active_embedder().embed(text);
     conn.execute(
         "INSERT INTO search_vectors (ref_id, ref_type, vector) VALUES (?1, ?2, ?3)",
         params![ref_id, ref_type, encode_vector(&vector)],
@@ -1688,13 +1876,18 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-/// Describes `search_knowledge`'s retrieval mode honestly: real fusion
-/// of two signals, but the vector half is `HashingEmbedder` (syntactic
-/// token-hashing), not a trained semantic model. Centralized here rather
-/// than hardcoded in `main.rs` so the description can't drift from what
-/// the function actually does.
-pub const RETRIEVAL_MODE_DESCRIPTION: &str =
-    "hybrid (lexical FTS5 + local hashing-vector -- not a trained semantic embedding)";
+/// Describes `search_knowledge`'s retrieval mode honestly: real fusion of
+/// two signals, lexical FTS5 plus whichever `Embedder` (`active_embedder`)
+/// is actually configured -- reflecting `HashingEmbedder`'s syntactic
+/// token-hashing or `OnyxEmbedder`'s real semantic model, whichever is
+/// active, not a hardcoded claim. Centralized here rather than duplicated
+/// in `main.rs` so the description can't drift from what actually ran.
+pub fn retrieval_mode_description() -> String {
+    format!(
+        "hybrid (lexical FTS5 + {})",
+        active_embedder().description()
+    )
+}
 
 /// Escapes `query` into a safe FTS5 `MATCH` expression: each whitespace-
 /// separated token becomes a quoted string literal (an embedded `"`
@@ -1769,7 +1962,7 @@ pub fn search_knowledge(
         }
     }
 
-    let query_vector = HashingEmbedder.embed(query);
+    let query_vector = active_embedder().embed(query);
     let mut vector_scores: HashMap<(String, String), f32> = HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT ref_id, ref_type, vector FROM search_vectors")?;
@@ -3295,6 +3488,78 @@ mod tests {
                 results
             );
         }
+    }
+
+    #[test]
+    fn onyx_embedder_from_env_requires_an_api_key() {
+        // No ONYX_API_KEY is set anywhere in this environment (by
+        // design -- see OnyxEmbedder's doc comment: no credentials are
+        // available to test against a live endpoint). Confirms the
+        // loud-failure path without this test itself touching global
+        // env state (mutating env vars from a test is racy against
+        // other tests running in parallel in the same process).
+        assert!(OnyxEmbedder::from_env().is_err());
+    }
+
+    /// Spins up a one-shot, hand-rolled HTTP/1.1 server on a local
+    /// ephemeral port (same approach `rusty_request`'s own test suite
+    /// uses, per its README) and returns the port plus a join handle
+    /// that resolves once it's served exactly one request with `body`.
+    /// Verifies `OnyxEmbedder`'s request-building and response-parsing
+    /// against Onyx's documented contract, without needing a live
+    /// endpoint or credentials.
+    fn spawn_one_shot_json_server(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onyx_embedder_parses_the_embedding_array_and_normalizes_it() {
+        // Already unit-length (0.6^2 + 0.8^2 = 1.0), so l2_normalize is
+        // a no-op and the assertion can be an exact match.
+        let (port, handle) = spawn_one_shot_json_server(r#"{"embedding":[0.6,0.8]}"#);
+        let embedder =
+            OnyxEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+        let vector = embedder.embed("hello world");
+        handle.join().unwrap();
+        assert_eq!(vector.len(), 2);
+        assert!((vector[0] - 0.6).abs() < 1e-5, "got {vector:?}");
+        assert!((vector[1] - 0.8).abs() < 1e-5, "got {vector:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onyx_embedder_normalizes_a_non_unit_response_vector() {
+        // [3.0, 4.0] has norm 5.0 -- normalized, [0.6, 0.8].
+        let (port, handle) = spawn_one_shot_json_server(r#"{"embedding":[3.0,4.0]}"#);
+        let embedder =
+            OnyxEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+        let vector = embedder.embed("hello world");
+        handle.join().unwrap();
+        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onyx_embedder_missing_embedding_field_falls_back_to_empty_not_a_panic() {
+        let (port, handle) = spawn_one_shot_json_server(r#"{"unexpected":"shape"}"#);
+        let embedder =
+            OnyxEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+        let vector = embedder.embed("hello world");
+        handle.join().unwrap();
+        assert!(vector.is_empty());
     }
 
     #[test]

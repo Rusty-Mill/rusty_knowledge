@@ -61,11 +61,13 @@
 //!   missing, and the overall verdict.
 //! - `search_knowledge` — hybrid search over every `Rule.statement` and
 //!   `Subject.name`/`short_name`/`description`, fusing lexical (FTS5
-//!   `bm25`) and vector (`store::HashingEmbedder` cosine similarity)
-//!   signals in equal weight. Always declares its retrieval mode
-//!   honestly: the vector half is a zero-dependency, zero-network
-//!   "hashing trick" bag-of-words embedding, not a trained semantic
-//!   model -- see `store::RETRIEVAL_MODE_DESCRIPTION`.
+//!   `bm25`) and vector (`store::Embedder` cosine similarity) signals in
+//!   equal weight. Always declares its retrieval mode honestly via
+//!   `store::retrieval_mode_description`, reflecting whichever
+//!   `Embedder` is actually active: `store::HashingEmbedder` (default,
+//!   zero-dependency, zero-network "hashing trick" bag-of-words, not a
+//!   trained semantic model) or `store::OnyxEmbedder` (a real semantic
+//!   model, opt-in via `EMBEDDING_BACKEND=onyx`).
 //! - `lookup_derived_summary` — any `RuleDerivation` rollups recorded for
 //!   a subject, always labeled NON-AUTHORITATIVE and listing exactly
 //!   which Rules each one was synthesized from. Firewalled from
@@ -1051,7 +1053,7 @@ impl KnowledgeServer {
         if results.is_empty() {
             return format!(
                 "No results for {query:?} (retrieval mode: {}).",
-                store::RETRIEVAL_MODE_DESCRIPTION
+                store::retrieval_mode_description()
             );
         }
 
@@ -1073,7 +1075,7 @@ impl KnowledgeServer {
         format!(
             "{} result(s) for {query:?} (retrieval mode: {}; higher score = more relevant):\n{lines}",
             results.len(),
-            store::RETRIEVAL_MODE_DESCRIPTION
+            store::retrieval_mode_description()
         )
     }
 

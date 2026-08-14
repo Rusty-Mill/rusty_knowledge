@@ -72,11 +72,15 @@ implemented.
   walk, so it catches disagreement between sibling organizations under the
   same parent — not only parent/child contradictions.
 - `search_knowledge` — hybrid search over every Rule statement and Subject
-  name/short_name/description, fusing lexical (FTS5) and vector (a local
-  "hashing trick" bag-of-words embedding) signals in equal weight, kept in
-  sync incrementally at write time. Always declares its retrieval mode
-  honestly — the vector half is a zero-dependency, zero-network technique,
-  not a trained semantic model.
+  name/short_name/description, fusing lexical (FTS5) and vector
+  (`store::Embedder`) signals in equal weight, kept in sync incrementally at
+  write time. The vector half defaults to `store::HashingEmbedder`, a local
+  "hashing trick" bag-of-words technique — zero-dependency, zero-network,
+  not a trained semantic model — or, opt-in via `EMBEDDING_BACKEND=onyx`,
+  `store::OnyxEmbedder`, a real semantic model called over Onyx's cloud
+  embeddings API. Always declares its retrieval mode honestly via
+  `store::retrieval_mode_description`, reflecting whichever `Embedder` is
+  actually active.
 - `lookup_derived_summary` — any `RuleDerivation` rollup summaries recorded
   for a subject, always labeled NON-AUTHORITATIVE with the exact Rules each
   one was synthesized from. Firewalled from authority by construction:
@@ -102,6 +106,9 @@ No Cargo features to opt into — the default build is everything there is.
 | --- | --- |
 | `KNOWLEDGE_DB_PATH` | Path to a SQLite file for a persistent, file-backed store, created if it doesn't exist. Unset (the default) uses an in-memory store that starts fresh every run. Seed/import only runs against an *empty* store — on a second run against the same file, previously-persisted data is left alone and seed/import is skipped. |
 | `KNOWLEDGE_MCP_IMPORT_PATH` | Path to a real `knowledge-mcp` SQLite file. Imports it via `knowledge_mcp_import_v2` instead of the small hand-seeded illustrative UDRA dataset (`store::seed_udra`) that's used otherwise. The two aren't run together — the reference data's real `udra` domain and the hand-seeded one use overlapping ids. See `knowledge_mcp_import_v2`'s module doc for exactly what does and doesn't translate, and the one inferred `SourceAuthority` edge it adds (disclosed, not silent). |
+| `EMBEDDING_BACKEND` | `onyx` opts `search_knowledge`'s vector component into `store::OnyxEmbedder` (a real semantic model, called via Onyx's cloud embeddings API). Unset (the default), or any other value, uses `store::HashingEmbedder` (syntactic, zero-network). A misconfigured `onyx` backend (see below) fails loudly and falls back to `HashingEmbedder` rather than silently doing nothing. |
+| `ONYX_API_KEY` / `ONYX_EMBEDDING_MODEL` | Required when `EMBEDDING_BACKEND=onyx`: the bearer token and model name for Onyx's embeddings endpoint. `OnyxEmbedder::from_env` errors clearly if either is missing. |
+| `ONYX_API_BASE_URL` | Optional, only relevant with `EMBEDDING_BACKEND=onyx`. Defaults to `https://ai.onyx.dev`. |
 
 Unset, the server starts in-memory with the hand-seeded illustrative UDRA
 dataset, fresh every run.
