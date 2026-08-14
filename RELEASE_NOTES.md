@@ -5,6 +5,26 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #53 — README/ARCHITECTURE.md updated for the v2 model
+**2026-08-13** · [#53](https://github.com/Rusty-Mill/rusty_knowledge/pull/53)
+
+- **Fixed:** both docs still described the pre-#51 model (15-tool surface,
+  `AuthorityLayer`/`Construct`, hybrid FTS5/`sqlite-vec` search,
+  `KNOWLEDGE_DB_PATH` file-backed persistence). Rewritten to describe
+  current reality: two tools (`lookup_subject`, `crosscut_conflicts`),
+  the five-table `Source`/`SourceAuthority`/`Subject`/`Rule`/
+  `RuleRelation` schema, in-memory-only storage, and
+  `knowledge_mcp_import_v2`.
+- **Fixed:** `store.rs`/`main.rs`'s own module doc comments overclaimed
+  "seven tables" -- `SelectionGroup`/`RuleDerivation` were specified in
+  the fuller design but never implemented. Comment-only, no behavior
+  change.
+- **Flagged, not fixed:** `Cargo.toml` still lists now-unused embedding/
+  search dependencies (`rusty-embedder-*`, `rusty_regx`, `sqlite-vec`)
+  and Cargo features from the model this replaces -- noted in
+  `ARCHITECTURE.md` as known cleanup debt.
+- Docs (plus two doc-comment-only `.rs` edits), no behavior change.
+
 ## PR #52 — knowledge-mcp importer for the v2 model, seeded with real data
 **2026-08-13** · [#52](https://github.com/Rusty-Mill/rusty_knowledge/pull/52)
 
