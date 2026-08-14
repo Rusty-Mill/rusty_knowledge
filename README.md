@@ -31,7 +31,9 @@ goal.
 Grew incrementally from the original two-tool vertical slice to the
 previous model's full 16-tool surface (tracked in
 [rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55),
-now closed).
+now closed), plus one beyond it: `lookup_derived_summary`, once
+`RuleDerivation` (the last piece of the fuller seven-table design) was
+implemented.
 
 - `lookup_subject` — everything the full authority chain says about a
   subject: every `Rule` that names it (directly, or as the target of a
@@ -75,6 +77,11 @@ now closed).
   (`lexical-only` — this model has no vector/hybrid component; that
   infrastructure was removed along with the schema this replaces and isn't
   reintroduced here).
+- `lookup_derived_summary` — any `RuleDerivation` rollup summaries recorded
+  for a subject, always labeled NON-AUTHORITATIVE with the exact Rules each
+  one was synthesized from. Firewalled from authority by construction:
+  never returned by any other lookup tool, never indexed for
+  `search_knowledge`, never a `RuleRelation` participant.
 
 See `src/main.rs`'s module doc comment for the authoritative, current
 breakdown — it's kept up to date as tools land, this file summarizes it.

@@ -8,15 +8,18 @@ answer to more than one independent parent), `Subject` (canonical,
 exact-lookup identity for what a rule is about, independent of who's making
 claims about it), `Rule` (the ground-truth statement — including
 relationship claims between two Subjects, and optional structured
-`machine_check` logic), and `RuleRelation` (the human-confirmed conflict
-gate). This started as a vertical slice proving that model end-to-end with
-two MCP tools and has since grown to the previous model's full 16-tool
+`machine_check` logic), `RuleRelation` (the human-confirmed conflict gate),
+`SelectionGroup` (a cardinality constraint over a set of relationship-shaped
+Rules), and `RuleDerivation` (a firewalled, non-authoritative rollup
+summary). This started as a vertical slice proving that model end-to-end
+with two MCP tools and has since grown to the previous model's full 16-tool
 surface (tracked in
 [rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55),
-now closed). See `src/store.rs`'s own module doc comment for the full
-account of what forced this design and `src/main.rs`'s for the exact,
-currently-maintained tool list — it's kept current as tools land; this file
-summarizes it rather than duplicating it in detail.
+now closed), plus `lookup_derived_summary`. See `src/store.rs`'s own module
+doc comment for the full account of what forced this design and
+`src/main.rs`'s for the exact, currently-maintained tool list — it's kept
+current as tools land; this file summarizes it rather than duplicating it
+in detail.
 
 This replaces an earlier fixed 4-layer `AuthorityLayer`/`Construct` model
 (Standard / Tool Implementation / Conventions / Process), which categorized
@@ -68,11 +71,12 @@ Single binary crate, three modules:
   `KnowledgeServer` and its tools (`#[tool_router]`), and startup
   seed/import selection.
 - `store.rs` — everything persistence and domain-logic: schema setup
-  (`open_store`), every `insert_*`/query function, the `Source`/`Subject`/
-  `Rule`/`RuleRelation`/`SelectionGroup`/etc. types, DAG traversal and cycle
-  rejection (`ancestors_of`, `insert_source_authority_edge`), the two-tier
-  conflict-candidate query, supersession-cascade logic, machine-check
-  evaluation (`evaluate_machine_check`), completeness evaluation
+  (`open_store`/`open_store_at`), every `insert_*`/query function, the
+  `Source`/`Subject`/`Rule`/`RuleRelation`/`SelectionGroup`/`RuleDerivation`/
+  etc. types, DAG traversal and cycle rejection (`ancestors_of`,
+  `insert_source_authority_edge`), the two-tier conflict-candidate query,
+  supersession-cascade logic, machine-check evaluation
+  (`evaluate_machine_check`), completeness evaluation
   (`evaluate_completeness`), and the hand-seeded illustrative UDRA dataset
   (`seed_udra`).
 - `knowledge_mcp_import_v2.rs` — translates a real `knowledge-mcp` SQLite
@@ -131,6 +135,11 @@ need splitting further.
 See [docs/adr/](./docs/adr/) for the record of individual decisions and their
 tradeoffs.
 
+The fuller seven-table design this model was built from (`Source`,
+`SourceAuthority`, `Subject`, `Rule`, `RuleRelation`, `SelectionGroup`,
+`RuleDerivation`) is now fully implemented -- nothing from that design is
+deferred anymore.
+
 ## Non-goals
 Deliberately out of scope, not silently dropped:
 - Vector/hybrid search (the `Embedder` trait, `sqlite-vec`) — the previous
@@ -139,13 +148,6 @@ Deliberately out of scope, not silently dropped:
   model, but deliberately lexical-only (FTS5, no vector component, no
   embedder pluggability); reintroducing a vector/hybrid layer is follow-up
   work for if a real case needs it, not assumed to happen automatically.
-- `RuleDerivation` (firewalled, non-authoritative rollup views) — specified
-  in the fuller seven-table design this was built from, not implemented,
-  since nothing in the current tool surface needs it. (`SelectionGroup`,
-  specified alongside it, *is* now implemented — it backs
-  `validate_completeness`.) Not a gap discovered late — a deliberate "don't
-  add a construct before a real case needs it" call, same as everything
-  else in this model's design history.
 - A `Store` trait / port-adapter abstraction for persistence — see
   Boundaries above; introduce one when a second real implementation
   actually needs it, not before.

@@ -5,6 +5,32 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #63 — Implement RuleDerivation (firewalled, non-authoritative rollups)
+**2026-08-14** · [#63](https://github.com/Rusty-Mill/rusty_knowledge/pull/63)
+
+- **Added:** `RuleDerivation` -- the last piece of the fuller seven-table
+  design this model was built from, and a new `lookup_derived_summary`
+  tool exposing it. A `RuleDerivation` is a synthesized rollup over a set
+  of Rules about one Subject (e.g. "the combined effective guidance"),
+  **firewalled from authority by construction**: it's never returned by
+  `rules_for_subject` or any other Rule-returning query, never indexed
+  for `search_knowledge`, never a `RuleRelation` participant, and every
+  `lookup_derived_summary` response is explicitly labeled
+  NON-AUTHORITATIVE and lists exactly which Rules it was synthesized
+  from, so a reader can go verify against ground truth rather than
+  citing the rollup itself.
+- New `store.rs` schema: `rule_derivations`/`rule_derivation_sources`
+  tables, `insert_rule_derivation` (inserts the derivation and its
+  source-rule links in one call), `rule_derivations_for_subject`.
+- `seed_udra` gained one illustrative derivation on `udra.DataProduct`,
+  rolling up the three separate ownership/registration rules spread
+  across the authority chain (data mesh principle -> Army UDRA -> org
+  implementation) into one orientation summary.
+- README/ARCHITECTURE.md/module doc comments updated: the fuller
+  seven-table design is now fully implemented -- nothing from it is
+  deferred anymore. Only vector/hybrid search and a `Store` trait
+  abstraction remain as deliberate non-goals.
+
 ## PR #62 — File-backed persistence (KNOWLEDGE_DB_PATH)
 **2026-08-14** · [#62](https://github.com/Rusty-Mill/rusty_knowledge/pull/62)
 
