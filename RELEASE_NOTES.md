@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — search_knowledge: lexical FTS5 search (rusty_knowledge#55)
-**2026-08-14**
+## PR #60 — search_knowledge: lexical FTS5 search (rusty_knowledge#55)
+**2026-08-14** · [#60](https://github.com/Rusty-Mill/rusty_knowledge/pull/60)
 
 - **Added:** `search_knowledge` -- lexical (FTS5) keyword search over
   every `Rule.statement` and `Subject.name`/`short_name`/`description`.
