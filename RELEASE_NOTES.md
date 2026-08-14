@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Crosscut + validate_relationship tools ported (rusty_knowledge#55, part 2)
-**2026-08-14** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #57 — Crosscut + validate_relationship tools ported (rusty_knowledge#55, part 2)
+**2026-08-14** · [#57](https://github.com/Rusty-Mill/rusty_knowledge/pull/57)
 
 - **Added:** `lookup_valid_relationships`, `crosscut_traceability`,
   `crosscut_cross_domain`, `crosscut_valid_relationship_candidates`,
