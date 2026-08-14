@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Introduce a Store trait / port-adapter abstraction
-**2026-08-14**
+## PR #64 — Introduce a Store trait / port-adapter abstraction
+**2026-08-14** · [#64](https://github.com/Rusty-Mill/rusty_knowledge/pull/64)
 
 - **Added:** `store::Store`, a trait covering exactly the read-only query
   surface `KnowledgeServer`'s 16 MCP tools need (`resolve_subject`,
