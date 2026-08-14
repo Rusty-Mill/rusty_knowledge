@@ -30,7 +30,10 @@
 //! the schema this replaces and isn't reintroduced here), plus
 //! `lookup_derived_summary` beyond it. File-backed persistence
 //! (`open_store_at`, gated on `KNOWLEDGE_DB_PATH` in `main.rs`) is real
-//! too, alongside the default in-memory store.
+//! too, alongside the default in-memory store. `KnowledgeServer` depends
+//! on `Store`, a trait covering exactly the read-only query surface those
+//! tools need -- `SqliteStore` is its only implementation (see the
+//! trait's own doc comment for what's deliberately excluded and why).
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
@@ -545,6 +548,121 @@ pub fn open_store_at(path: &std::path::Path) -> rusqlite::Result<Connection> {
 pub fn is_empty(conn: &Connection) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM subjects", [], |row| row.get(0))?;
     Ok(count == 0)
+}
+
+/// The read-only query port `KnowledgeServer` depends on for serving MCP
+/// tool calls -- every one of its 16 tools resolves down to some
+/// combination of these methods. Deliberately scoped to exactly that
+/// surface, not literally every public function in this module: writes
+/// (`insert_*`, `seed_udra`) and connection lifecycle
+/// (`open_store`/`open_store_at`, `is_empty`) are bootstrap/data-loading
+/// concerns that happen once at startup, before a `Store` even exists,
+/// not part of what a running server needs to answer a query -- and
+/// `knowledge_mcp_import_v2`'s importer does some operations (a raw
+/// `dest.execute` for a disclosure-only path) that don't map onto a
+/// structured port at all, so it stays on the raw `Connection` rather
+/// than forcing an awkward abstraction onto it.
+///
+/// `SqliteStore` (below) is the only implementation, extracted now
+/// because a caller explicitly asked for the abstraction, not because a
+/// second backend exists yet -- see `ARCHITECTURE.md`'s Boundaries
+/// section. Every method here just delegates to this module's existing
+/// free function of the same name; those free functions remain the real
+/// implementation (and every test in this module keeps calling them
+/// directly, unchanged), so this trait is a thin dependency-inversion
+/// layer on top, not a rewrite.
+pub trait Store {
+    fn resolve_subject(
+        &self,
+        domain_tag: &str,
+        subject_ref: &str,
+    ) -> rusqlite::Result<Option<Subject>>;
+    fn rules_for_subject(&self, subject_id: &str) -> rusqlite::Result<Vec<(Rule, Source)>>;
+
+    fn confirmed_conflicts_for_subject(
+        &self,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Rule, RuleRelation)>>;
+    fn conflict_candidates_for_subject(
+        &self,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Rule)>>;
+
+    fn list_domains(&self) -> rusqlite::Result<Vec<DomainInfo>>;
+    fn subjects_in_domain(
+        &self,
+        domain_tag: &str,
+        subject_type: Option<&str>,
+    ) -> rusqlite::Result<Vec<Subject>>;
+    fn domain_summary(&self, domain_tag: &str) -> rusqlite::Result<DomainSummary>;
+
+    fn statement_rules_for_subject(
+        &self,
+        subject_id: &str,
+        binding_strength: Option<BindingStrength>,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>>;
+    fn outgoing_relationships(
+        &self,
+        subject_id: &str,
+        relationship_type: Option<&str>,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>>;
+
+    fn valid_relationship_types(
+        &self,
+        domain_tag: &str,
+        from_type: &str,
+        to_type: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>>;
+    fn traceability(
+        &self,
+        subject_id: &str,
+        include_optional: bool,
+    ) -> rusqlite::Result<TraceabilityResult>;
+    fn cross_domain_relationships(
+        &self,
+        subject_id: &str,
+        to_domain_tag: Option<&str>,
+    ) -> rusqlite::Result<Vec<(Rule, Subject, Source)>>;
+    fn candidate_valid_relationships(
+        &self,
+        domain_tag: &str,
+    ) -> rusqlite::Result<Vec<ValidRelationshipCandidate>>;
+    fn validate_relationship(
+        &self,
+        from_subject_id: &str,
+        to_subject_id: &str,
+        relationship_type: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>>;
+
+    fn evaluate_completeness(
+        &self,
+        subject_id: &str,
+        present: &HashSet<String>,
+    ) -> rusqlite::Result<Vec<CompletenessFinding>>;
+
+    fn search_knowledge(
+        &self,
+        query: &str,
+        domain_tag: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<SearchResult>>;
+
+    fn rule_derivations_for_subject(
+        &self,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<RuleDerivation>>;
+}
+
+/// The only `Store` implementation: SQLite via `rusqlite`. Wraps an
+/// already-open `Connection` -- typically one already seeded/imported
+/// into via the free functions above, since that bootstrap step happens
+/// before a `Store` is needed (see the trait's own doc comment).
+pub struct SqliteStore(Connection);
+
+impl From<Connection> for SqliteStore {
+    fn from(conn: Connection) -> Self {
+        SqliteStore(conn)
+    }
 }
 
 const SOURCE_COLUMNS: &str = "id, name, kind, domain_tags, steward, citation, supersedes_source_id";
@@ -2012,6 +2130,122 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
     .map_err(to_string_err)?;
 
     Ok(())
+}
+
+impl Store for SqliteStore {
+    fn resolve_subject(
+        &self,
+        domain_tag: &str,
+        subject_ref: &str,
+    ) -> rusqlite::Result<Option<Subject>> {
+        resolve_subject(&self.0, domain_tag, subject_ref)
+    }
+    fn rules_for_subject(&self, subject_id: &str) -> rusqlite::Result<Vec<(Rule, Source)>> {
+        rules_for_subject(&self.0, subject_id)
+    }
+
+    fn confirmed_conflicts_for_subject(
+        &self,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Rule, RuleRelation)>> {
+        confirmed_conflicts_for_subject(&self.0, subject_id)
+    }
+    fn conflict_candidates_for_subject(
+        &self,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Rule)>> {
+        conflict_candidates_for_subject(&self.0, subject_id)
+    }
+
+    fn list_domains(&self) -> rusqlite::Result<Vec<DomainInfo>> {
+        list_domains(&self.0)
+    }
+    fn subjects_in_domain(
+        &self,
+        domain_tag: &str,
+        subject_type: Option<&str>,
+    ) -> rusqlite::Result<Vec<Subject>> {
+        subjects_in_domain(&self.0, domain_tag, subject_type)
+    }
+    fn domain_summary(&self, domain_tag: &str) -> rusqlite::Result<DomainSummary> {
+        domain_summary(&self.0, domain_tag)
+    }
+
+    fn statement_rules_for_subject(
+        &self,
+        subject_id: &str,
+        binding_strength: Option<BindingStrength>,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>> {
+        statement_rules_for_subject(&self.0, subject_id, binding_strength)
+    }
+    fn outgoing_relationships(
+        &self,
+        subject_id: &str,
+        relationship_type: Option<&str>,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>> {
+        outgoing_relationships(&self.0, subject_id, relationship_type)
+    }
+
+    fn valid_relationship_types(
+        &self,
+        domain_tag: &str,
+        from_type: &str,
+        to_type: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>> {
+        valid_relationship_types(&self.0, domain_tag, from_type, to_type)
+    }
+    fn traceability(
+        &self,
+        subject_id: &str,
+        include_optional: bool,
+    ) -> rusqlite::Result<TraceabilityResult> {
+        traceability(&self.0, subject_id, include_optional)
+    }
+    fn cross_domain_relationships(
+        &self,
+        subject_id: &str,
+        to_domain_tag: Option<&str>,
+    ) -> rusqlite::Result<Vec<(Rule, Subject, Source)>> {
+        cross_domain_relationships(&self.0, subject_id, to_domain_tag)
+    }
+    fn candidate_valid_relationships(
+        &self,
+        domain_tag: &str,
+    ) -> rusqlite::Result<Vec<ValidRelationshipCandidate>> {
+        candidate_valid_relationships(&self.0, domain_tag)
+    }
+    fn validate_relationship(
+        &self,
+        from_subject_id: &str,
+        to_subject_id: &str,
+        relationship_type: &str,
+    ) -> rusqlite::Result<Vec<(Rule, Source)>> {
+        validate_relationship(&self.0, from_subject_id, to_subject_id, relationship_type)
+    }
+
+    fn evaluate_completeness(
+        &self,
+        subject_id: &str,
+        present: &HashSet<String>,
+    ) -> rusqlite::Result<Vec<CompletenessFinding>> {
+        evaluate_completeness(&self.0, subject_id, present)
+    }
+
+    fn search_knowledge(
+        &self,
+        query: &str,
+        domain_tag: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<SearchResult>> {
+        search_knowledge(&self.0, query, domain_tag, limit)
+    }
+
+    fn rule_derivations_for_subject(
+        &self,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<RuleDerivation>> {
+        rule_derivations_for_subject(&self.0, subject_id)
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,30 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Introduce a Store trait / port-adapter abstraction
+**2026-08-14**
+
+- **Added:** `store::Store`, a trait covering exactly the read-only query
+  surface `KnowledgeServer`'s 16 MCP tools need (`resolve_subject`,
+  `rules_for_subject`, `search_knowledge`, etc.). `KnowledgeServer` now
+  holds `Arc<Mutex<dyn Store + Send>>` instead of a raw
+  `Arc<Mutex<Connection>>`. `store::SqliteStore` -- a thin `Connection`
+  newtype whose trait methods delegate to `store.rs`'s existing free
+  functions -- is the only implementation.
+- **Deliberately scoped, not exhaustive:** writes (`insert_*`) and
+  bootstrap (`seed_udra`, `open_store`/`open_store_at`, `is_empty`) stay
+  *outside* the trait -- they run once at startup, before a `Store` is
+  even constructed, and continue operating on the raw `Connection`
+  exactly as before. `knowledge_mcp_import_v2` also stays on the raw
+  `Connection` rather than the trait, since one of its paths does a raw
+  `dest.execute` that doesn't map onto a structured port at all.
+  Every free function in `store.rs` is unchanged; every existing test
+  keeps calling them directly. This is a dependency-inversion layer
+  `KnowledgeServer` sits behind, not a rewrite.
+- README/ARCHITECTURE.md updated: `ARCHITECTURE.md`'s Boundaries section
+  now documents the real port/adapter split; a second `Store`
+  implementation is the one remaining non-goal.
+
 ## PR #63 — Implement RuleDerivation (firewalled, non-authoritative rollups)
 **2026-08-14** · [#63](https://github.com/Rusty-Mill/rusty_knowledge/pull/63)
 

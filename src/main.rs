@@ -227,7 +227,7 @@ struct LookupDerivedSummaryParams {
 
 #[derive(Clone)]
 struct KnowledgeServer {
-    conn: Arc<Mutex<Connection>>,
+    store: Arc<Mutex<dyn store::Store + Send>>,
 }
 
 fn format_source(source: &Source) -> String {
@@ -290,8 +290,8 @@ impl KnowledgeServer {
             subject_ref,
         }): Parameters<SubjectLookupParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -299,7 +299,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let rules = match store::rules_for_subject(&conn, &subject.id) {
+        let rules = match db.rules_for_subject(&subject.id) {
             Ok(rules) => rules,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -361,8 +361,8 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -370,7 +370,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let rules = match store::statement_rules_for_subject(&conn, &subject.id, filter) {
+        let rules = match db.statement_rules_for_subject(&subject.id, filter) {
             Ok(rules) => rules,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -403,8 +403,8 @@ impl KnowledgeServer {
             relationship_type,
         }): Parameters<LookupRelationshipsParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -412,11 +412,10 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let rules =
-            match store::outgoing_relationships(&conn, &subject.id, relationship_type.as_deref()) {
-                Ok(rules) => rules,
-                Err(err) => return format!("Lookup failed: {err}"),
-            };
+        let rules = match db.outgoing_relationships(&subject.id, relationship_type.as_deref()) {
+            Ok(rules) => rules,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
 
         if rules.is_empty() {
             return format!(
@@ -449,8 +448,8 @@ impl KnowledgeServer {
         &self,
         Parameters(DomainParams { domain_tag }): Parameters<DomainParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let summary = match store::domain_summary(&conn, &domain_tag) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let summary = match db.domain_summary(&domain_tag) {
             Ok(summary) => summary,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -490,9 +489,8 @@ impl KnowledgeServer {
             subject_type,
         }): Parameters<SearchConstructsParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subjects = match store::subjects_in_domain(&conn, &domain_tag, subject_type.as_deref())
-        {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subjects = match db.subjects_in_domain(&domain_tag, subject_type.as_deref()) {
             Ok(subjects) => subjects,
             Err(err) => return format!("Search failed: {err}"),
         };
@@ -516,8 +514,8 @@ impl KnowledgeServer {
         description = "List every domain tag in use, with its subject count and the Source(s) that root it."
     )]
     fn meta_list_domains(&self) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let domains = match store::list_domains(&conn) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let domains = match db.list_domains() {
             Ok(domains) => domains,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -564,8 +562,8 @@ impl KnowledgeServer {
             subject_ref,
         }): Parameters<SubjectLookupParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -573,11 +571,11 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let confirmed = match store::confirmed_conflicts_for_subject(&conn, &subject.id) {
+        let confirmed = match db.confirmed_conflicts_for_subject(&subject.id) {
             Ok(confirmed) => confirmed,
             Err(err) => return format!("Conflict lookup failed: {err}"),
         };
-        let candidates = match store::conflict_candidates_for_subject(&conn, &subject.id) {
+        let candidates = match db.conflict_candidates_for_subject(&subject.id) {
             Ok(candidates) => candidates,
             Err(err) => return format!("Conflict lookup failed: {err}"),
         };
@@ -628,9 +626,8 @@ impl KnowledgeServer {
             to_type,
         }): Parameters<ValidRelationshipsParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let rules = match store::valid_relationship_types(&conn, &domain_tag, &from_type, &to_type)
-        {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let rules = match db.valid_relationship_types(&domain_tag, &from_type, &to_type) {
             Ok(rules) => rules,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -668,8 +665,8 @@ impl KnowledgeServer {
             include_optional,
         }): Parameters<TraceabilityParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -677,7 +674,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let (outgoing, incoming) = match store::traceability(&conn, &subject.id, include_optional) {
+        let (outgoing, incoming) = match db.traceability(&subject.id, include_optional) {
             Ok(result) => result,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -732,8 +729,8 @@ impl KnowledgeServer {
             to_domain_tag,
         }): Parameters<CrossDomainParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -742,7 +739,7 @@ impl KnowledgeServer {
         };
 
         let relationships =
-            match store::cross_domain_relationships(&conn, &subject.id, to_domain_tag.as_deref()) {
+            match db.cross_domain_relationships(&subject.id, to_domain_tag.as_deref()) {
                 Ok(relationships) => relationships,
                 Err(err) => return format!("Lookup failed: {err}"),
             };
@@ -779,8 +776,8 @@ impl KnowledgeServer {
             ValidRelationshipCandidatesParams,
         >,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let candidates = match store::candidate_valid_relationships(&conn, &domain_tag) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let candidates = match db.candidate_valid_relationships(&domain_tag) {
             Ok(candidates) => candidates,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -830,15 +827,15 @@ impl KnowledgeServer {
             relationship_type,
         }): Parameters<ValidateRelationshipParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let from_subject = match store::resolve_subject(&conn, &domain_tag, &from_subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let from_subject = match db.resolve_subject(&domain_tag, &from_subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {from_subject_ref:?} not found in domain {domain_tag:?}.");
             }
             Err(err) => return format!("Lookup failed: {err}"),
         };
-        let to_subject = match store::resolve_subject(&conn, &domain_tag, &to_subject_ref) {
+        let to_subject = match db.resolve_subject(&domain_tag, &to_subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {to_subject_ref:?} not found in domain {domain_tag:?}.");
@@ -846,15 +843,11 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let matches = match store::validate_relationship(
-            &conn,
-            &from_subject.id,
-            &to_subject.id,
-            &relationship_type,
-        ) {
-            Ok(matches) => matches,
-            Err(err) => return format!("Validation failed: {err}"),
-        };
+        let matches =
+            match db.validate_relationship(&from_subject.id, &to_subject.id, &relationship_type) {
+                Ok(matches) => matches,
+                Err(err) => return format!("Validation failed: {err}"),
+            };
 
         if matches.is_empty() {
             return format!(
@@ -891,8 +884,8 @@ impl KnowledgeServer {
             properties,
         }): Parameters<ValidateElementParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -900,7 +893,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let rules = match store::statement_rules_for_subject(&conn, &subject.id, None) {
+        let rules = match db.statement_rules_for_subject(&subject.id, None) {
             Ok(rules) => rules,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -975,8 +968,8 @@ impl KnowledgeServer {
             present_element_types,
         }): Parameters<ValidateCompletenessParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -985,7 +978,7 @@ impl KnowledgeServer {
         };
 
         let present: HashSet<String> = present_element_types.into_iter().collect();
-        let findings = match store::evaluate_completeness(&conn, &subject.id, &present) {
+        let findings = match db.evaluate_completeness(&subject.id, &present) {
             Ok(findings) => findings,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -1047,13 +1040,9 @@ impl KnowledgeServer {
         if query.trim().is_empty() {
             return "Query is empty; nothing to search.".to_string();
         }
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let results = match store::search_knowledge(
-            &conn,
-            &query,
-            domain_tag.as_deref(),
-            limit.unwrap_or(10),
-        ) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let results = match db.search_knowledge(&query, domain_tag.as_deref(), limit.unwrap_or(10))
+        {
             Ok(results) => results,
             Err(err) => return format!("Search failed: {err}"),
         };
@@ -1093,8 +1082,8 @@ impl KnowledgeServer {
             subject_ref,
         }): Parameters<LookupDerivedSummaryParams>,
     ) -> String {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+        let db = self.store.lock().expect("store mutex poisoned");
+        let subject = match db.resolve_subject(&domain_tag, &subject_ref) {
             Ok(Some(subject)) => subject,
             Ok(None) => {
                 return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
@@ -1102,7 +1091,7 @@ impl KnowledgeServer {
             Err(err) => return format!("Lookup failed: {err}"),
         };
 
-        let derivations = match store::rule_derivations_for_subject(&conn, &subject.id) {
+        let derivations = match db.rule_derivations_for_subject(&subject.id) {
             Ok(derivations) => derivations,
             Err(err) => return format!("Lookup failed: {err}"),
         };
@@ -1201,13 +1190,13 @@ async fn main() -> anyhow::Result<()> {
          lookup_relationships, lookup_valid_relationships, lookup_domain_summary, \
          search_constructs, meta_list_domains, meta_routing_guide, crosscut_traceability, \
          crosscut_cross_domain, crosscut_valid_relationship_candidates, validate_relationship, \
-         validate_element, validate_completeness, crosscut_conflicts, search_knowledge; \
-         knowledge-model-v2)"
+         validate_element, validate_completeness, crosscut_conflicts, search_knowledge, \
+         lookup_derived_summary; knowledge-model-v2)"
     );
 
-    let server = KnowledgeServer {
-        conn: Arc::new(Mutex::new(conn)),
-    };
+    let store: Arc<Mutex<dyn store::Store + Send>> =
+        Arc::new(Mutex::new(store::SqliteStore::from(conn)));
+    let server = KnowledgeServer { store };
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -1220,9 +1209,9 @@ mod tests {
     fn test_server() -> KnowledgeServer {
         let conn = store::open_store().unwrap();
         store::seed_udra(&conn).unwrap();
-        KnowledgeServer {
-            conn: Arc::new(Mutex::new(conn)),
-        }
+        let store: Arc<Mutex<dyn store::Store + Send>> =
+            Arc::new(Mutex::new(store::SqliteStore::from(conn)));
+        KnowledgeServer { store }
     }
 
     #[test]
