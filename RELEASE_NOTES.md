@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — machine_check evaluator + validate_element (rusty_knowledge#55)
-**2026-08-14**
+## PR #58 — machine_check evaluator + validate_element (rusty_knowledge#55)
+**2026-08-14** · [#58](https://github.com/Rusty-Mill/rusty_knowledge/pull/58)
 
 - **Added:** `validate_element` -- checks a real element's properties
   against a subject's machine-checkable rules and reports PASS/FAIL/WARNING
