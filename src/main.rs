@@ -18,10 +18,7 @@
 //! `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
 //! default.
 //!
-//! Tools wired end-to-end -- 15 so far. rusty_knowledge#55 tracks the
-//! rest: `search_knowledge` needs a fresh design decision, since its old
-//! FTS5/`sqlite-vec` infrastructure was removed entirely along with the
-//! schema this replaces.
+//! All 16 tools tracked by rusty_knowledge#55 are now wired end-to-end.
 //! - `lookup_subject` — everything a Subject's authority chain says about
 //!   it, across every Source that makes a claim, with provenance.
 //! - `lookup_rules` — plain statement rules for a subject (excludes
@@ -63,6 +60,12 @@
 //!   against a caller-supplied set of element types actually present,
 //!   reporting which groups are satisfied, which member rules are
 //!   missing, and the overall verdict.
+//! - `search_knowledge` — lexical (FTS5) keyword search over every
+//!   `Rule.statement` and `Subject.name`/`short_name`/`description`,
+//!   always declaring its retrieval mode (`lexical-only` -- this model
+//!   has no vector/hybrid component; that infrastructure was removed
+//!   entirely along with the schema this replaces and isn't reintroduced
+//!   here).
 
 mod knowledge_mcp_import_v2;
 mod store;
@@ -196,6 +199,20 @@ struct ValidateCompletenessParams {
     present_element_types: Vec<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SearchKnowledgeParams {
+    /// Keyword search query. Whitespace-separated terms are OR-matched
+    /// (each term treated as literal text, never as FTS query syntax).
+    query: String,
+    /// Restrict results to one domain tag, e.g. "udra". Omit to search
+    /// every domain.
+    #[serde(default)]
+    domain_tag: Option<String>,
+    /// Max results to return. Omit for the default of 10.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -242,7 +259,8 @@ fn routing_guide() -> String {
      - \"Is this relationship permitted?\" -> validate_relationship\n\
      - \"Is X valid/conformant?\" -> validate_element\n\
      - \"Is this model/container complete? What's missing?\" -> validate_completeness\n\
-     - \"Where do sources disagree about X?\" -> crosscut_conflicts"
+     - \"Where do sources disagree about X?\" -> crosscut_conflicts\n\
+     - \"Search for X across everything\" -> search_knowledge (lexical-only keyword search)"
         .to_string()
 }
 
@@ -1000,6 +1018,56 @@ impl KnowledgeServer {
             findings_report.trim_end()
         )
     }
+
+    #[tool(
+        description = "Lexical (keyword) search over every Rule statement and Subject name/short_name/description. Always declares its retrieval mode (lexical-only -- this model has no vector/hybrid component) and returns ranked hits identified well enough to look each one up via lookup_subject."
+    )]
+    fn search_knowledge(
+        &self,
+        Parameters(SearchKnowledgeParams {
+            query,
+            domain_tag,
+            limit,
+        }): Parameters<SearchKnowledgeParams>,
+    ) -> String {
+        if query.trim().is_empty() {
+            return "Query is empty; nothing to search.".to_string();
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let results = match store::search_knowledge(
+            &conn,
+            &query,
+            domain_tag.as_deref(),
+            limit.unwrap_or(10),
+        ) {
+            Ok(results) => results,
+            Err(err) => return format!("Search failed: {err}"),
+        };
+
+        if results.is_empty() {
+            return format!("No results for {query:?} (retrieval mode: lexical-only).");
+        }
+
+        let lines = results
+            .iter()
+            .map(|r| {
+                let kind = match r.ref_type {
+                    store::SearchRefType::Rule => "rule",
+                    store::SearchRefType::Subject => "subject",
+                };
+                format!(
+                    "  [{kind}] {} ({}) -- {} (score {:.3})",
+                    r.ref_id, r.domain_tag, r.text, r.score
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} result(s) for {query:?} (retrieval mode: lexical-only; lower score = more relevant):\n{lines}",
+            results.len()
+        )
+    }
 }
 
 #[tokio::main]
@@ -1044,7 +1112,8 @@ async fn main() -> anyhow::Result<()> {
          lookup_relationships, lookup_valid_relationships, lookup_domain_summary, \
          search_constructs, meta_list_domains, meta_routing_guide, crosscut_traceability, \
          crosscut_cross_domain, crosscut_valid_relationship_candidates, validate_relationship, \
-         validate_element, validate_completeness, crosscut_conflicts; knowledge-model-v2)"
+         validate_element, validate_completeness, crosscut_conflicts, search_knowledge; \
+         knowledge-model-v2)"
     );
 
     let server = KnowledgeServer {
@@ -1416,5 +1485,51 @@ mod tests {
             present_element_types: vec![],
         }));
         assert!(response.contains("not found"));
+    }
+
+    #[test]
+    fn search_knowledge_finds_matches_and_declares_lexical_only() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchKnowledgeParams {
+            query: "accountable".into(),
+            domain_tag: None,
+            limit: None,
+        }));
+        assert!(response.contains("retrieval mode: lexical-only"));
+        assert!(response.contains("rule.dm.001"));
+    }
+
+    #[test]
+    fn search_knowledge_filters_by_domain_tag() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchKnowledgeParams {
+            query: "Product".into(),
+            domain_tag: Some("data_mesh".into()),
+            limit: None,
+        }));
+        assert!(response.contains("data_mesh.DataProduct"));
+        assert!(!response.contains("udra.DataProduct"));
+    }
+
+    #[test]
+    fn search_knowledge_no_match_says_so_not_an_error() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchKnowledgeParams {
+            query: "zzzznosuchword".into(),
+            domain_tag: None,
+            limit: None,
+        }));
+        assert!(response.starts_with("No results"));
+    }
+
+    #[test]
+    fn search_knowledge_empty_query_says_so_not_an_error() {
+        let server = test_server();
+        let response = server.search_knowledge(Parameters(SearchKnowledgeParams {
+            query: "   ".into(),
+            domain_tag: None,
+            limit: None,
+        }));
+        assert!(response.contains("Query is empty"));
     }
 }

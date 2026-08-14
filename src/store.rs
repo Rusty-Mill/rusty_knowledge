@@ -23,10 +23,11 @@
 //! data end-to-end: schema, insert-time invariants (DAG cycle rejection,
 //! supersession cascade), the two-tier conflict-candidate query, and two
 //! MCP tools (`lookup_subject`, `crosscut_conflicts` -- see `main.rs`).
-//! It's since grown to 15 tools (tracked in rusty_knowledge#55); only
-//! `search_knowledge` remains, needing a fresh design decision rather than
-//! a direct re-port, since its old FTS5/`sqlite-vec` search infrastructure
-//! was removed entirely along with the schema this replaces. File-backed
+//! It's since grown to the full 16-tool surface tracked in
+//! rusty_knowledge#55, including a lexical (FTS5) `search_knowledge` --
+//! deliberately no vector/hybrid component, since the previous model's
+//! `Embedder`/`sqlite-vec` infrastructure was removed entirely along with
+//! the schema this replaces and isn't reintroduced here. File-backed
 //! persistence is likewise not carried forward yet.
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -466,6 +467,12 @@ fn schema_ddl() -> &'static str {
         rule_id TEXT NOT NULL REFERENCES rules(id),
         PRIMARY KEY (group_id, rule_id)
     );
+
+    CREATE VIRTUAL TABLE search_index USING fts5(
+        ref_id UNINDEXED,
+        ref_type UNINDEXED,
+        text
+    );
     "
 }
 
@@ -597,6 +604,23 @@ fn subject_from_row(row: &rusqlite::Row) -> rusqlite::Result<Subject> {
     })
 }
 
+/// Adds one row to the `search_index` FTS5 table. Called from
+/// `insert_rule`/`insert_subject` so the index is kept in sync
+/// incrementally, at write time -- never rebuilt per `search_knowledge`
+/// call.
+fn index_for_search(
+    conn: &Connection,
+    ref_id: &str,
+    ref_type: &str,
+    text: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO search_index (ref_id, ref_type, text) VALUES (?1, ?2, ?3)",
+        params![ref_id, ref_type, text],
+    )?;
+    Ok(())
+}
+
 pub fn insert_subject(conn: &Connection, subject: &Subject) -> rusqlite::Result<()> {
     conn.execute(
         &format!("INSERT INTO subjects ({SUBJECT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
@@ -612,6 +636,17 @@ pub fn insert_subject(conn: &Connection, subject: &Subject) -> rusqlite::Result<
             subject.supersedes_subject_id,
             subject.source_section,
         ],
+    )?;
+    index_for_search(
+        conn,
+        &subject.id,
+        "subject",
+        &format!(
+            "{} {} {}",
+            subject.name,
+            subject.short_name,
+            subject.description.as_deref().unwrap_or("")
+        ),
     )?;
     Ok(())
 }
@@ -698,6 +733,7 @@ pub fn insert_rule(conn: &Connection, rule: &Rule) -> rusqlite::Result<()> {
             params![superseded_id],
         )?;
     }
+    index_for_search(conn, &rule.id, "rule", &rule.statement)?;
     Ok(())
 }
 
@@ -1368,6 +1404,125 @@ pub fn evaluate_completeness(
         });
     }
     Ok(findings)
+}
+
+/// What a `SearchResult` matched -- either a Rule's `statement`, or a
+/// Subject's `name`/`short_name`/`description`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchRefType {
+    Rule,
+    Subject,
+}
+
+/// One `search_knowledge` hit. `score` is the raw SQLite FTS5 `bm25`
+/// rank -- lower (more negative) means more relevant, not higher.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResult {
+    pub ref_type: SearchRefType,
+    pub ref_id: String,
+    pub domain_tag: String,
+    pub text: String,
+    pub score: f64,
+}
+
+/// Escapes `query` into a safe FTS5 `MATCH` expression: each whitespace-
+/// separated token becomes a quoted string literal (an embedded `"`
+/// doubled, per FTS5 string-literal syntax), joined with `OR`. This means
+/// hyphens, `AND`/`OR`/`NOT`, `^`, and every other FTS5 query-syntax
+/// character in the caller's input is always treated as literal text to
+/// match, never as an operator -- a query like "data-product" searches
+/// for that literal token instead of silently becoming "data NOT
+/// product". Returns `None` for an all-whitespace query.
+fn fts5_safe_query(query: &str) -> Option<String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" OR "))
+    }
+}
+
+/// Lexical (FTS5) search over every `Rule.statement` and `Subject.name`/
+/// `short_name`/`description`, kept in sync incrementally by
+/// `insert_rule`/`insert_subject` -- never rebuilt per call. Deliberately
+/// lexical-only: the previous model's `Embedder` trait and `sqlite-vec`
+/// vector/hybrid-search infrastructure were removed entirely along with
+/// the schema this replaces and are not reintroduced here (see
+/// `ARCHITECTURE.md`'s non-goals) -- this is a scope decision, not a gap.
+///
+/// Internally over-fetches (bounded by `OVER_FETCH_CAP`) before applying
+/// the optional `domain_tag` filter and truncating to `limit`, since a
+/// hit's domain isn't stored redundantly in the FTS5 index. Fine at this
+/// dataset's scale; revisit if that ever becomes a real bottleneck.
+pub fn search_knowledge(
+    conn: &Connection,
+    query: &str,
+    domain_tag: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<SearchResult>> {
+    const OVER_FETCH_CAP: usize = 200;
+    let Some(match_expr) = fts5_safe_query(query) else {
+        return Ok(Vec::new());
+    };
+    let fetch_limit = if domain_tag.is_some() {
+        OVER_FETCH_CAP
+    } else {
+        limit
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT ref_id, ref_type, text, rank FROM search_index \
+         WHERE search_index MATCH ?1 ORDER BY rank LIMIT ?2",
+    )?;
+    let rows: Vec<(String, String, String, f64)> = stmt
+        .query_map(params![match_expr, fetch_limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut out = Vec::new();
+    for (ref_id, ref_type_text, text, score) in rows {
+        let ref_type = match ref_type_text.as_str() {
+            "rule" => SearchRefType::Rule,
+            "subject" => SearchRefType::Subject,
+            other => {
+                panic!("stored search_index ref_type {other:?} is not \"rule\" or \"subject\"")
+            }
+        };
+        let resolved_domain_tag = match ref_type {
+            SearchRefType::Rule => {
+                let rule =
+                    rule_by_id(conn, &ref_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                subject_by_id(conn, &rule.subject_id)?
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+                    .domain_tag
+            }
+            SearchRefType::Subject => {
+                subject_by_id(conn, &ref_id)?
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+                    .domain_tag
+            }
+        };
+        if let Some(domain_tag) = domain_tag
+            && resolved_domain_tag != domain_tag
+        {
+            continue;
+        }
+        out.push(SearchResult {
+            ref_type,
+            ref_id,
+            domain_tag: resolved_domain_tag,
+            text,
+            score,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Seeds a real UDRA authority chain: a data mesh standard (root) ->
@@ -2324,5 +2479,72 @@ mod tests {
             .unwrap();
         assert!(at_least_finding.is_satisfied);
         assert_eq!(at_least_finding.satisfied_count, 1);
+    }
+
+    #[test]
+    fn fts5_safe_query_quotes_each_token_and_joins_with_or() {
+        assert_eq!(
+            fts5_safe_query("data product").unwrap(),
+            "\"data\" OR \"product\""
+        );
+        assert_eq!(fts5_safe_query("data-product").unwrap(), "\"data-product\"");
+        assert!(fts5_safe_query("   ").is_none());
+    }
+
+    #[test]
+    fn fts5_safe_query_escapes_embedded_quotes() {
+        let escaped = fts5_safe_query("say\"hi").unwrap();
+        assert!(escaped.contains("\"\""));
+    }
+
+    #[test]
+    fn search_knowledge_finds_seeded_rule_by_statement_keyword() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "accountable", None, 10).unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.ref_id == "rule.dm.001" && r.ref_type == SearchRefType::Rule)
+        );
+    }
+
+    #[test]
+    fn search_knowledge_finds_seeded_subject_by_name() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "Contract", None, 10).unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.ref_id == "udra.DataContract" && r.ref_type == SearchRefType::Subject)
+        );
+    }
+
+    #[test]
+    fn search_knowledge_filters_by_domain_tag() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "Product", Some("data_mesh"), 10).unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.domain_tag == "data_mesh"));
+    }
+
+    #[test]
+    fn search_knowledge_respects_limit() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "data", None, 2).unwrap();
+        assert!(results.len() <= 2);
+    }
+
+    #[test]
+    fn search_knowledge_empty_query_is_empty_not_an_error() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "   ", None, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_knowledge_no_match_is_empty_not_an_error() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "zzzznosuchword", None, 10).unwrap();
+        assert!(results.is_empty());
     }
 }

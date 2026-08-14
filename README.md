@@ -28,12 +28,10 @@ goal.
 
 ## What's implemented
 
-Growing incrementally from the original two-tool vertical slice toward the
-previous model's full surface (tracked in
-[rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)).
-15 MCP tools so far — only `search_knowledge` remains, and it needs a fresh
-design decision since its old FTS5/`sqlite-vec` search infrastructure was
-removed along with the schema this replaces.
+Grew incrementally from the original two-tool vertical slice to the
+previous model's full 16-tool surface (tracked in
+[rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55),
+now closed).
 
 - `lookup_subject` — everything the full authority chain says about a
   subject: every `Rule` that names it (directly, or as the target of a
@@ -71,6 +69,12 @@ removed along with the schema this replaces.
   review. Correlates by exact subject identity first, not just an ancestor
   walk, so it catches disagreement between sibling organizations under the
   same parent — not only parent/child contradictions.
+- `search_knowledge` — lexical (FTS5) keyword search over every Rule
+  statement and Subject name/short_name/description, kept in sync
+  incrementally at write time. Always declares its retrieval mode
+  (`lexical-only` — this model has no vector/hybrid component; that
+  infrastructure was removed along with the schema this replaces and isn't
+  reintroduced here).
 
 See `src/main.rs`'s module doc comment for the authoritative, current
 breakdown — it's kept up to date as tools land, this file summarizes it.

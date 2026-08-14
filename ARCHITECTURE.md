@@ -10,10 +10,10 @@ claims about it), `Rule` (the ground-truth statement — including
 relationship claims between two Subjects, and optional structured
 `machine_check` logic), and `RuleRelation` (the human-confirmed conflict
 gate). This started as a vertical slice proving that model end-to-end with
-two MCP tools and is growing incrementally toward the previous model's full
+two MCP tools and has since grown to the previous model's full 16-tool
 surface (tracked in
-[rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)) —
-15 tools so far. See `src/store.rs`'s own module doc comment for the full
+[rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55),
+now closed). See `src/store.rs`'s own module doc comment for the full
 account of what forced this design and `src/main.rs`'s for the exact,
 currently-maintained tool list — it's kept current as tools land; this file
 summarizes it rather than duplicating it in detail.
@@ -44,12 +44,16 @@ once a second backend actually needs one — none has, yet.
 | ---- | ---------- | ----- |
 | *(none)* | `store.rs` — SQLite via `rusqlite`, in-memory only | single implementation; not behind a trait |
 
-There is no embedder/search boundary in this model — the previous crate's
+There is no embedder boundary in this model -- the previous crate's
 `Embedder` trait (`rusty_embedder_core`, `NullEmbedder`/local/http backends)
-and its `sqlite-vec`-backed hybrid search were built around the old schema
-and were not carried forward. Their `Cargo.toml` dependencies and the
+and its `sqlite-vec`-backed hybrid/vector search were built around the old
+schema and were not carried forward; their `Cargo.toml` dependencies and the
 `local-embeddings`/`http-embeddings` features were removed once nothing in
-`src/` referenced them anymore.
+`src/` referenced them anymore. `search_knowledge` is real, but
+lexical-only: a SQLite FTS5 virtual table (`search_index`) kept in sync
+incrementally by `insert_rule`/`insert_subject`, with no vector component
+and no embedder pluggability -- a deliberate scope decision, documented in
+Non-goals below, not a gap.
 
 ## Structure
 Single binary crate, three modules:
@@ -117,17 +121,14 @@ tradeoffs.
 
 ## Non-goals
 Deliberately out of scope, not silently dropped:
-- The previous model's full 15-tool surface (`lookup_construct`,
-  `search_knowledge`, etc.) — built around the schema this replaces;
-  re-porting individual tools onto the new model is follow-up work, tracked
-  separately, not assumed to happen automatically. `search_knowledge` is the
-  one tool left in #55, needing a fresh design decision rather than a
-  direct re-port, since its old FTS5/`sqlite-vec` infrastructure was removed
-  entirely along with the schema this replaces.
 - File-backed persistence (`KNOWLEDGE_DB_PATH`) — the previous model had
   this; the current one is in-memory only until a real case needs it back.
-- Search (FTS5/`sqlite-vec` hybrid retrieval, the `Embedder` trait) — same
-  reasoning; nothing in the current tool surface needs it yet.
+- Vector/hybrid search (the `Embedder` trait, `sqlite-vec`) — the previous
+  model's hybrid FTS5+vector retrieval was built around the old schema and
+  was not carried forward. `search_knowledge` is real in the current
+  model, but deliberately lexical-only (FTS5, no vector component, no
+  embedder pluggability); reintroducing a vector/hybrid layer is follow-up
+  work for if a real case needs it, not assumed to happen automatically.
 - `RuleDerivation` (firewalled, non-authoritative rollup views) — specified
   in the fuller seven-table design this was built from, not implemented,
   since nothing in the current tool surface needs it. (`SelectionGroup`,

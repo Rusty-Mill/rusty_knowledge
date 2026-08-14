@@ -5,6 +5,35 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #60 — search_knowledge: lexical FTS5 search (rusty_knowledge#55)
+**2026-08-14** · [#60](https://github.com/Rusty-Mill/rusty_knowledge/pull/60)
+
+- **Added:** `search_knowledge` -- lexical (FTS5) keyword search over
+  every `Rule.statement` and `Subject.name`/`short_name`/`description`.
+  This is the last of the 16 tools tracked by #55, which is now closed.
+  Tool surface goes from 15 to 16.
+- New `store.rs` schema: a `search_index` FTS5 virtual table, kept in
+  sync incrementally by `insert_rule`/`insert_subject` (via a new private
+  `index_for_search` helper) -- never rebuilt per call, and every
+  existing seed/import path gets indexed for free since both go through
+  those same `insert_*` functions.
+- New `store.rs` types/functions: `SearchRefType` (`Rule`/`Subject`),
+  `SearchResult`, `search_knowledge`. A `fts5_safe_query` helper quotes
+  each whitespace-separated query token as an FTS5 string literal before
+  building the `MATCH` expression -- otherwise a query like
+  `"data-product"` would be silently reinterpreted by FTS5's query syntax
+  as `data NOT product` (a leading `-` is the FTS5 NOT operator), and
+  more generally any FTS5 syntax character in a caller's free-text query
+  would change the search instead of being searched for literally.
+- **Deliberately lexical-only**, not the previous model's hybrid
+  FTS5+vector search: the `Embedder` trait and `sqlite-vec` retrieval
+  were removed entirely along with the schema this replaces and are not
+  reintroduced here (documented in `ARCHITECTURE.md`'s non-goals). The
+  tool always declares its retrieval mode (`lexical-only`) in its
+  response rather than leaving that undiscoverable.
+- README/ARCHITECTURE.md/module doc comments updated for the full
+  16-tool surface; #55 closed.
+
 ## PR #59 — SelectionGroup + validate_completeness (rusty_knowledge#55)
 **2026-08-14** · [#59](https://github.com/Rusty-Mill/rusty_knowledge/pull/59)
 
