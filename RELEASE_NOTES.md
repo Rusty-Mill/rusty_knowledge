@@ -5,6 +5,36 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — SelectionGroup + validate_completeness (rusty_knowledge#55)
+**2026-08-14**
+
+- **Added:** `validate_completeness` -- evaluates every `SelectionGroup`
+  defined on a container/viewpoint subject against a caller-supplied set
+  of element types actually present, reporting per-group and per-member
+  satisfaction plus an overall COMPLETE/INCOMPLETE verdict. Tool surface
+  goes from 14 to 15; only `search_knowledge` remains of #55's original
+  16-tool scope, and it needs a fresh design decision rather than a
+  direct re-port.
+- New `store.rs` type/functions: `SelectionConstraint` (`All` or
+  `AtLeast(n)`), `SelectionGroup` (a cardinality constraint over a set of
+  relationship-shaped Rules on one Subject -- distinct from a single
+  Rule's own `cardinality` field, which constrains instance count within
+  *one* relationship rather than which subset of *several* rules must
+  hold), `insert_selection_group`, `selection_groups_for_subject`,
+  `evaluate_completeness` (+ `CompletenessFinding`). A member rule with no
+  `related_subject_id` can't be checked against the presence set and
+  always counts as satisfied, since there's nothing external for the
+  caller to have supplied.
+- `seed_udra` gained one `SelectionGroup` on `udra.DataProduct`
+  (`selgrp.data-product-complete`, `All`, reusing the existing
+  `exposes`/`realizes` relationship rules) -- needed to make
+  `validate_completeness` demonstrable and testable against real seed
+  data rather than synthetic test-only fixtures.
+- README/ARCHITECTURE.md/module doc comments updated for the 15-tool
+  surface; `SelectionGroup` moved out of the "specified but not
+  implemented" non-goals list (`RuleDerivation` is the one construct from
+  the fuller seven-table design still deferred).
+
 ## PR #58 — machine_check evaluator + validate_element (rusty_knowledge#55)
 **2026-08-14** · [#58](https://github.com/Rusty-Mill/rusty_knowledge/pull/58)
 
