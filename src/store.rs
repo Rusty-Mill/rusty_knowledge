@@ -24,11 +24,12 @@
 //! supersession cascade), the two-tier conflict-candidate query, and two
 //! MCP tools (`lookup_subject`, `crosscut_conflicts` -- see `main.rs`).
 //! It's since grown to the full 16-tool surface tracked in
-//! rusty_knowledge#55 (including a lexical (FTS5) `search_knowledge` --
-//! deliberately no vector/hybrid component, since the previous model's
-//! `Embedder`/`sqlite-vec` infrastructure was removed entirely along with
-//! the schema this replaces and isn't reintroduced here), plus
-//! `lookup_derived_summary` beyond it. File-backed persistence
+//! rusty_knowledge#55 (including `search_knowledge`, hybrid: lexical
+//! FTS5 fused with `Embedder`/`HashingEmbedder`, a real but deliberately
+//! non-semantic "hashing trick" vector -- see that trait's own doc
+//! comment for why, and why that's disclosed honestly rather than
+//! presented as more than it is), plus `lookup_derived_summary` beyond
+//! it. File-backed persistence
 //! (`open_store_at`, gated on `KNOWLEDGE_DB_PATH` in `main.rs`) is real
 //! too, alongside the default in-memory store. `KnowledgeServer` depends
 //! on `Store`, a trait covering exactly the read-only query surface those
@@ -37,6 +38,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 /// A rule or relationship's normative strength. `Delegated` means the
 /// issuing Source explicitly hands the decision to whichever Source(s)
@@ -504,6 +506,13 @@ fn schema_ddl() -> &'static str {
         text
     );
 
+    CREATE TABLE IF NOT EXISTS search_vectors (
+        ref_id TEXT NOT NULL,
+        ref_type TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        PRIMARY KEY (ref_id, ref_type)
+    );
+
     CREATE TABLE IF NOT EXISTS rule_derivations (
         id TEXT PRIMARY KEY,
         subject_id TEXT NOT NULL REFERENCES subjects(id),
@@ -786,10 +795,72 @@ fn subject_from_row(row: &rusqlite::Row) -> rusqlite::Result<Subject> {
     })
 }
 
-/// Adds one row to the `search_index` FTS5 table. Called from
-/// `insert_rule`/`insert_subject` so the index is kept in sync
-/// incrementally, at write time -- never rebuilt per `search_knowledge`
-/// call.
+/// Produces a fixed-dimension vector representation of text, for
+/// approximate nearest-neighbor retrieval alongside lexical (FTS5)
+/// search. `HashingEmbedder` (below) is the only implementation.
+/// Deliberately *not* a trained semantic embedding -- this crate has no
+/// network access and bundles no model weights -- just a real, working
+/// "hashing trick" bag-of-words vector, the same zero-dependency
+/// technique real production systems fall back to. Disclosed honestly as
+/// syntactic (token-overlap-driven), not semantic: it won't find a
+/// synonym FTS5's exact tokens miss, but it does surface near-duplicate
+/// phrasing and partial term overlap that pure keyword matching can rank
+/// poorly. A trait, not a single function, so a real embedder becomes a
+/// drop-in swap if this crate ever gets network/model access -- same
+/// pluggability the previous model's `Embedder` trait had, without
+/// pretending to already have a backend this crate doesn't.
+pub trait Embedder {
+    fn embed(&self, text: &str) -> Vec<f32>;
+}
+
+const EMBEDDING_DIM: usize = 256;
+
+/// See `Embedder`'s doc comment. Each whitespace-separated, lowercased
+/// token is hashed into one of `EMBEDDING_DIM` buckets, which is
+/// incremented; the resulting count vector is L2-normalized so cosine
+/// similarity reduces to a plain dot product.
+pub struct HashingEmbedder;
+
+impl Embedder for HashingEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut vector = vec![0f32; EMBEDDING_DIM];
+        for token in text.split_whitespace() {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            token.to_lowercase().hash(&mut hasher);
+            let bucket = (hasher.finish() as usize) % EMBEDDING_DIM;
+            vector[bucket] += 1.0;
+        }
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for v in &mut vector {
+                *v /= norm;
+            }
+        }
+        vector
+    }
+}
+
+/// Both inputs are expected L2-normalized (every vector this module
+/// stores is), so cosine similarity is just the dot product.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn encode_vector(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn decode_vector(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Adds one row each to `search_index` (FTS5) and `search_vectors`
+/// (`HashingEmbedder`). Called from `insert_rule`/`insert_subject` so
+/// both indexes are kept in sync incrementally, at write time -- never
+/// rebuilt per `search_knowledge` call.
 fn index_for_search(
     conn: &Connection,
     ref_id: &str,
@@ -799,6 +870,11 @@ fn index_for_search(
     conn.execute(
         "INSERT INTO search_index (ref_id, ref_type, text) VALUES (?1, ?2, ?3)",
         params![ref_id, ref_type, text],
+    )?;
+    let vector = HashingEmbedder.embed(text);
+    conn.execute(
+        "INSERT INTO search_vectors (ref_id, ref_type, vector) VALUES (?1, ?2, ?3)",
+        params![ref_id, ref_type, encode_vector(&vector)],
     )?;
     Ok(())
 }
@@ -1596,8 +1672,13 @@ pub enum SearchRefType {
     Subject,
 }
 
-/// One `search_knowledge` hit. `score` is the raw SQLite FTS5 `bm25`
-/// rank -- lower (more negative) means more relevant, not higher.
+/// One `search_knowledge` hit. `score` is the fused hybrid score in
+/// `[0, 1]` -- higher means more relevant, combining a normalized
+/// lexical (FTS5 `bm25`) component with a `HashingEmbedder` cosine
+/// similarity component in equal weight. A hit found by only one signal
+/// (e.g. a vector-only near-duplicate FTS5's exact tokenizer missed
+/// entirely) still gets a score -- the other component contributes 0,
+/// not `None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub ref_type: SearchRefType,
@@ -1606,6 +1687,14 @@ pub struct SearchResult {
     pub text: String,
     pub score: f64,
 }
+
+/// Describes `search_knowledge`'s retrieval mode honestly: real fusion
+/// of two signals, but the vector half is `HashingEmbedder` (syntactic
+/// token-hashing), not a trained semantic model. Centralized here rather
+/// than hardcoded in `main.rs` so the description can't drift from what
+/// the function actually does.
+pub const RETRIEVAL_MODE_DESCRIPTION: &str =
+    "hybrid (lexical FTS5 + local hashing-vector -- not a trained semantic embedding)";
 
 /// Escapes `query` into a safe FTS5 `MATCH` expression: each whitespace-
 /// separated token becomes a quoted string literal (an embedded `"`
@@ -1627,18 +1716,23 @@ fn fts5_safe_query(query: &str) -> Option<String> {
     }
 }
 
-/// Lexical (FTS5) search over every `Rule.statement` and `Subject.name`/
+/// Hybrid search over every `Rule.statement` and `Subject.name`/
 /// `short_name`/`description`, kept in sync incrementally by
-/// `insert_rule`/`insert_subject` -- never rebuilt per call. Deliberately
-/// lexical-only: the previous model's `Embedder` trait and `sqlite-vec`
-/// vector/hybrid-search infrastructure were removed entirely along with
-/// the schema this replaces and are not reintroduced here (see
-/// `ARCHITECTURE.md`'s non-goals) -- this is a scope decision, not a gap.
+/// `insert_rule`/`insert_subject` -- never rebuilt per call. Fuses two
+/// real signals in equal weight: lexical (FTS5 `bm25`, min-max
+/// normalized to `[0, 1]` across the fetched candidate set) and vector
+/// (cosine similarity against every stored `HashingEmbedder` vector --
+/// see that type's doc comment for what it is and isn't). A hit found by
+/// only one signal is still ranked, with the other signal contributing 0
+/// rather than excluding it -- that's the point of fusion over a pure
+/// lexical `AND`/`OR`.
 ///
-/// Internally over-fetches (bounded by `OVER_FETCH_CAP`) before applying
-/// the optional `domain_tag` filter and truncating to `limit`, since a
-/// hit's domain isn't stored redundantly in the FTS5 index. Fine at this
-/// dataset's scale; revisit if that ever becomes a real bottleneck.
+/// Both the lexical candidate fetch (bounded by `OVER_FETCH_CAP`) and the
+/// vector similarity scan (bounded by `VECTOR_CANDIDATE_CAP`, brute-force
+/// over every stored vector) happen before applying the optional
+/// `domain_tag` filter and truncating to `limit`, since a hit's domain
+/// isn't stored redundantly in either index. Fine at this dataset's
+/// scale; revisit if that ever becomes a real bottleneck.
 pub fn search_knowledge(
     conn: &Connection,
     query: &str,
@@ -1646,27 +1740,105 @@ pub fn search_knowledge(
     limit: usize,
 ) -> rusqlite::Result<Vec<SearchResult>> {
     const OVER_FETCH_CAP: usize = 200;
-    let Some(match_expr) = fts5_safe_query(query) else {
+    const VECTOR_CANDIDATE_CAP: usize = 50;
+    // A single hash-bucket collision between the query and an unrelated
+    // document can produce spurious low-level cosine similarity purely
+    // by chance -- this floor keeps that noise out of the candidate set
+    // so an unrelated ("no match") query doesn't pick up phantom hits.
+    const MIN_VECTOR_SIMILARITY: f32 = 0.25;
+
+    if query.trim().is_empty() {
         return Ok(Vec::new());
-    };
-    let fetch_limit = if domain_tag.is_some() {
-        OVER_FETCH_CAP
+    }
+
+    let mut lexical_scores: HashMap<(String, String), f64> = HashMap::new();
+    let mut text_by_key: HashMap<(String, String), String> = HashMap::new();
+    if let Some(match_expr) = fts5_safe_query(query) {
+        let mut stmt = conn.prepare(
+            "SELECT ref_id, ref_type, text, rank FROM search_index \
+             WHERE search_index MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows: Vec<(String, String, String, f64)> = stmt
+            .query_map(params![match_expr, OVER_FETCH_CAP as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (ref_id, ref_type, text, score) in rows {
+            lexical_scores.insert((ref_id.clone(), ref_type.clone()), score);
+            text_by_key.insert((ref_id, ref_type), text);
+        }
+    }
+
+    let query_vector = HashingEmbedder.embed(query);
+    let mut vector_scores: HashMap<(String, String), f32> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT ref_id, ref_type, vector FROM search_vectors")?;
+        let mut rows: Vec<(String, String, f32)> = stmt
+            .query_map([], |row| {
+                let ref_id: String = row.get(0)?;
+                let ref_type: String = row.get(1)?;
+                let bytes: Vec<u8> = row.get(2)?;
+                let similarity = cosine_similarity(&decode_vector(&bytes), &query_vector);
+                Ok((ref_id, ref_type, similarity))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.retain(|(_, _, similarity)| *similarity >= MIN_VECTOR_SIMILARITY);
+        rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        rows.truncate(VECTOR_CANDIDATE_CAP);
+        for (ref_id, ref_type, similarity) in rows {
+            vector_scores.insert((ref_id, ref_type), similarity);
+        }
+    }
+
+    for key in vector_scores.keys() {
+        if let std::collections::hash_map::Entry::Vacant(entry) = text_by_key.entry(key.clone()) {
+            let text: Option<String> = conn
+                .query_row(
+                    "SELECT text FROM search_index WHERE ref_id = ?1 AND ref_type = ?2",
+                    params![key.0, key.1],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(text) = text {
+                entry.insert(text);
+            }
+        }
+    }
+
+    let lexical_normalized: HashMap<(String, String), f32> = if lexical_scores.is_empty() {
+        HashMap::new()
     } else {
-        limit
+        let min = lexical_scores
+            .values()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        let max = lexical_scores
+            .values()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = (max - min).max(1e-9);
+        lexical_scores
+            .iter()
+            .map(|(key, score)| (key.clone(), ((max - score) / range) as f32))
+            .collect()
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT ref_id, ref_type, text, rank FROM search_index \
-         WHERE search_index MATCH ?1 ORDER BY rank LIMIT ?2",
-    )?;
-    let rows: Vec<(String, String, String, f64)> = stmt
-        .query_map(params![match_expr, fetch_limit as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let mut combined: Vec<((String, String), f32)> = text_by_key
+        .keys()
+        .map(|key| {
+            let lexical = lexical_normalized.get(key).copied().unwrap_or(0.0);
+            let vector = vector_scores.get(key).copied().unwrap_or(0.0);
+            (key.clone(), 0.5 * lexical + 0.5 * vector)
+        })
+        .collect();
+    combined.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
 
     let mut out = Vec::new();
-    for (ref_id, ref_type_text, text, score) in rows {
+    for ((ref_id, ref_type_text), score) in combined {
         let ref_type = match ref_type_text.as_str() {
             "rule" => SearchRefType::Rule,
             "subject" => SearchRefType::Subject,
@@ -1693,12 +1865,16 @@ pub fn search_knowledge(
         {
             continue;
         }
+        let text = text_by_key
+            .get(&(ref_id.clone(), ref_type_text.clone()))
+            .cloned()
+            .unwrap_or_default();
         out.push(SearchResult {
             ref_type,
             ref_id,
             domain_tag: resolved_domain_tag,
             text,
-            score,
+            score: score as f64,
         });
         if out.len() >= limit {
             break;
@@ -3066,6 +3242,62 @@ mod tests {
     }
 
     #[test]
+    fn hashing_embedder_is_deterministic_and_l2_normalized() {
+        let a = HashingEmbedder.embed("data product owner");
+        let b = HashingEmbedder.embed("data product owner");
+        assert_eq!(a, b);
+        let norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
+    }
+
+    #[test]
+    fn hashing_embedder_empty_text_is_the_zero_vector() {
+        let vector = HashingEmbedder.embed("");
+        assert!(vector.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn cosine_similarity_of_a_vector_with_itself_is_one() {
+        let vector = HashingEmbedder.embed("data mesh principles");
+        let similarity = cosine_similarity(&vector, &vector);
+        assert!((similarity - 1.0).abs() < 1e-5, "got {similarity}");
+    }
+
+    #[test]
+    fn vector_encode_decode_round_trips() {
+        let original = HashingEmbedder.embed("round trip this vector");
+        let decoded = decode_vector(&encode_vector(&original));
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn every_indexed_row_has_a_stored_vector() {
+        let conn = seeded();
+        let index_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_index", [], |row| row.get(0))
+            .unwrap();
+        let vector_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_vectors", [], |row| row.get(0))
+            .unwrap();
+        assert!(index_count > 0);
+        assert_eq!(index_count, vector_count);
+    }
+
+    #[test]
+    fn search_knowledge_score_is_higher_is_better() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "accountable owner", None, 10).unwrap();
+        assert!(results.len() >= 2);
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].score >= pair[1].score,
+                "results should be sorted by descending score: {:?}",
+                results
+            );
+        }
+    }
+
+    #[test]
     fn rule_derivations_for_subject_returns_seeded_derivation_with_sources() {
         let conn = seeded();
         let derivations = rule_derivations_for_subject(&conn, "udra.DataProduct").unwrap();
@@ -3103,11 +3335,20 @@ mod tests {
     #[test]
     fn rule_derivations_are_not_indexed_for_search() {
         let conn = seeded();
+        // Search for a word unique to the derivation's own summary text
+        // (not present in any Rule/Subject). Assert on the specific
+        // guarantee -- the derivation's own id never appears as a hit --
+        // rather than an empty result set: with a hashing-trick vector
+        // component in the mix, an unrelated query can still turn up
+        // low-similarity noise from real indexed content by chance, and
+        // that's not what this test is about.
         let results = search_knowledge(&conn, "synthesized", None, 10).unwrap();
         assert!(
-            results.is_empty(),
-            "a derivation's own summary text should not be searchable -- only its source \
-             Rules are, and none of them contain \"synthesized\""
+            results
+                .iter()
+                .all(|r| r.ref_id != "ruleder.data-product-ownership-summary"),
+            "a derivation's own summary text should not be directly searchable -- only its \
+             source Rules are"
         );
     }
 

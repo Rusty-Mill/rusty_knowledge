@@ -65,16 +65,20 @@ all.
 | ---- | ---------- | ----- |
 | `store::Store` (read-only query surface `KnowledgeServer` needs) | `store::SqliteStore` — wraps a `rusqlite::Connection`, in-memory or file-backed (`KNOWLEDGE_DB_PATH`) | single implementation; writes/bootstrap stay on the raw `Connection`, outside the trait |
 
-There is no embedder boundary in this model -- the previous crate's
-`Embedder` trait (`rusty_embedder_core`, `NullEmbedder`/local/http backends)
-and its `sqlite-vec`-backed hybrid/vector search were built around the old
-schema and were not carried forward; their `Cargo.toml` dependencies and the
-`local-embeddings`/`http-embeddings` features were removed once nothing in
-`src/` referenced them anymore. `search_knowledge` is real, but
-lexical-only: a SQLite FTS5 virtual table (`search_index`) kept in sync
-incrementally by `insert_rule`/`insert_subject`, with no vector component
-and no embedder pluggability -- a deliberate scope decision, documented in
-Non-goals below, not a gap.
+`store::Embedder` is a small pluggable-embedding port -- not the previous
+crate's `rusty_embedder_core`/`sqlite-vec` infrastructure, which was built
+around the old schema, removed with it, and isn't reintroduced here (their
+`Cargo.toml` dependencies and `local-embeddings`/`http-embeddings` features
+were removed once nothing in `src/` referenced them). Its only
+implementation is `store::HashingEmbedder`: a zero-dependency, zero-network
+"hashing trick" bag-of-words vector, not a trained semantic model --
+disclosed as syntactic (token-overlap-driven), never presented as more than
+it is. `search_knowledge` fuses this vector signal with lexical (FTS5,
+`search_index`) in equal weight; both indexes are kept in sync
+incrementally by `insert_rule`/`insert_subject` via `index_for_search`.
+`store::RETRIEVAL_MODE_DESCRIPTION` is the single source of truth for how
+the tool describes its own retrieval mode, so the description can't drift
+from the actual behavior.
 
 ## Structure
 Single binary crate, three modules:
@@ -153,12 +157,14 @@ deferred anymore.
 
 ## Non-goals
 Deliberately out of scope, not silently dropped:
-- Vector/hybrid search (the `Embedder` trait, `sqlite-vec`) — the previous
-  model's hybrid FTS5+vector retrieval was built around the old schema and
-  was not carried forward. `search_knowledge` is real in the current
-  model, but deliberately lexical-only (FTS5, no vector component, no
-  embedder pluggability); reintroducing a vector/hybrid layer is follow-up
-  work for if a real case needs it, not assumed to happen automatically.
+- A trained/semantic embedder for `search_knowledge` — `store::Embedder`
+  is a real pluggable port and `HashingEmbedder` is a genuine (if
+  syntactic, not semantic) vector signal fused into hybrid retrieval
+  today, but this crate has no network access and bundles no model
+  weights, so a real semantic backend (à la the previous model's
+  `rusty_embedder_core`/`sqlite-vec` infrastructure) stays a
+  follow-up for if a real case needs it, not assumed to happen
+  automatically.
 - A second `Store` implementation — the trait now exists (see Boundaries
   above), but `SqliteStore` is still its only implementer; a real second
   backend would be the trigger for anything further (e.g. reconsidering

@@ -71,12 +71,12 @@ implemented.
   review. Correlates by exact subject identity first, not just an ancestor
   walk, so it catches disagreement between sibling organizations under the
   same parent — not only parent/child contradictions.
-- `search_knowledge` — lexical (FTS5) keyword search over every Rule
-  statement and Subject name/short_name/description, kept in sync
-  incrementally at write time. Always declares its retrieval mode
-  (`lexical-only` — this model has no vector/hybrid component; that
-  infrastructure was removed along with the schema this replaces and isn't
-  reintroduced here).
+- `search_knowledge` — hybrid search over every Rule statement and Subject
+  name/short_name/description, fusing lexical (FTS5) and vector (a local
+  "hashing trick" bag-of-words embedding) signals in equal weight, kept in
+  sync incrementally at write time. Always declares its retrieval mode
+  honestly — the vector half is a zero-dependency, zero-network technique,
+  not a trained semantic model.
 - `lookup_derived_summary` — any `RuleDerivation` rollup summaries recorded
   for a subject, always labeled NON-AUTHORITATIVE with the exact Rules each
   one was synthesized from. Firewalled from authority by construction:
