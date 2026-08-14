@@ -75,12 +75,16 @@ implementations, selected once per process by `store::active_embedder()`
 (the default), a zero-dependency, zero-network "hashing trick" bag-of-words
 vector, not a trained semantic model -- disclosed as syntactic
 (token-overlap-driven), never presented as more than it is; and
-`store::OnyxEmbedder` (opt-in via `EMBEDDING_BACKEND=onyx`), a real
-semantic model called over Onyx's cloud embeddings API via `rusty_request`
-(the ecosystem's own sovereign HTTP client, not `reqwest`). A misconfigured
-`onyx` backend (missing `ONYX_API_KEY`/`ONYX_EMBEDDING_MODEL`) fails loudly
-to stderr and falls back to `HashingEmbedder` rather than silently doing
-nothing. `search_knowledge` fuses whichever vector signal is active with
+`store::OllamaEmbedder` (opt-in via `EMBEDDING_BACKEND=ollama`), a real
+semantic model called over a local (or otherwise self-hosted) Ollama
+server's `/api/embed` endpoint via `rusty_request` (the ecosystem's own
+sovereign HTTP client, not `reqwest`). No API key -- a local Ollama server
+has nothing to authenticate to by default; an earlier attempt at this same
+port targeted Onyx's *cloud* embeddings API instead, which turned out to
+require one, with no unauthenticated tier. A misconfigured `ollama` backend
+(missing `OLLAMA_EMBEDDING_MODEL`) fails loudly to stderr and falls back to
+`HashingEmbedder` rather than silently doing nothing. `search_knowledge`
+fuses whichever vector signal is active with
 lexical (FTS5, `search_index`) in equal weight; both indexes are kept in
 sync incrementally by `insert_rule`/`insert_subject` via `index_for_search`.
 `store::retrieval_mode_description()` is the single source of truth for how
@@ -165,13 +169,15 @@ deferred anymore.
 ## Non-goals
 Deliberately out of scope, not silently dropped:
 - A *live-verified* semantic embedder for `search_knowledge` —
-  `store::OnyxEmbedder` is a real, opt-in (`EMBEDDING_BACKEND=onyx`)
-  implementation calling Onyx's cloud embeddings API, not a stub, but it
-  has never been exercised against a live endpoint in this environment (no
-  API key has been available) — its tests cover request/response shape
-  against a local mock server only. A first live run with real credentials
-  is the only thing that actually confirms end-to-end correctness; until
-  then, treat it as implemented but unverified, not as proven to work.
+  `store::OllamaEmbedder` is a real, opt-in (`EMBEDDING_BACKEND=ollama`)
+  implementation calling a local (or otherwise self-hosted) Ollama
+  server's `/api/embed` endpoint, not a stub, but it has never been
+  exercised against a live server in this environment (no Ollama
+  installation is available here) — its tests cover request/response
+  shape against a local mock server only. A first live run against a real
+  Ollama instance is the only thing that actually confirms end-to-end
+  correctness; until then, treat it as implemented but unverified, not as
+  proven to work.
 - A second `Store` implementation — the trait now exists (see Boundaries
   above), but `SqliteStore` is still its only implementer; a real second
   backend would be the trigger for anything further (e.g. reconsidering

@@ -66,8 +66,8 @@
 //!   `store::retrieval_mode_description`, reflecting whichever
 //!   `Embedder` is actually active: `store::HashingEmbedder` (default,
 //!   zero-dependency, zero-network "hashing trick" bag-of-words, not a
-//!   trained semantic model) or `store::OnyxEmbedder` (a real semantic
-//!   model, opt-in via `EMBEDDING_BACKEND=onyx`).
+//!   trained semantic model) or `store::OllamaEmbedder` (a real semantic
+//!   model, opt-in via `EMBEDDING_BACKEND=ollama`).
 //! - `lookup_derived_summary` — any `RuleDerivation` rollups recorded for
 //!   a subject, always labeled NON-AUTHORITATIVE and listing exactly
 //!   which Rules each one was synthesized from. Firewalled from

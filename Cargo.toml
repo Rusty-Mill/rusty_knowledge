@@ -9,8 +9,8 @@ rmcp = { version = "3.1.2", features = ["macros", "server", "transport-io"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusty_regx = { git = "https://github.com/baileyrd/rusty_regx", rev = "93c5541d6713750141476c87d6cd774629e1ae3a" }
 # The ecosystem's own sovereign HTTP client (no reqwest/hyper) -- used
-# only by store::OnyxEmbedder, an opt-in real embedding backend behind
-# EMBEDDING_BACKEND=onyx (see that type's doc comment). `tokio` feature:
+# only by store::OllamaEmbedder, an opt-in real embedding backend behind
+# EMBEDDING_BACKEND=ollama (see that type's doc comment). `tokio` feature:
 # runs on this crate's own real-tokio runtime (already started by
 # `#[tokio::main]` in main.rs) instead of pulling in a second,
 # rusty_request-native async runtime alongside it.

@@ -5,6 +5,33 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #68 — Replace OnyxEmbedder with OllamaEmbedder (no API key needed)
+**2026-08-14** · [#68](https://github.com/Rusty-Mill/rusty_knowledge/pull/68)
+
+- **Corrected:** PR #67's `store::OnyxEmbedder` targeted Onyx's *cloud*
+  embeddings API (`ai.onyx.dev`), which turned out to require
+  authentication (a Bearer token, or `x-onyx-key`/`x-onyx-secret`) with no
+  unauthenticated tier — exactly the credential this environment doesn't
+  have. Replaced with `store::OllamaEmbedder`, calling a local (or
+  otherwise self-hosted) Ollama server's `POST /api/embed` instead. A
+  local Ollama server has nothing to authenticate to by default, so no API
+  key is needed at all.
+- `EMBEDDING_BACKEND=ollama` replaces `EMBEDDING_BACKEND=onyx`;
+  `OLLAMA_EMBEDDING_MODEL` (required — Ollama has no documented default
+  embedding model) and `OLLAMA_API_BASE_URL` (optional, defaults to
+  `http://localhost:11434`) replace `ONYX_API_KEY`/`ONYX_EMBEDDING_MODEL`/
+  `ONYX_API_BASE_URL`. `HashingEmbedder` remains the unchanged default.
+- Request/response shape changed to match Ollama's actual documented
+  contract: `{"model", "input"}` → `{"embeddings": [[...]]}` (a batched
+  shape, one vector array per input, even for a single string), rather
+  than Onyx's `{"model", "prompt"}` → `{"embedding": [...]}`.
+- **Still honestly disclosed:** this environment has no Ollama
+  installation either, so `OllamaEmbedder` remains live-unverified —
+  tested only against a local mock HTTP server exercising the documented
+  request/response shape. Swapping which real backend is unverified
+  doesn't change that status; it's tracked the same way `OnyxEmbedder`'s
+  was.
+
 ## PR #67 — Real (Onyx) semantic embedder backend for search_knowledge
 **2026-08-14** · [#67](https://github.com/Rusty-Mill/rusty_knowledge/pull/67)
 

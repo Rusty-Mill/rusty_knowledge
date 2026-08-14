@@ -852,8 +852,10 @@ impl Embedder for HashingEmbedder {
 /// L2-normalizes `vector` in place -- every vector this module stores is
 /// expected to already be unit-length, so `cosine_similarity` can be a
 /// plain dot product. `HashingEmbedder` does this itself inline;
-/// `OnyxEmbedder` calls this explicitly since a real embedding API isn't
-/// guaranteed to already return a normalized vector.
+/// `OllamaEmbedder` calls this explicitly as a defensive step -- Ollama's
+/// own docs say `/api/embed` already returns unit-length vectors, but
+/// re-normalizing an already-unit vector is a no-op, and it costs nothing
+/// to not depend on that holding across every model/version.
 fn l2_normalize(vector: &mut [f32]) {
     let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -863,21 +865,29 @@ fn l2_normalize(vector: &mut [f32]) {
     }
 }
 
-/// A second `Embedder` implementation, calling Onyx's cloud embeddings
-/// endpoint (Ollama-compatible `POST /api/embeddings`; see
-/// <https://onyx.dev/documentation/api-documentation/ai-endpoint>) via
+/// A second `Embedder` implementation, calling a local (or otherwise
+/// self-hosted) Ollama server's embeddings endpoint (`POST /api/embed`;
+/// see <https://docs.ollama.com/capabilities/embeddings>) via
 /// `rusty_request`, the ecosystem's own sovereign HTTP client. Real,
 /// trained, semantic -- unlike `HashingEmbedder`, this can find a
 /// synonym or paraphrase that shares no tokens with the query.
 ///
+/// This replaces an earlier attempt at this same gap that targeted
+/// Onyx's *cloud* embeddings API instead. That endpoint turned out to
+/// require authentication (a Bearer token, or an `x-onyx-key`/
+/// `x-onyx-secret` pair -- there's no unauthenticated tier), which is
+/// exactly the credential this environment doesn't have. Ollama, run
+/// locally, has no such requirement by default -- it's not a public
+/// service, so there's nothing to authenticate to.
+///
 /// **Honesty note, not a hedge:** this has never been run against a
-/// live Onyx endpoint in this codebase's own development or CI --
-/// there's no API key available in this environment to do that with.
-/// The request/response *shape* is real and unit-tested against a local
-/// hand-rolled HTTP server (see the `tests` module), matching Onyx's
-/// documented Ollama-compatible contract, but a live first run against
-/// a real key is the only thing that actually confirms end-to-end
-/// correctness. Opt-in via `EMBEDDING_BACKEND=onyx` (see
+/// live Ollama server in this codebase's own development or CI -- this
+/// environment has no Ollama installation to test against. The
+/// request/response *shape* is real and unit-tested against a local
+/// hand-rolled HTTP server (see the `tests` module), matching Ollama's
+/// documented `/api/embed` contract, but a first real run against an
+/// actual server is the only thing that actually confirms end-to-end
+/// correctness. Opt-in via `EMBEDDING_BACKEND=ollama` (see
 /// `active_embedder`) specifically so nothing changes for a caller who
 /// doesn't set it -- `HashingEmbedder` remains the default, and a
 /// configuration or request failure falls back to it loudly (an
@@ -892,7 +902,7 @@ fn l2_normalize(vector: &mut [f32]) {
 /// `index_for_search`/`search_knowledge`, both reached only through
 /// `main()`'s server loop or `seed_udra`/the importer at startup --
 /// never from this module's own synchronous unit tests, which don't set
-/// `EMBEDDING_BACKEND` and so never construct an `OnyxEmbedder` at all.
+/// `EMBEDDING_BACKEND` and so never construct an `OllamaEmbedder` at all.
 ///
 /// **Vector-space caveat, disclosed rather than silently handled:**
 /// switching `EMBEDDING_BACKEND` against a `KNOWLEDGE_DB_PATH` store
@@ -904,32 +914,30 @@ fn l2_normalize(vector: &mut [f32]) {
 /// that boundary rather than an error. This crate has no reindex tool
 /// yet; treat a backend switch on a persistent store as a fresh-store
 /// operation.
-pub struct OnyxEmbedder {
+pub struct OllamaEmbedder {
     client: rusty_request::Client,
     base_url: String,
     model: String,
 }
 
-impl OnyxEmbedder {
-    /// Builds a client from `ONYX_API_KEY` (required -- the bearer
-    /// token) and `ONYX_EMBEDDING_MODEL` (required -- Onyx's API has no
-    /// documented default), plus `ONYX_API_BASE_URL` (optional, defaults
-    /// to `https://ai.onyx.dev`). `Err` (a human-readable message) on a
-    /// missing required var -- never silently proceeds unauthenticated
-    /// or with a guessed model name.
+impl OllamaEmbedder {
+    /// Builds a client from `OLLAMA_EMBEDDING_MODEL` (required -- Ollama
+    /// has no documented default embedding model; it must already be
+    /// pulled on the target server) plus `OLLAMA_API_BASE_URL` (optional,
+    /// defaults to `http://localhost:11434`, Ollama's own default bind
+    /// address). No API key: a local Ollama server has nothing to
+    /// authenticate to by default. `Err` (a human-readable message) on a
+    /// missing required var -- never silently proceeds with a guessed
+    /// model name.
     pub fn from_env() -> Result<Self, String> {
-        let api_key =
-            std::env::var("ONYX_API_KEY").map_err(|_| "ONYX_API_KEY is not set".to_string())?;
-        let model = std::env::var("ONYX_EMBEDDING_MODEL")
-            .map_err(|_| "ONYX_EMBEDDING_MODEL is not set".to_string())?;
-        let base_url = std::env::var("ONYX_API_BASE_URL")
-            .unwrap_or_else(|_| "https://ai.onyx.dev".to_string());
+        let model = std::env::var("OLLAMA_EMBEDDING_MODEL")
+            .map_err(|_| "OLLAMA_EMBEDDING_MODEL is not set".to_string())?;
+        let base_url = std::env::var("OLLAMA_API_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
         let client = rusty_request::Client::builder()
-            .bearer_auth(&api_key)
-            .map_err(|err| format!("invalid ONYX_API_KEY: {err}"))?
             .timeout(std::time::Duration::from_secs(10))
             .build();
-        Ok(OnyxEmbedder {
+        Ok(OllamaEmbedder {
             client,
             base_url,
             model,
@@ -938,7 +946,7 @@ impl OnyxEmbedder {
 
     #[cfg(test)]
     fn with_base_url(base_url: &str, model: &str) -> Self {
-        OnyxEmbedder {
+        OllamaEmbedder {
             client: rusty_request::Client::new(),
             base_url: base_url.to_string(),
             model: model.to_string(),
@@ -948,31 +956,37 @@ impl OnyxEmbedder {
     async fn embed_async(&self, text: &str) -> Result<Vec<f32>, String> {
         let mut body = rusty_request::Json::object();
         body.insert("model", self.model.as_str());
-        body.insert("prompt", text);
-        let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
+        body.insert("input", text);
+        let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
         let response = self
             .client
             .post(&url)
-            .map_err(|err| format!("invalid Onyx embeddings URL {url:?}: {err}"))?
+            .map_err(|err| format!("invalid Ollama embeddings URL {url:?}: {err}"))?
             .json(&body)
             .map_err(|err| format!("failed to encode embedding request: {err}"))?
             .send()
             .await
-            .map_err(|err| format!("Onyx embeddings request failed: {err}"))?
+            .map_err(|err| format!("Ollama embeddings request failed: {err}"))?
             .error_for_status()
-            .map_err(|err| format!("Onyx embeddings request failed: {err}"))?;
+            .map_err(|err| format!("Ollama embeddings request failed: {err}"))?;
         let json = response
             .json()
-            .map_err(|err| format!("Onyx embeddings response was not valid JSON: {err}"))?;
-        let embedding = json
-            .get("embedding")
+            .map_err(|err| format!("Ollama embeddings response was not valid JSON: {err}"))?;
+        let embeddings = json
+            .get("embeddings")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| "Onyx embeddings response had no \"embedding\" array".to_string())?;
+            .ok_or_else(|| "Ollama embeddings response had no \"embeddings\" array".to_string())?;
+        let embedding = embeddings
+            .first()
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                "Ollama embeddings response's \"embeddings\" array was empty".to_string()
+            })?;
         let mut vector: Vec<f32> = embedding
             .iter()
             .map(|v| {
                 v.as_f64().map(|f| f as f32).ok_or_else(|| {
-                    "Onyx embeddings response had a non-numeric vector entry".to_string()
+                    "Ollama embeddings response had a non-numeric vector entry".to_string()
                 })
             })
             .collect::<Result<_, String>>()?;
@@ -981,7 +995,7 @@ impl OnyxEmbedder {
     }
 }
 
-impl Embedder for OnyxEmbedder {
+impl Embedder for OllamaEmbedder {
     fn embed(&self, text: &str) -> Vec<f32> {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.embed_async(text))
@@ -990,7 +1004,7 @@ impl Embedder for OnyxEmbedder {
             Ok(vector) => vector,
             Err(err) => {
                 eprintln!(
-                    "Onyx embedding request failed ({err}); using a zero vector for this text."
+                    "Ollama embedding request failed ({err}); using a zero vector for this text."
                 );
                 Vec::new()
             }
@@ -998,28 +1012,30 @@ impl Embedder for OnyxEmbedder {
     }
 
     fn description(&self) -> &'static str {
-        "Onyx cloud embedding -- a real trained semantic model"
+        "Ollama local embedding -- a real trained semantic model"
     }
 }
 
 /// Selects the active `Embedder` from `EMBEDDING_BACKEND`, read once and
 /// cached for the process's lifetime. Unset or any value other than
-/// `"onyx"` -> `HashingEmbedder` (the default; nothing changes for a
-/// caller who sets nothing). `"onyx"` -> `OnyxEmbedder::from_env()`, or a
-/// loud fallback to `HashingEmbedder` if that fails (missing env vars) --
-/// never a silent substitution.
+/// `"ollama"` -> `HashingEmbedder` (the default; nothing changes for a
+/// caller who sets nothing). `"ollama"` -> `OllamaEmbedder::from_env()`,
+/// or a loud fallback to `HashingEmbedder` if that fails (missing env
+/// vars) -- never a silent substitution.
 fn active_embedder() -> &'static dyn Embedder {
     static EMBEDDER: std::sync::OnceLock<Box<dyn Embedder + Send + Sync>> =
         std::sync::OnceLock::new();
     EMBEDDER
         .get_or_init(|| match std::env::var("EMBEDDING_BACKEND").as_deref() {
-            Ok("onyx") => match OnyxEmbedder::from_env() {
+            Ok("ollama") => match OllamaEmbedder::from_env() {
                 Ok(embedder) => {
-                    eprintln!("Using Onyx embedder for search_knowledge's vector component.");
+                    eprintln!("Using Ollama embedder for search_knowledge's vector component.");
                     Box::new(embedder)
                 }
                 Err(err) => {
-                    eprintln!("EMBEDDING_BACKEND=onyx but {err}; falling back to HashingEmbedder.");
+                    eprintln!(
+                        "EMBEDDING_BACKEND=ollama but {err}; falling back to HashingEmbedder."
+                    );
                     Box::new(HashingEmbedder)
                 }
             },
@@ -1879,7 +1895,7 @@ pub struct SearchResult {
 /// Describes `search_knowledge`'s retrieval mode honestly: real fusion of
 /// two signals, lexical FTS5 plus whichever `Embedder` (`active_embedder`)
 /// is actually configured -- reflecting `HashingEmbedder`'s syntactic
-/// token-hashing or `OnyxEmbedder`'s real semantic model, whichever is
+/// token-hashing or `OllamaEmbedder`'s real semantic model, whichever is
 /// active, not a hardcoded claim. Centralized here rather than duplicated
 /// in `main.rs` so the description can't drift from what actually ran.
 pub fn retrieval_mode_description() -> String {
@@ -3491,23 +3507,23 @@ mod tests {
     }
 
     #[test]
-    fn onyx_embedder_from_env_requires_an_api_key() {
-        // No ONYX_API_KEY is set anywhere in this environment (by
-        // design -- see OnyxEmbedder's doc comment: no credentials are
-        // available to test against a live endpoint). Confirms the
+    fn ollama_embedder_from_env_requires_a_model() {
+        // No OLLAMA_EMBEDDING_MODEL is set anywhere in this environment
+        // (by design -- see OllamaEmbedder's doc comment: no Ollama
+        // installation is available to test against). Confirms the
         // loud-failure path without this test itself touching global
         // env state (mutating env vars from a test is racy against
         // other tests running in parallel in the same process).
-        assert!(OnyxEmbedder::from_env().is_err());
+        assert!(OllamaEmbedder::from_env().is_err());
     }
 
     /// Spins up a one-shot, hand-rolled HTTP/1.1 server on a local
     /// ephemeral port (same approach `rusty_request`'s own test suite
     /// uses, per its README) and returns the port plus a join handle
     /// that resolves once it's served exactly one request with `body`.
-    /// Verifies `OnyxEmbedder`'s request-building and response-parsing
-    /// against Onyx's documented contract, without needing a live
-    /// endpoint or credentials.
+    /// Verifies `OllamaEmbedder`'s request-building and response-parsing
+    /// against Ollama's documented `/api/embed` contract, without
+    /// needing a live server.
     fn spawn_one_shot_json_server(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3527,12 +3543,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn onyx_embedder_parses_the_embedding_array_and_normalizes_it() {
+    async fn ollama_embedder_parses_the_embedding_array_and_normalizes_it() {
         // Already unit-length (0.6^2 + 0.8^2 = 1.0), so l2_normalize is
         // a no-op and the assertion can be an exact match.
-        let (port, handle) = spawn_one_shot_json_server(r#"{"embedding":[0.6,0.8]}"#);
+        let (port, handle) = spawn_one_shot_json_server(r#"{"embeddings":[[0.6,0.8]]}"#);
         let embedder =
-            OnyxEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+            OllamaEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
         let vector = embedder.embed("hello world");
         handle.join().unwrap();
         assert_eq!(vector.len(), 2);
@@ -3541,11 +3557,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn onyx_embedder_normalizes_a_non_unit_response_vector() {
+    async fn ollama_embedder_normalizes_a_non_unit_response_vector() {
         // [3.0, 4.0] has norm 5.0 -- normalized, [0.6, 0.8].
-        let (port, handle) = spawn_one_shot_json_server(r#"{"embedding":[3.0,4.0]}"#);
+        let (port, handle) = spawn_one_shot_json_server(r#"{"embeddings":[[3.0,4.0]]}"#);
         let embedder =
-            OnyxEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+            OllamaEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
         let vector = embedder.embed("hello world");
         handle.join().unwrap();
         let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -3553,10 +3569,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn onyx_embedder_missing_embedding_field_falls_back_to_empty_not_a_panic() {
+    async fn ollama_embedder_missing_embeddings_field_falls_back_to_empty_not_a_panic() {
         let (port, handle) = spawn_one_shot_json_server(r#"{"unexpected":"shape"}"#);
         let embedder =
-            OnyxEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+            OllamaEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
+        let vector = embedder.embed("hello world");
+        handle.join().unwrap();
+        assert!(vector.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_embedder_empty_embeddings_array_falls_back_to_empty_not_a_panic() {
+        let (port, handle) = spawn_one_shot_json_server(r#"{"embeddings":[]}"#);
+        let embedder =
+            OllamaEmbedder::with_base_url(&format!("http://127.0.0.1:{port}"), "test-model");
         let vector = embedder.embed("hello world");
         handle.join().unwrap();
         assert!(vector.is_empty());
