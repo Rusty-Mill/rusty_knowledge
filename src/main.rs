@@ -1,24 +1,23 @@
 //! Rusty Knowledge — an MCP server (via `rmcp`, stdio transport) over the
 //! knowledge-model-v2 store (`Source`/`SourceAuthority`/`Subject`/`Rule`/
-//! `RuleRelation` -- see `store`'s module doc for the two tables the
-//! fuller design specifies but this doesn't implement yet).
+//! `RuleRelation`/`SelectionGroup`/`RuleDerivation` -- see `store`'s module
+//! doc for the one remaining piece of the fuller seven-table design this
+//! doesn't implement).
 //!
-//! This is a vertical slice proving the redesigned model end-to-end, not
-//! a full port of the previous 15-tool surface. That surface was built
-//! around the model this replaces (`AuthorityLayer`/`Construct`/a fixed
-//! 4-layer taxonomy) and is deferred to follow-up work, not silently
-//! dropped.
+//! `KNOWLEDGE_DB_PATH` set at startup opens a file-backed store instead of
+//! the default in-memory one (see `store::open_store_at`); either way,
+//! `KNOWLEDGE_MCP_IMPORT_PATH` set imports a real `knowledge-mcp` SQLite
+//! file (see `knowledge_mcp_import_v2`'s module doc for exactly what does
+//! and doesn't translate) instead of the small hand-seeded illustrative
+//! UDRA dataset (`store::seed_udra`) -- the two aren't run together, since
+//! the reference data's `udra` domain and the hand-seeded one use
+//! overlapping ids (e.g. both define `udra.DataProduct`). Neither runs at
+//! all against a store that already has data from a previous run
+//! (`store::is_empty`). Omit both env vars and nothing changes from the
+//! in-memory hand-seeded default.
 //!
-//! Setting `KNOWLEDGE_MCP_IMPORT_PATH` at startup imports a real
-//! `knowledge-mcp` SQLite file (see `knowledge_mcp_import_v2`'s module
-//! doc for exactly what does and doesn't translate) instead of the small
-//! hand-seeded illustrative UDRA dataset (`store::seed_udra`) -- the two
-//! aren't run together, since the reference data's `udra` domain and the
-//! hand-seeded one use overlapping ids (e.g. both define
-//! `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
-//! default.
-//!
-//! All 16 tools tracked by rusty_knowledge#55 are now wired end-to-end.
+//! All 16 tools tracked by rusty_knowledge#55 are wired end-to-end, plus
+//! `lookup_derived_summary` (below).
 //! - `lookup_subject` — everything a Subject's authority chain says about
 //!   it, across every Source that makes a claim, with provenance.
 //! - `lookup_rules` — plain statement rules for a subject (excludes
@@ -66,6 +65,11 @@
 //!   has no vector/hybrid component; that infrastructure was removed
 //!   entirely along with the schema this replaces and isn't reintroduced
 //!   here).
+//! - `lookup_derived_summary` — any `RuleDerivation` rollups recorded for
+//!   a subject, always labeled NON-AUTHORITATIVE and listing exactly
+//!   which Rules each one was synthesized from. Firewalled from
+//!   authority: never returned by `lookup_subject`/`lookup_rules`, never
+//!   indexed for `search_knowledge`, never a `RuleRelation` participant.
 
 mod knowledge_mcp_import_v2;
 mod store;
@@ -213,6 +217,14 @@ struct SearchKnowledgeParams {
     limit: Option<usize>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct LookupDerivedSummaryParams {
+    /// Domain tag the subject belongs to, e.g. "udra".
+    domain_tag: String,
+    /// Short name or full subject ID.
+    subject_ref: String,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -260,7 +272,9 @@ fn routing_guide() -> String {
      - \"Is X valid/conformant?\" -> validate_element\n\
      - \"Is this model/container complete? What's missing?\" -> validate_completeness\n\
      - \"Where do sources disagree about X?\" -> crosscut_conflicts\n\
-     - \"Search for X across everything\" -> search_knowledge (lexical-only keyword search)"
+     - \"Search for X across everything\" -> search_knowledge (lexical-only keyword search)\n\
+     - \"Give me a quick summary of X\" -> lookup_derived_summary (NON-AUTHORITATIVE -- \
+       still verify against lookup_subject)"
         .to_string()
 }
 
@@ -1066,6 +1080,59 @@ impl KnowledgeServer {
         format!(
             "{} result(s) for {query:?} (retrieval mode: lexical-only; lower score = more relevant):\n{lines}",
             results.len()
+        )
+    }
+
+    #[tool(
+        description = "Look up any synthesized, non-authoritative rollup summaries recorded for a subject (RuleDerivation). Every response is explicitly labeled NON-AUTHORITATIVE and lists the Rules it was derived from -- use lookup_subject for ground truth, this tool only for a quick orientation summary."
+    )]
+    fn lookup_derived_summary(
+        &self,
+        Parameters(LookupDerivedSummaryParams {
+            domain_tag,
+            subject_ref,
+        }): Parameters<LookupDerivedSummaryParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let derivations = match store::rule_derivations_for_subject(&conn, &subject.id) {
+            Ok(derivations) => derivations,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if derivations.is_empty() {
+            return format!(
+                "{} ({}) has no recorded derived summaries.",
+                subject.name, subject.id
+            );
+        }
+
+        let body = derivations
+            .iter()
+            .map(|d| {
+                format!(
+                    "  [NON-AUTHORITATIVE] {}: {}\n    Derived from: {}",
+                    d.label,
+                    d.summary,
+                    d.source_rule_ids.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{} ({}) -- {} derived summary/summaries (NON-AUTHORITATIVE -- refer to \
+             lookup_subject for ground truth):\n{body}",
+            subject.name,
+            subject.id,
+            derivations.len()
         )
     }
 }

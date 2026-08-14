@@ -396,6 +396,27 @@ pub struct SelectionGroup {
     pub member_rule_ids: Vec<String>,
 }
 
+/// A synthesized rollup over a set of Rules about one Subject -- e.g. "the
+/// combined effective guidance," written by a human/process reading
+/// several individual Rules and summarizing them into one text.
+/// **Firewalled from authority, deliberately**: a `RuleDerivation` is
+/// never itself a `Rule` (it has no `binding_strength`, no
+/// `machine_check`, no `id` a `RuleRelation` can reference), is never
+/// returned by `rules_for_subject`/`statement_rules_for_subject`/etc, and
+/// never participates in the conflict gate. It fully discloses which
+/// Rules it was synthesized from (`source_rule_ids`) so a reader can go
+/// verify against the ground truth rather than citing the rollup itself
+/// as authoritative -- the same "disclose, don't fabricate" posture as
+/// `knowledge_mcp_import_v2`'s `ImportReport`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleDerivation {
+    pub id: String,
+    pub subject_id: String,
+    pub label: String,
+    pub summary: String,
+    pub source_rule_ids: Vec<String>,
+}
+
 fn schema_ddl() -> &'static str {
     "
     CREATE TABLE sources (
@@ -472,6 +493,20 @@ fn schema_ddl() -> &'static str {
         ref_id UNINDEXED,
         ref_type UNINDEXED,
         text
+    );
+
+    CREATE TABLE rule_derivations (
+        id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL REFERENCES subjects(id),
+        label TEXT NOT NULL,
+        summary TEXT NOT NULL
+    );
+    CREATE INDEX idx_rule_derivations_subject ON rule_derivations(subject_id);
+
+    CREATE TABLE rule_derivation_sources (
+        derivation_id TEXT NOT NULL REFERENCES rule_derivations(id),
+        rule_id TEXT NOT NULL REFERENCES rules(id),
+        PRIMARY KEY (derivation_id, rule_id)
     );
     "
 }
@@ -1525,6 +1560,73 @@ pub fn search_knowledge(
     Ok(out)
 }
 
+const RULE_DERIVATION_COLUMNS: &str = "id, subject_id, label, summary";
+
+fn rule_derivation_from_row(row: &rusqlite::Row) -> rusqlite::Result<RuleDerivation> {
+    Ok(RuleDerivation {
+        id: row.get(0)?,
+        subject_id: row.get(1)?,
+        label: row.get(2)?,
+        summary: row.get(3)?,
+        source_rule_ids: Vec::new(),
+    })
+}
+
+/// Inserts a `RuleDerivation` and its source-rule links in one call. Not
+/// inserted into `search_index` -- a derivation is a rollup of existing
+/// Rule text, not new ground truth, and `search_knowledge` should surface
+/// the authoritative Rules themselves, not a paraphrase of them.
+pub fn insert_rule_derivation(
+    conn: &Connection,
+    derivation: &RuleDerivation,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO rule_derivations ({RULE_DERIVATION_COLUMNS}) VALUES (?1, ?2, ?3, ?4)"
+        ),
+        params![
+            derivation.id,
+            derivation.subject_id,
+            derivation.label,
+            derivation.summary,
+        ],
+    )?;
+    for rule_id in &derivation.source_rule_ids {
+        conn.execute(
+            "INSERT INTO rule_derivation_sources (derivation_id, rule_id) VALUES (?1, ?2)",
+            params![derivation.id, rule_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every `RuleDerivation` recorded for `subject_id`, with `source_rule_ids`
+/// populated (ordered by rule id). Deliberately separate from
+/// `rules_for_subject` and every other Rule-returning query -- a
+/// derivation is never mixed into the same result set as actual Rules,
+/// so a caller can't accidentally treat one as the other.
+pub fn rule_derivations_for_subject(
+    conn: &Connection,
+    subject_id: &str,
+) -> rusqlite::Result<Vec<RuleDerivation>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RULE_DERIVATION_COLUMNS} FROM rule_derivations WHERE subject_id = ?1 ORDER BY id"
+    ))?;
+    let mut derivations: Vec<RuleDerivation> = stmt
+        .query_map(params![subject_id], rule_derivation_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut sources_stmt = conn.prepare(
+        "SELECT rule_id FROM rule_derivation_sources WHERE derivation_id = ?1 ORDER BY rule_id",
+    )?;
+    for derivation in &mut derivations {
+        derivation.source_rule_ids = sources_stmt
+            .query_map(params![derivation.id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    Ok(derivations)
+}
+
 /// Seeds a real UDRA authority chain: a data mesh standard (root) ->
 /// Army UDRA -> the org's UDRA implementation -> two subordinate orgs
 /// (siblings) implementing under it. Exercises `DELEGATED` (the schema
@@ -1849,6 +1951,33 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
                 .into(),
             constraint: SelectionConstraint::All,
             member_rule_ids: vec!["rule.dm.002".into(), "rule.dm.003".into()],
+        },
+    )
+    .map_err(to_string_err)?;
+
+    // A non-authoritative rollup of the three separate ownership/
+    // registration rules spread across the authority chain (data mesh
+    // principle -> Army UDRA -> org implementation) -- useful as a quick
+    // orientation summary, but every claim in it traces back to a real
+    // Rule via source_rule_ids, which is what keeps it from being cited
+    // as ground truth on its own.
+    insert_rule_derivation(
+        conn,
+        &RuleDerivation {
+            id: "ruleder.data-product-ownership-summary".into(),
+            subject_id: "udra.DataProduct".into(),
+            label: "Effective ownership & registration guidance".into(),
+            summary: "A UDRA data product must have a clearly defined, accountable owner \
+                      (identified by a valid organizational email address), and must be \
+                      registered in the enterprise data catalog. See the cited rules for the \
+                      authoritative statements -- this is a synthesized summary, not itself a \
+                      rule."
+                .into(),
+            source_rule_ids: vec![
+                "rule.dm.001".into(),
+                "rule.army-udra.001".into(),
+                "rule.org.001".into(),
+            ],
         },
     )
     .map_err(to_string_err)?;
@@ -2671,5 +2800,51 @@ mod tests {
         let conn = seeded();
         let results = search_knowledge(&conn, "zzzznosuchword", None, 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn rule_derivations_for_subject_returns_seeded_derivation_with_sources() {
+        let conn = seeded();
+        let derivations = rule_derivations_for_subject(&conn, "udra.DataProduct").unwrap();
+        assert_eq!(derivations.len(), 1);
+        let derivation = &derivations[0];
+        assert_eq!(derivation.id, "ruleder.data-product-ownership-summary");
+        assert_eq!(
+            derivation.source_rule_ids,
+            vec![
+                "rule.army-udra.001".to_string(),
+                "rule.dm.001".to_string(),
+                "rule.org.001".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_derivations_for_subject_empty_when_none_recorded() {
+        let conn = seeded();
+        let derivations = rule_derivations_for_subject(&conn, "udra.DataContract").unwrap();
+        assert!(derivations.is_empty());
+    }
+
+    #[test]
+    fn rule_derivations_are_not_returned_by_rules_for_subject() {
+        let conn = seeded();
+        let rules = rules_for_subject(&conn, "udra.DataProduct").unwrap();
+        assert!(
+            rules
+                .iter()
+                .all(|(rule, _)| rule.id != "ruleder.data-product-ownership-summary")
+        );
+    }
+
+    #[test]
+    fn rule_derivations_are_not_indexed_for_search() {
+        let conn = seeded();
+        let results = search_knowledge(&conn, "synthesized", None, 10).unwrap();
+        assert!(
+            results.is_empty(),
+            "a derivation's own summary text should not be searchable -- only its source \
+             Rules are, and none of them contain \"synthesized\""
+        );
     }
 }
