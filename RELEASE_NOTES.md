@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Remove unused Cargo.toml dependencies
-**2026-08-14** · [#TBD](https://github.com/Rusty-Mill/rusty_knowledge/pull/TBD)
+## PR #54 — Remove unused Cargo.toml dependencies
+**2026-08-14** · [#54](https://github.com/Rusty-Mill/rusty_knowledge/pull/54)
 
 - **Removed:** `rusty-embedder-core`/`-http`/`-local`, `rusty_regx`,
   `sqlite-vec`, and the `local-embeddings`/`http-embeddings` Cargo
