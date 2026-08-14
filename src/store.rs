@@ -838,6 +838,223 @@ pub fn outgoing_relationships(
     with_sources(conn, rules)
 }
 
+/// Every relationship-shaped `Rule` declaring a `from_type -> to_type`
+/// connection within `domain_tag` -- both ends of the relationship must be
+/// in that domain (a relationship crossing domains is
+/// `cross_domain_relationships`'s job, not this one's).
+pub fn valid_relationship_types(
+    conn: &Connection,
+    domain_tag: &str,
+    from_type: &str,
+    to_type: &str,
+) -> rusqlite::Result<Vec<(Rule, Source)>> {
+    let cols = qualified_rule_columns();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM rules \
+         JOIN subjects sa ON sa.id = rules.subject_id \
+         JOIN subjects sb ON sb.id = rules.related_subject_id \
+         WHERE rules.related_subject_id IS NOT NULL \
+           AND sa.domain_tag = ?1 AND sa.subject_type = ?2 \
+           AND sb.domain_tag = ?1 AND sb.subject_type = ?3 \
+         ORDER BY rules.id"
+    ))?;
+    let rules: Vec<Rule> = stmt
+        .query_map(params![domain_tag, from_type, to_type], rule_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    with_sources(conn, rules)
+}
+
+/// Traceability for `subject_id`: relationship-shaped Rules tagged
+/// `relationship_type = "traces_to"`, split into outgoing (this subject
+/// traces to something) and incoming (something traces to this subject).
+/// `MUST` traces only, unless `include_optional` also pulls in `SHOULD`.
+type TraceabilityResult = (Vec<(Rule, Source)>, Vec<(Rule, Source)>);
+
+pub fn traceability(
+    conn: &Connection,
+    subject_id: &str,
+    include_optional: bool,
+) -> rusqlite::Result<TraceabilityResult> {
+    let cols = qualified_rule_columns();
+    let strength_clause = if include_optional {
+        "AND rules.binding_strength IN ('MUST', 'SHOULD')"
+    } else {
+        "AND rules.binding_strength = 'MUST'"
+    };
+
+    let mut outgoing_stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM rules \
+         WHERE rules.subject_id = ?1 AND rules.relationship_type = 'traces_to' \
+         {strength_clause} ORDER BY rules.id"
+    ))?;
+    let outgoing: Vec<Rule> = outgoing_stmt
+        .query_map(params![subject_id], rule_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut incoming_stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM rules \
+         WHERE rules.related_subject_id = ?1 AND rules.relationship_type = 'traces_to' \
+         {strength_clause} ORDER BY rules.id"
+    ))?;
+    let incoming: Vec<Rule> = incoming_stmt
+        .query_map(params![subject_id], rule_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    Ok((with_sources(conn, outgoing)?, with_sources(conn, incoming)?))
+}
+
+/// Outgoing relationship-shaped Rules from `subject_id` whose target
+/// Subject sits in a *different* `domain_tag`, optionally narrowed to one
+/// `to_domain_tag`.
+pub fn cross_domain_relationships(
+    conn: &Connection,
+    subject_id: &str,
+    to_domain_tag: Option<&str>,
+) -> rusqlite::Result<Vec<(Rule, Subject, Source)>> {
+    let subject = subject_by_id(conn, subject_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let candidates = outgoing_relationships(conn, subject_id, None)?;
+
+    let mut out = Vec::new();
+    for (rule, source) in candidates {
+        let related_id = rule
+            .related_subject_id
+            .as_ref()
+            .expect("outgoing_relationships only returns rows with related_subject_id set");
+        let related =
+            subject_by_id(conn, related_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if related.domain_tag == subject.domain_tag {
+            continue;
+        }
+        if let Some(to_domain_tag) = to_domain_tag
+            && related.domain_tag != to_domain_tag
+        {
+            continue;
+        }
+        out.push((rule, related, source));
+    }
+    Ok(out)
+}
+
+/// A suggested (never auto-committed) declared valid-relationship rule,
+/// derived from existing relationship-shaped `Rule` instances grouped by
+/// `(from_type, to_type, relationship_type)`. Cardinality disagreements
+/// across instances are surfaced via `other_cardinalities_seen`, not
+/// silently hidden behind the majority choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidRelationshipCandidate {
+    pub from_type: String,
+    pub to_type: String,
+    pub relationship_type: String,
+    pub instance_count: i64,
+    pub majority_cardinality: Option<String>,
+    pub other_cardinalities_seen: Vec<String>,
+}
+
+/// Derives `ValidRelationshipCandidate`s from every relationship-shaped
+/// Rule within `domain_tag` (both ends in that domain). A human reviews
+/// these and decides whether to declare them as real valid-relationship
+/// rules -- this function only ever suggests, never writes.
+pub fn candidate_valid_relationships(
+    conn: &Connection,
+    domain_tag: &str,
+) -> rusqlite::Result<Vec<ValidRelationshipCandidate>> {
+    let cols = qualified_rule_columns();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM rules \
+         JOIN subjects sa ON sa.id = rules.subject_id \
+         JOIN subjects sb ON sb.id = rules.related_subject_id \
+         WHERE rules.related_subject_id IS NOT NULL \
+           AND sa.domain_tag = ?1 AND sb.domain_tag = ?1 \
+         ORDER BY rules.id"
+    ))?;
+    let rules: Vec<Rule> = stmt
+        .query_map(params![domain_tag], rule_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut groups: std::collections::HashMap<(String, String, String), Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    for rule in &rules {
+        let from_subject =
+            subject_by_id(conn, &rule.subject_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let to_subject = subject_by_id(conn, rule.related_subject_id.as_ref().unwrap())?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let relationship_type = rule.relationship_type.clone().unwrap_or_default();
+        let key = (
+            from_subject.subject_type,
+            to_subject.subject_type,
+            relationship_type,
+        );
+        groups
+            .entry(key)
+            .or_default()
+            .push(rule.cardinality.clone());
+    }
+
+    let mut out: Vec<ValidRelationshipCandidate> = groups
+        .into_iter()
+        .map(|((from_type, to_type, relationship_type), cardinalities)| {
+            let instance_count = cardinalities.len() as i64;
+            let mut counts: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for cardinality in cardinalities.into_iter().flatten() {
+                *counts.entry(cardinality).or_insert(0) += 1;
+            }
+            // Deterministic tie-break: highest count first, then
+            // alphabetical -- HashMap iteration order isn't stable, and a
+            // majority pick that changes between runs would be worse than
+            // useless for a human reviewing it.
+            let mut counts: Vec<(String, i64)> = counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let majority_cardinality = counts.first().map(|(cardinality, _)| cardinality.clone());
+            let other_cardinalities_seen = counts
+                .into_iter()
+                .skip(1)
+                .map(|(cardinality, _)| cardinality)
+                .collect();
+            ValidRelationshipCandidate {
+                from_type,
+                to_type,
+                relationship_type,
+                instance_count,
+                majority_cardinality,
+                other_cardinalities_seen,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (&a.from_type, &a.to_type, &a.relationship_type).cmp(&(
+            &b.from_type,
+            &b.to_type,
+            &b.relationship_type,
+        ))
+    });
+    Ok(out)
+}
+
+/// Rules declaring `from_subject_id --relationship_type--> to_subject_id`
+/// exactly -- empty means no such declaration exists (INVALID at the tool
+/// layer), not an error.
+pub fn validate_relationship(
+    conn: &Connection,
+    from_subject_id: &str,
+    to_subject_id: &str,
+    relationship_type: &str,
+) -> rusqlite::Result<Vec<(Rule, Source)>> {
+    let cols = qualified_rule_columns();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM rules \
+         WHERE subject_id = ?1 AND related_subject_id = ?2 AND relationship_type = ?3 \
+         ORDER BY id"
+    ))?;
+    let rules: Vec<Rule> = stmt
+        .query_map(
+            params![from_subject_id, to_subject_id, relationship_type],
+            rule_from_row,
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    with_sources(conn, rules)
+}
+
 /// Seeds a real UDRA authority chain: a data mesh standard (root) ->
 /// Army UDRA -> the org's UDRA implementation -> two subordinate orgs
 /// (siblings) implementing under it. Exercises `DELEGATED` (the schema
@@ -957,6 +1174,26 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
         },
     )
     .map_err(to_string_err)?;
+    insert_subject(
+        conn,
+        &Subject {
+            id: "data_mesh.DataProduct".into(),
+            domain_tag: "data_mesh".into(),
+            subject_type: "concept".into(),
+            name: "Data Product".into(),
+            short_name: "DataProduct".into(),
+            description: Some(
+                "Dehghani's original data-mesh data product concept, which UDRA specializes for \
+                 the Army."
+                    .into(),
+            ),
+            is_deprecated: false,
+            parent_subject_id: None,
+            supersedes_subject_id: None,
+            source_section: None,
+        },
+    )
+    .map_err(to_string_err)?;
 
     insert_rule(
         conn,
@@ -984,6 +1221,38 @@ pub fn seed_udra(conn: &Connection) -> Result<(), String> {
             relationship_type: Some("exposes".into()),
             cardinality: Some("1..*".into()),
             statement: "A data product exposes one or more data contracts.".into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.dm.003".into(),
+            source_id: "src.data-mesh-principles".into(),
+            subject_id: "udra.DataProduct".into(),
+            related_subject_id: Some("data_mesh.DataProduct".into()),
+            relationship_type: Some("realizes".into()),
+            cardinality: Some("1".into()),
+            statement: "A UDRA data product realizes the Data Mesh data product concept.".into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: None,
+        },
+    )
+    .map_err(to_string_err)?;
+    insert_rule(
+        conn,
+        &Rule {
+            id: "rule.org.003".into(),
+            source_id: "src.org-udra-impl".into(),
+            subject_id: "udra.DataContract".into(),
+            related_subject_id: Some("udra.DataProduct".into()),
+            relationship_type: Some("traces_to".into()),
+            cardinality: Some("1".into()),
+            statement: "A data contract must trace to the data product it belongs to.".into(),
             machine_check: None,
             binding_strength: BindingStrength::Must,
             supersedes_rule_id: None,
@@ -1409,12 +1678,11 @@ mod tests {
     fn outgoing_relationships_returns_only_relationship_shaped_rules() {
         let conn = seeded();
         let relationships = outgoing_relationships(&conn, "udra.DataProduct", None).unwrap();
-        assert_eq!(relationships.len(), 1);
-        assert_eq!(relationships[0].0.id, "rule.dm.002");
-        assert_eq!(
-            relationships[0].0.related_subject_id.as_deref(),
-            Some("udra.DataContract")
-        );
+        assert_eq!(relationships.len(), 2);
+        assert!(relationships.iter().any(|(r, _)| r.id == "rule.dm.002"
+            && r.related_subject_id.as_deref() == Some("udra.DataContract")));
+        assert!(relationships.iter().any(|(r, _)| r.id == "rule.dm.003"
+            && r.related_subject_id.as_deref() == Some("data_mesh.DataProduct")));
     }
 
     #[test]
@@ -1422,8 +1690,91 @@ mod tests {
         let conn = seeded();
         let matching = outgoing_relationships(&conn, "udra.DataProduct", Some("exposes")).unwrap();
         assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].0.id, "rule.dm.002");
         let non_matching =
             outgoing_relationships(&conn, "udra.DataProduct", Some("no-such-type")).unwrap();
         assert!(non_matching.is_empty());
+    }
+
+    #[test]
+    fn valid_relationship_types_scoped_to_domain_and_subject_types() {
+        let conn = seeded();
+        let found = valid_relationship_types(&conn, "udra", "concept", "concept").unwrap();
+        assert!(found.iter().any(|(r, _)| r.id == "rule.dm.002"));
+        assert!(found.iter().any(|(r, _)| r.id == "rule.org.003"));
+        // rule.dm.003 crosses into data_mesh -- not within-domain, shouldn't match.
+        assert!(!found.iter().any(|(r, _)| r.id == "rule.dm.003"));
+    }
+
+    #[test]
+    fn traceability_finds_outgoing_and_incoming_traces_to() {
+        let conn = seeded();
+        let (outgoing, incoming) = traceability(&conn, "udra.DataContract", false).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].0.id, "rule.org.003");
+        assert!(incoming.is_empty());
+
+        let (outgoing2, incoming2) = traceability(&conn, "udra.DataProduct", false).unwrap();
+        assert!(outgoing2.is_empty());
+        assert_eq!(incoming2.len(), 1);
+        assert_eq!(incoming2[0].0.id, "rule.org.003");
+    }
+
+    #[test]
+    fn cross_domain_relationships_finds_only_different_domain_targets() {
+        let conn = seeded();
+        let found = cross_domain_relationships(&conn, "udra.DataProduct", None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.id, "rule.dm.003");
+        assert_eq!(found[0].1.domain_tag, "data_mesh");
+    }
+
+    #[test]
+    fn cross_domain_relationships_filters_by_to_domain() {
+        let conn = seeded();
+        let matching =
+            cross_domain_relationships(&conn, "udra.DataProduct", Some("data_mesh")).unwrap();
+        assert_eq!(matching.len(), 1);
+        let non_matching =
+            cross_domain_relationships(&conn, "udra.DataProduct", Some("no-such-domain")).unwrap();
+        assert!(non_matching.is_empty());
+    }
+
+    #[test]
+    fn candidate_valid_relationships_groups_by_type_triple() {
+        let conn = seeded();
+        let candidates = candidate_valid_relationships(&conn, "udra").unwrap();
+        let exposes = candidates
+            .iter()
+            .find(|c| c.relationship_type == "exposes")
+            .expect("exposes candidate should be present");
+        assert_eq!(exposes.from_type, "concept");
+        assert_eq!(exposes.to_type, "concept");
+        assert_eq!(exposes.instance_count, 1);
+        assert_eq!(exposes.majority_cardinality.as_deref(), Some("1..*"));
+        assert!(exposes.other_cardinalities_seen.is_empty());
+    }
+
+    #[test]
+    fn validate_relationship_finds_matching_rule() {
+        let conn = seeded();
+        let matches =
+            validate_relationship(&conn, "udra.DataProduct", "udra.DataContract", "exposes")
+                .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0.id, "rule.dm.002");
+    }
+
+    #[test]
+    fn validate_relationship_no_match_is_empty_not_an_error() {
+        let conn = seeded();
+        let matches = validate_relationship(
+            &conn,
+            "udra.DataProduct",
+            "udra.DataContract",
+            "no-such-type",
+        )
+        .unwrap();
+        assert!(matches.is_empty());
     }
 }

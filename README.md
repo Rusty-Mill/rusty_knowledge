@@ -31,7 +31,11 @@ goal.
 Growing incrementally from the original two-tool vertical slice toward the
 previous model's full surface (tracked in
 [rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)).
-Eight MCP tools so far:
+13 MCP tools so far — `validate_element`, `validate_completeness`, and
+`search_knowledge` remain: the first two are blocked on model capability
+that's specified but not built yet (a `machine_check` evaluator,
+`SelectionGroup`), and the third needs a fresh design decision since its old
+search infrastructure was removed along with the schema this replaces.
 
 - `lookup_subject` — everything the full authority chain says about a
   subject: every `Rule` that names it (directly, or as the target of a
@@ -40,12 +44,23 @@ Eight MCP tools so far:
   relationship claims), optionally filtered by binding strength.
 - `lookup_relationships` — outgoing relationship claims from a subject,
   optionally filtered by relationship type.
+- `lookup_valid_relationships` — declared relationship types between two
+  subject_types within a domain.
 - `lookup_domain_summary` — subject counts (overall and by type) and the
   Source(s) that root a domain.
 - `search_constructs` — list/filter subjects within a domain by type.
 - `meta_list_domains` — every domain tag in use, with counts and root
   Sources.
 - `meta_routing_guide` — query routing guidance.
+- `crosscut_traceability` — outgoing/incoming `traces_to` relationship
+  claims for a subject.
+- `crosscut_cross_domain` — relationship claims whose target sits in a
+  different domain.
+- `crosscut_valid_relationship_candidates` — suggests candidate
+  valid-relationship rules from existing relationship instances, for a
+  human to review (no `knowledge-mcp` equivalent; never auto-commits).
+- `validate_relationship` — whether a relationship between two subjects is
+  declared by an existing rule.
 - `crosscut_conflicts` — conflict-registry status for a subject: confirmed,
   active `conflicts_with` relations between its rules, plus candidate pairs
   (same subject, different Sources, no confirmed relation yet) needing human

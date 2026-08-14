@@ -18,20 +18,35 @@
 //! `udra.DataProduct`). Omit it and nothing changes from the hand-seeded
 //! default.
 //!
-//! Tools wired end-to-end (rusty_knowledge#55 tracks porting the rest of
-//! the previous surface onto this model):
+//! Tools wired end-to-end -- 13 so far. rusty_knowledge#55 tracks the
+//! rest: `validate_element` and `validate_completeness` are blocked on
+//! model capability that's specified but not built yet (a `machine_check`
+//! evaluator, `SelectionGroup`); `search_knowledge` needs a fresh design
+//! decision, since its old FTS5/`sqlite-vec` infrastructure was removed
+//! entirely along with the schema this replaces.
 //! - `lookup_subject` — everything a Subject's authority chain says about
 //!   it, across every Source that makes a claim, with provenance.
 //! - `lookup_rules` — plain statement rules for a subject (excludes
 //!   relationship claims), optionally filtered by binding strength.
 //! - `lookup_relationships` — outgoing relationship claims from a
 //!   subject, optionally filtered by relationship type.
+//! - `lookup_valid_relationships` — declared relationship types between
+//!   two subject_types within a domain.
 //! - `lookup_domain_summary` — subject counts (overall and by type) and
 //!   root Source(s) for a domain.
 //! - `search_constructs` — list/filter subjects within a domain by type.
 //! - `meta_list_domains` — every domain tag in use, with counts and
 //!   root Sources.
 //! - `meta_routing_guide` — query routing guidance.
+//! - `crosscut_traceability` — outgoing/incoming `traces_to` relationship
+//!   claims for a subject.
+//! - `crosscut_cross_domain` — relationship claims whose target sits in a
+//!   different domain.
+//! - `crosscut_valid_relationship_candidates` — suggests candidate
+//!   valid-relationship rules from existing relationship instances, for a
+//!   human to review (no `knowledge-mcp` equivalent; never auto-commits).
+//! - `validate_relationship` — whether a relationship between two
+//!   subjects is declared by an existing rule.
 //! - `crosscut_conflicts` — confirmed conflicts plus unconfirmed
 //!   candidates needing review, via the two-tier conflict gate (exact
 //!   `subject_id` correlation catches sibling/cousin conflicts a pure
@@ -97,6 +112,56 @@ struct LookupRelationshipsParams {
     relationship_type: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidRelationshipsParams {
+    /// Domain tag, e.g. "udra".
+    domain_tag: String,
+    /// Source subject_type, e.g. "concept".
+    from_type: String,
+    /// Target subject_type, e.g. "concept".
+    to_type: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TraceabilityParams {
+    /// Domain tag the subject belongs to, e.g. "udra".
+    domain_tag: String,
+    /// Short name or full subject ID.
+    subject_ref: String,
+    /// Include SHOULD traces, not just MUST.
+    #[serde(default)]
+    include_optional: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CrossDomainParams {
+    /// Domain tag the subject belongs to, e.g. "udra".
+    domain_tag: String,
+    /// Short name or full subject ID.
+    subject_ref: String,
+    /// Restrict results to one target domain. Omit for all domains.
+    #[serde(default)]
+    to_domain_tag: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidRelationshipCandidatesParams {
+    /// Domain tag to derive candidates for, e.g. "udra".
+    domain_tag: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateRelationshipParams {
+    /// Domain tag both subjects belong to, e.g. "udra".
+    domain_tag: String,
+    /// Source subject (short name or full ID).
+    from_subject_ref: String,
+    /// Target subject (short name or full ID).
+    to_subject_ref: String,
+    /// The relationship type to validate, e.g. "exposes".
+    relationship_type: String,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     conn: Arc<Mutex<Connection>>,
@@ -131,9 +196,16 @@ fn routing_guide() -> String {
      - \"What does X mean?\" -> lookup_subject\n\
      - \"What are the rules for X?\" -> lookup_rules (optionally filter by binding_strength)\n\
      - \"What does X relate to / contain / extend?\" -> lookup_relationships\n\
+     - \"What relationship types are valid between type A and type B?\" -> \
+       lookup_valid_relationships\n\
      - \"I can't find the right subject\" -> search_constructs\n\
      - \"What domains are loaded?\" -> meta_list_domains\n\
      - \"Give me an overview of domain X\" -> lookup_domain_summary\n\
+     - \"Does X trace to Y?\" -> crosscut_traceability\n\
+     - \"How does X relate to a subject in another domain?\" -> crosscut_cross_domain\n\
+     - \"What valid-relationship rules should I declare for this domain?\" -> \
+       crosscut_valid_relationship_candidates\n\
+     - \"Is this relationship permitted?\" -> validate_relationship\n\
      - \"Where do sources disagree about X?\" -> crosscut_conflicts"
         .to_string()
 }
@@ -476,6 +548,269 @@ impl KnowledgeServer {
             subject.name, subject.id
         )
     }
+
+    #[tool(
+        description = "Given two subject_types within a domain, list every declared relationship_type between them (with cardinality and binding strength), derived from existing relationship-shaped rules."
+    )]
+    fn lookup_valid_relationships(
+        &self,
+        Parameters(ValidRelationshipsParams {
+            domain_tag,
+            from_type,
+            to_type,
+        }): Parameters<ValidRelationshipsParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let rules = match store::valid_relationship_types(&conn, &domain_tag, &from_type, &to_type)
+        {
+            Ok(rules) => rules,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if rules.is_empty() {
+            return format!(
+                "No declared relationship types found from {from_type:?} to {to_type:?} in \
+                 domain {domain_tag:?}."
+            );
+        }
+        rules
+            .iter()
+            .map(|(rule, source)| {
+                let cardinality = rule.cardinality.as_deref().unwrap_or("(no cardinality)");
+                format!(
+                    "[{}] {} ({}) -- {}",
+                    rule.binding_strength.as_str(),
+                    rule.relationship_type.as_deref().unwrap_or("?"),
+                    cardinality,
+                    format_source(source)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tool(
+        description = "Get traceability for a subject -- what it must (and optionally should) trace to, and what must (and optionally should) trace to it, via relationship_type=\"traces_to\" rules."
+    )]
+    fn crosscut_traceability(
+        &self,
+        Parameters(TraceabilityParams {
+            domain_tag,
+            subject_ref,
+            include_optional,
+        }): Parameters<TraceabilityParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let (outgoing, incoming) = match store::traceability(&conn, &subject.id, include_optional) {
+            Ok(result) => result,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let outgoing_block = if outgoing.is_empty() {
+            "(none)".to_string()
+        } else {
+            outgoing
+                .iter()
+                .map(|(rule, source)| {
+                    format!(
+                        "  [{}] -> {} -- {}",
+                        rule.binding_strength.as_str(),
+                        rule.related_subject_id.as_deref().unwrap_or("?"),
+                        format_source(source)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let incoming_block = if incoming.is_empty() {
+            "(none)".to_string()
+        } else {
+            incoming
+                .iter()
+                .map(|(rule, source)| {
+                    format!(
+                        "  [{}] <- {} -- {}",
+                        rule.binding_strength.as_str(),
+                        rule.subject_id,
+                        format_source(source)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        format!(
+            "Traceability for {} ({}):\nMust trace to:\n{outgoing_block}\nMust be traced from:\n{incoming_block}",
+            subject.name, subject.id
+        )
+    }
+
+    #[tool(
+        description = "Find cross-domain relationships from a subject -- relationship claims whose target subject sits in a different domain, optionally narrowed to one to_domain_tag."
+    )]
+    fn crosscut_cross_domain(
+        &self,
+        Parameters(CrossDomainParams {
+            domain_tag,
+            subject_ref,
+            to_domain_tag,
+        }): Parameters<CrossDomainParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let subject = match store::resolve_subject(&conn, &domain_tag, &subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let relationships =
+            match store::cross_domain_relationships(&conn, &subject.id, to_domain_tag.as_deref()) {
+                Ok(relationships) => relationships,
+                Err(err) => return format!("Lookup failed: {err}"),
+            };
+
+        if relationships.is_empty() {
+            return format!(
+                "No cross-domain relationships found for {} ({}).",
+                subject.name, subject.id
+            );
+        }
+        relationships
+            .iter()
+            .map(|(rule, related, source)| {
+                format!(
+                    "[{}] {} --{}--> {} ({}) -- {}",
+                    rule.binding_strength.as_str(),
+                    subject.id,
+                    rule.relationship_type.as_deref().unwrap_or("relates_to"),
+                    related.id,
+                    related.domain_tag,
+                    format_source(source)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tool(
+        description = "Suggest candidate valid-relationship rules for a domain, derived from existing relationship-shaped rules grouped by (from_type, to_type, relationship_type). Never auto-committed -- a human decides whether to declare these."
+    )]
+    fn crosscut_valid_relationship_candidates(
+        &self,
+        Parameters(ValidRelationshipCandidatesParams { domain_tag }): Parameters<
+            ValidRelationshipCandidatesParams,
+        >,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let candidates = match store::candidate_valid_relationships(&conn, &domain_tag) {
+            Ok(candidates) => candidates,
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        if candidates.is_empty() {
+            return format!(
+                "No relationship-shaped rules found in domain {domain_tag:?} to derive \
+                 candidates from."
+            );
+        }
+        candidates
+            .iter()
+            .map(|candidate| {
+                let disagreement = if candidate.other_cardinalities_seen.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (other cardinalities seen: {})",
+                        candidate.other_cardinalities_seen.join(", ")
+                    )
+                };
+                format!(
+                    "{} --{}--> {} : cardinality {}{disagreement} ({} instance(s))",
+                    candidate.from_type,
+                    candidate.relationship_type,
+                    candidate.to_type,
+                    candidate
+                        .majority_cardinality
+                        .as_deref()
+                        .unwrap_or("(none declared)"),
+                    candidate.instance_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tool(
+        description = "Check whether a relationship between two subjects is declared by an existing rule -- VALID with the matching rule(s), or INVALID if no such declaration exists."
+    )]
+    fn validate_relationship(
+        &self,
+        Parameters(ValidateRelationshipParams {
+            domain_tag,
+            from_subject_ref,
+            to_subject_ref,
+            relationship_type,
+        }): Parameters<ValidateRelationshipParams>,
+    ) -> String {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let from_subject = match store::resolve_subject(&conn, &domain_tag, &from_subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {from_subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+        let to_subject = match store::resolve_subject(&conn, &domain_tag, &to_subject_ref) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => {
+                return format!("Subject {to_subject_ref:?} not found in domain {domain_tag:?}.");
+            }
+            Err(err) => return format!("Lookup failed: {err}"),
+        };
+
+        let matches = match store::validate_relationship(
+            &conn,
+            &from_subject.id,
+            &to_subject.id,
+            &relationship_type,
+        ) {
+            Ok(matches) => matches,
+            Err(err) => return format!("Validation failed: {err}"),
+        };
+
+        if matches.is_empty() {
+            return format!(
+                "INVALID: no rule declares {} --{}--> {}.",
+                from_subject.id, relationship_type, to_subject.id
+            );
+        }
+        let rules_block = matches
+            .iter()
+            .map(|(rule, source)| {
+                format!(
+                    "  [{}] {} -- {}",
+                    rule.binding_strength.as_str(),
+                    rule.statement,
+                    format_source(source)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "VALID: {} --{}--> {}\n{rules_block}",
+            from_subject.id, relationship_type, to_subject.id
+        )
+    }
 }
 
 #[tokio::main]
@@ -517,8 +852,10 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!(
         "rusty-knowledge MCP server starting on stdio (tools: lookup_subject, lookup_rules, \
-         lookup_relationships, lookup_domain_summary, search_constructs, meta_list_domains, \
-         meta_routing_guide, crosscut_conflicts; knowledge-model-v2)"
+         lookup_relationships, lookup_valid_relationships, lookup_domain_summary, \
+         search_constructs, meta_list_domains, meta_routing_guide, crosscut_traceability, \
+         crosscut_cross_domain, crosscut_valid_relationship_candidates, validate_relationship, \
+         crosscut_conflicts; knowledge-model-v2)"
     );
 
     let server = KnowledgeServer {
@@ -603,9 +940,14 @@ mod tests {
         assert!(response.contains("lookup_subject"));
         assert!(response.contains("lookup_rules"));
         assert!(response.contains("lookup_relationships"));
+        assert!(response.contains("lookup_valid_relationships"));
         assert!(response.contains("search_constructs"));
         assert!(response.contains("meta_list_domains"));
         assert!(response.contains("lookup_domain_summary"));
+        assert!(response.contains("crosscut_traceability"));
+        assert!(response.contains("crosscut_cross_domain"));
+        assert!(response.contains("crosscut_valid_relationship_candidates"));
+        assert!(response.contains("validate_relationship"));
         assert!(response.contains("crosscut_conflicts"));
     }
 
@@ -712,5 +1054,82 @@ mod tests {
             relationship_type: Some("no-such-type".into()),
         }));
         assert!(non_matching.contains("No outgoing relationships"));
+    }
+
+    #[test]
+    fn lookup_valid_relationships_scoped_within_domain() {
+        let server = test_server();
+        let response = server.lookup_valid_relationships(Parameters(ValidRelationshipsParams {
+            domain_tag: "udra".into(),
+            from_type: "concept".into(),
+            to_type: "concept".into(),
+        }));
+        assert!(response.contains("exposes"));
+        assert!(response.contains("traces_to"));
+        // rule.dm.003 crosses into data_mesh -- shouldn't show up here.
+        assert!(!response.contains("realizes"));
+    }
+
+    #[test]
+    fn crosscut_traceability_reports_outgoing_and_incoming() {
+        let server = test_server();
+        let response = server.crosscut_traceability(Parameters(TraceabilityParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataContract".into(),
+            include_optional: false,
+        }));
+        assert!(response.contains("Must trace to:"));
+        assert!(response.contains("udra.DataProduct"));
+    }
+
+    #[test]
+    fn crosscut_cross_domain_finds_seeded_cross_domain_relationship() {
+        let server = test_server();
+        let response = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            to_domain_tag: None,
+        }));
+        assert!(response.contains("realizes"));
+        assert!(response.contains("data_mesh.DataProduct"));
+
+        let non_matching = server.crosscut_cross_domain(Parameters(CrossDomainParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+            to_domain_tag: Some("no-such-domain".into()),
+        }));
+        assert!(non_matching.contains("No cross-domain relationships"));
+    }
+
+    #[test]
+    fn crosscut_valid_relationship_candidates_reports_seeded_candidates() {
+        let server = test_server();
+        let response = server.crosscut_valid_relationship_candidates(Parameters(
+            ValidRelationshipCandidatesParams {
+                domain_tag: "udra".into(),
+            },
+        ));
+        assert!(response.contains("exposes"));
+        assert!(response.contains("cardinality 1..*"));
+    }
+
+    #[test]
+    fn validate_relationship_reports_valid_and_invalid() {
+        let server = test_server();
+        let valid = server.validate_relationship(Parameters(ValidateRelationshipParams {
+            domain_tag: "udra".into(),
+            from_subject_ref: "DataProduct".into(),
+            to_subject_ref: "DataContract".into(),
+            relationship_type: "exposes".into(),
+        }));
+        assert!(valid.starts_with("VALID"));
+
+        let invalid = server.validate_relationship(Parameters(ValidateRelationshipParams {
+            domain_tag: "udra".into(),
+            from_subject_ref: "DataProduct".into(),
+            to_subject_ref: "DataContract".into(),
+            relationship_type: "no-such-type".into(),
+        }));
+        assert!(invalid.starts_with("INVALID"));
     }
 }
