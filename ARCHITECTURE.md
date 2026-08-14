@@ -45,9 +45,9 @@ once a second backend actually needs one — none has, yet.
 There is no embedder/search boundary in this model — the previous crate's
 `Embedder` trait (`rusty_embedder_core`, `NullEmbedder`/local/http backends)
 and its `sqlite-vec`-backed hybrid search were built around the old schema
-and were not carried forward. `Cargo.toml` still lists those dependencies
-and the `local-embeddings`/`http-embeddings` features; nothing in `src/`
-references them anymore — cleanup, not yet done.
+and were not carried forward. Their `Cargo.toml` dependencies and the
+`local-embeddings`/`http-embeddings` features were removed once nothing in
+`src/` referenced them anymore.
 
 ## Structure
 Single binary crate, three modules:

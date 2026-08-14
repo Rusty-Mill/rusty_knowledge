@@ -5,6 +5,18 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #54 — Remove unused Cargo.toml dependencies
+**2026-08-14** · [#54](https://github.com/Rusty-Mill/rusty_knowledge/pull/54)
+
+- **Removed:** `rusty-embedder-core`/`-http`/`-local`, `rusty_regx`,
+  `sqlite-vec`, and the `local-embeddings`/`http-embeddings` Cargo
+  features -- all built around the search/embedding infrastructure the
+  v2 model (#51) replaced. Nothing in `src/` has referenced any of them
+  since that PR; flagged as known cleanup debt in #53, now done.
+- No behavior change -- `cargo build --all-features` and default now
+  build identically, since no features remain.
+- `Cargo.lock` regenerated accordingly.
+
 ## PR #53 — README/ARCHITECTURE.md updated for the v2 model
 **2026-08-13** · [#53](https://github.com/Rusty-Mill/rusty_knowledge/pull/53)
 
