@@ -5,6 +5,42 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR TBD — Real (Onyx) semantic embedder backend for search_knowledge
+**2026-08-14** · PR TBD
+
+- **Added:** `store::OnyxEmbedder`, a second, real `Embedder` implementation
+  calling Onyx's cloud embeddings API (`POST /api/embeddings`, an
+  Ollama-compatible shape), closing the one remaining gap noted in PR #65
+  and tracked as [#66](https://github.com/Rusty-Mill/rusty_knowledge/issues/66)
+  — a real semantic model has no network access rationale to stay
+  deferred once network access is confirmed available. Opt-in via
+  `EMBEDDING_BACKEND=onyx`; unset, or any other value, keeps the existing
+  `HashingEmbedder` default unchanged.
+- New `store::active_embedder()`: a `OnceLock`-cached, env-var-gated
+  selector run once per process. A misconfigured `onyx` backend (missing
+  `ONYX_API_KEY`/`ONYX_EMBEDDING_MODEL`, or any other `OnyxEmbedder::from_env`
+  failure) fails loudly to stderr and falls back to `HashingEmbedder` rather
+  than silently doing nothing or panicking. `store::RETRIEVAL_MODE_DESCRIPTION`
+  (a const) is replaced with `store::retrieval_mode_description()` (a
+  function), since the description must now reflect whichever backend is
+  actually active rather than a single hardcoded string.
+- New `rusty_request` git dependency (`baileyrd/rusty_request`, `tokio`
+  feature) for the HTTP transport, chosen over `reqwest`/`ureq` to match
+  this ecosystem's own sovereign-HTTP-client convention. `Embedder::embed`
+  stays synchronous (dozens of existing sync call sites); `OnyxEmbedder`
+  bridges into `rusty_request`'s async API via `tokio::task::block_in_place`
+  + `Handle::current().block_on(...)`, safe because it's only ever reached
+  from within `main()`'s multi-threaded tokio runtime.
+- **Honestly disclosed, not fabricated:** no Onyx API key is available in
+  this environment, so `OnyxEmbedder` has never been exercised against a
+  live endpoint. Its tests (request/response shape, vector normalization,
+  malformed-response fallback) run against a small hand-rolled local mock
+  HTTP server instead. This is called out in the type's own doc comment,
+  in `ARCHITECTURE.md`, and here: implemented and CI-gate-clean, but
+  live-unverified until real credentials are supplied.
+- New config: `EMBEDDING_BACKEND`, `ONYX_API_KEY`, `ONYX_EMBEDDING_MODEL`,
+  `ONYX_API_BASE_URL` (optional, defaults to `https://ai.onyx.dev`).
+
 ## PR #65 — Vector/hybrid search for search_knowledge
 **2026-08-14** · [#65](https://github.com/Rusty-Mill/rusty_knowledge/pull/65)
 
