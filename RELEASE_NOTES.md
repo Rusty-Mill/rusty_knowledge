@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Multi-parent-authority DAG stress test
-**2026-08-14**
+## PR #61 — Multi-parent-authority DAG stress test
+**2026-08-14** · [#61](https://github.com/Rusty-Mill/rusty_knowledge/pull/61)
 
 - **Added:** three `store.rs` tests exercising a deeper multi-parent
   `SourceAuthority` DAG than the existing single-extra-edge case: two
