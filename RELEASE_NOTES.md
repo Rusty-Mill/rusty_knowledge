@@ -23,6 +23,21 @@ against `main`, reverse chronological, each linking to its PR.
   "not carried forward yet" (the other, vector/hybrid search, remains a
   deliberate non-goal).
 
+## PR #61 — Multi-parent-authority DAG stress test
+**2026-08-14** · [#61](https://github.com/Rusty-Mill/rusty_knowledge/pull/61)
+
+- **Added:** three `store.rs` tests exercising a deeper multi-parent
+  `SourceAuthority` DAG than the existing single-extra-edge case: two
+  entirely independent, two-level-deep root lineages (no shared ancestor
+  at all) converging only at a shared descendant. Verifies `ancestors_of`
+  correctly walks the full transitive closure across both lineages,
+  verifies the two roots/mids don't spuriously see each other as
+  ancestors, and verifies `rules_for_subject`/`conflict_candidates_for_subject`
+  surface and flag disagreeing rules from the two unrelated lineages about
+  a shared Subject -- the real-world shape this exists for (e.g. two
+  independent standards both making claims about the same system
+  boundary). Test-only; no production code changed.
+
 ## PR #60 — search_knowledge: lexical FTS5 search (rusty_knowledge#55)
 **2026-08-14** · [#60](https://github.com/Rusty-Mill/rusty_knowledge/pull/60)
 
