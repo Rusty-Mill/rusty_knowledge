@@ -5,6 +5,38 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #65 — Vector/hybrid search for search_knowledge
+**2026-08-14** · [#65](https://github.com/Rusty-Mill/rusty_knowledge/pull/65)
+
+- **Added:** `search_knowledge` now fuses lexical (FTS5 `bm25`, min-max
+  normalized to `[0, 1]`) and vector (cosine similarity) signals in equal
+  weight, instead of lexical-only. A hit found by only one signal is
+  still ranked -- the other contributes 0, not exclusion -- so a
+  near-duplicate phrasing FTS5's exact tokenizer misses can still surface.
+  `score`'s semantics flip accordingly: now `[0, 1]`, higher is more
+  relevant (previously raw `bm25`, lower was more relevant).
+- New `store::Embedder` trait + `store::HashingEmbedder`: a real,
+  zero-dependency, zero-network "hashing trick" bag-of-words vector --
+  **deliberately not a trained semantic embedding**, since this crate has
+  no network access and bundles no model weights. Disclosed honestly as
+  syntactic (token-overlap-driven) rather than semantic, both in code
+  comments and in the tool's own output
+  (`store::RETRIEVAL_MODE_DESCRIPTION`, the single source of truth for
+  how `search_knowledge` describes its own retrieval mode). A pluggable
+  trait, not a hardcoded function, so a real embedder is a drop-in swap
+  if this crate ever gets network/model access.
+- New `search_vectors` table, kept in sync incrementally by
+  `index_for_search` (same write path as the FTS5 index) -- every
+  existing seed/import path gets vectors for free. A similarity floor
+  (`MIN_VECTOR_SIMILARITY`) filters out spurious hash-bucket-collision
+  noise on unrelated queries, and `EMBEDDING_DIM = 256` keeps genuine
+  single-token accidental collisions rare at this dataset's scale.
+- This closes the last item from `ARCHITECTURE.md`'s non-goals list that
+  was about *capability* rather than *implementation count* -- a trained/
+  semantic embedder remains the one deliberately deferred piece, since
+  building one is out of this crate's reach in this environment, not out
+  of scope on principle.
+
 ## PR #64 — Introduce a Store trait / port-adapter abstraction
 **2026-08-14** · [#64](https://github.com/Rusty-Mill/rusty_knowledge/pull/64)
 

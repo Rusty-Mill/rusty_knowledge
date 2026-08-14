@@ -59,12 +59,13 @@
 //!   against a caller-supplied set of element types actually present,
 //!   reporting which groups are satisfied, which member rules are
 //!   missing, and the overall verdict.
-//! - `search_knowledge` — lexical (FTS5) keyword search over every
-//!   `Rule.statement` and `Subject.name`/`short_name`/`description`,
-//!   always declaring its retrieval mode (`lexical-only` -- this model
-//!   has no vector/hybrid component; that infrastructure was removed
-//!   entirely along with the schema this replaces and isn't reintroduced
-//!   here).
+//! - `search_knowledge` — hybrid search over every `Rule.statement` and
+//!   `Subject.name`/`short_name`/`description`, fusing lexical (FTS5
+//!   `bm25`) and vector (`store::HashingEmbedder` cosine similarity)
+//!   signals in equal weight. Always declares its retrieval mode
+//!   honestly: the vector half is a zero-dependency, zero-network
+//!   "hashing trick" bag-of-words embedding, not a trained semantic
+//!   model -- see `store::RETRIEVAL_MODE_DESCRIPTION`.
 //! - `lookup_derived_summary` — any `RuleDerivation` rollups recorded for
 //!   a subject, always labeled NON-AUTHORITATIVE and listing exactly
 //!   which Rules each one was synthesized from. Firewalled from
@@ -272,7 +273,7 @@ fn routing_guide() -> String {
      - \"Is X valid/conformant?\" -> validate_element\n\
      - \"Is this model/container complete? What's missing?\" -> validate_completeness\n\
      - \"Where do sources disagree about X?\" -> crosscut_conflicts\n\
-     - \"Search for X across everything\" -> search_knowledge (lexical-only keyword search)\n\
+     - \"Search for X across everything\" -> search_knowledge (hybrid: lexical + hashing-vector)\n\
      - \"Give me a quick summary of X\" -> lookup_derived_summary (NON-AUTHORITATIVE -- \
        still verify against lookup_subject)"
         .to_string()
@@ -1027,7 +1028,7 @@ impl KnowledgeServer {
     }
 
     #[tool(
-        description = "Lexical (keyword) search over every Rule statement and Subject name/short_name/description. Always declares its retrieval mode (lexical-only -- this model has no vector/hybrid component) and returns ranked hits identified well enough to look each one up via lookup_subject."
+        description = "Hybrid search over every Rule statement and Subject name/short_name/description, fusing lexical (FTS5) and vector (local hashing-trick embedding, not a trained semantic model) signals. Always declares its retrieval mode honestly and returns ranked hits identified well enough to look each one up via lookup_subject."
     )]
     fn search_knowledge(
         &self,
@@ -1048,7 +1049,10 @@ impl KnowledgeServer {
         };
 
         if results.is_empty() {
-            return format!("No results for {query:?} (retrieval mode: lexical-only).");
+            return format!(
+                "No results for {query:?} (retrieval mode: {}).",
+                store::RETRIEVAL_MODE_DESCRIPTION
+            );
         }
 
         let lines = results
@@ -1067,8 +1071,9 @@ impl KnowledgeServer {
             .join("\n");
 
         format!(
-            "{} result(s) for {query:?} (retrieval mode: lexical-only; lower score = more relevant):\n{lines}",
-            results.len()
+            "{} result(s) for {query:?} (retrieval mode: {}; higher score = more relevant):\n{lines}",
+            results.len(),
+            store::RETRIEVAL_MODE_DESCRIPTION
         )
     }
 
@@ -1566,14 +1571,15 @@ mod tests {
     }
 
     #[test]
-    fn search_knowledge_finds_matches_and_declares_lexical_only() {
+    fn search_knowledge_finds_matches_and_declares_retrieval_mode_honestly() {
         let server = test_server();
         let response = server.search_knowledge(Parameters(SearchKnowledgeParams {
             query: "accountable".into(),
             domain_tag: None,
             limit: None,
         }));
-        assert!(response.contains("retrieval mode: lexical-only"));
+        assert!(response.contains("retrieval mode: hybrid"));
+        assert!(response.contains("not a trained semantic embedding"));
         assert!(response.contains("rule.dm.001"));
     }
 
