@@ -1,12 +1,12 @@
 //! The knowledge-model-v2 store: `Source`, `SourceAuthority`, `Subject`,
-//! `Rule`, `RuleRelation`, and `SelectionGroup` (a cardinality constraint
-//! over a set of relationship-shaped Rules, e.g. "must have both X and Y"
-//! -- backs `validate_completeness`), replacing the earlier
-//! `AuthorityLayer`/`Construct`/fixed-4-layer model. The fuller
-//! seven-table design this was built from also specifies `RuleDerivation`
-//! (firewalled, non-authoritative rollup views), deliberately not
-//! implemented yet since nothing in the current tool surface needs it.
-//! Add it when a real case does, not speculatively.
+//! `Rule`, `RuleRelation`, `SelectionGroup` (a cardinality constraint over
+//! a set of relationship-shaped Rules, e.g. "must have both X and Y" --
+//! backs `validate_completeness`), and `RuleDerivation` (a firewalled,
+//! non-authoritative rollup summary over a set of Rules -- backs
+//! `lookup_derived_summary`, never itself returned as a Rule or counted
+//! toward authority), replacing the earlier `AuthorityLayer`/`Construct`/
+//! fixed-4-layer model. This is every table the fuller seven-table design
+//! specifies -- nothing from that design is deferred anymore.
 //!
 //! This redesign came out of stress-testing the original design against
 //! UDRA (a nested-organization authority chain that doesn't fit a fixed
@@ -24,11 +24,13 @@
 //! supersession cascade), the two-tier conflict-candidate query, and two
 //! MCP tools (`lookup_subject`, `crosscut_conflicts` -- see `main.rs`).
 //! It's since grown to the full 16-tool surface tracked in
-//! rusty_knowledge#55, including a lexical (FTS5) `search_knowledge` --
+//! rusty_knowledge#55 (including a lexical (FTS5) `search_knowledge` --
 //! deliberately no vector/hybrid component, since the previous model's
 //! `Embedder`/`sqlite-vec` infrastructure was removed entirely along with
-//! the schema this replaces and isn't reintroduced here. File-backed
-//! persistence is likewise not carried forward yet.
+//! the schema this replaces and isn't reintroduced here), plus
+//! `lookup_derived_summary` beyond it. File-backed persistence
+//! (`open_store_at`, gated on `KNOWLEDGE_DB_PATH` in `main.rs`) is real
+//! too, alongside the default in-memory store.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
@@ -417,9 +419,13 @@ pub struct RuleDerivation {
     pub source_rule_ids: Vec<String>,
 }
 
+/// `IF NOT EXISTS` on every statement so this can run unconditionally
+/// against a file that may already carry the schema from a previous
+/// process (see `open_store_at`) -- re-running it against a fresh
+/// in-memory connection (`open_store`) is unaffected.
 fn schema_ddl() -> &'static str {
     "
-    CREATE TABLE sources (
+    CREATE TABLE IF NOT EXISTS sources (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
@@ -429,13 +435,13 @@ fn schema_ddl() -> &'static str {
         supersedes_source_id TEXT REFERENCES sources(id)
     );
 
-    CREATE TABLE source_authority (
+    CREATE TABLE IF NOT EXISTS source_authority (
         child_source_id TEXT NOT NULL REFERENCES sources(id),
         parent_source_id TEXT NOT NULL REFERENCES sources(id),
         PRIMARY KEY (child_source_id, parent_source_id)
     );
 
-    CREATE TABLE subjects (
+    CREATE TABLE IF NOT EXISTS subjects (
         id TEXT PRIMARY KEY,
         domain_tag TEXT NOT NULL,
         subject_type TEXT NOT NULL,
@@ -447,9 +453,9 @@ fn schema_ddl() -> &'static str {
         supersedes_subject_id TEXT REFERENCES subjects(id),
         source_section TEXT
     );
-    CREATE INDEX idx_subjects_short ON subjects(domain_tag, short_name);
+    CREATE INDEX IF NOT EXISTS idx_subjects_short ON subjects(domain_tag, short_name);
 
-    CREATE TABLE rules (
+    CREATE TABLE IF NOT EXISTS rules (
         id TEXT PRIMARY KEY,
         source_id TEXT NOT NULL REFERENCES sources(id),
         subject_id TEXT NOT NULL REFERENCES subjects(id),
@@ -461,11 +467,11 @@ fn schema_ddl() -> &'static str {
         binding_strength TEXT NOT NULL,
         supersedes_rule_id TEXT REFERENCES rules(id)
     );
-    CREATE INDEX idx_rules_subject ON rules(subject_id);
-    CREATE INDEX idx_rules_related_subject ON rules(related_subject_id);
-    CREATE INDEX idx_rules_source ON rules(source_id);
+    CREATE INDEX IF NOT EXISTS idx_rules_subject ON rules(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_rules_related_subject ON rules(related_subject_id);
+    CREATE INDEX IF NOT EXISTS idx_rules_source ON rules(source_id);
 
-    CREATE TABLE rule_relations (
+    CREATE TABLE IF NOT EXISTS rule_relations (
         rule_a_id TEXT NOT NULL REFERENCES rules(id),
         rule_b_id TEXT NOT NULL REFERENCES rules(id),
         relation_type TEXT NOT NULL,
@@ -474,36 +480,36 @@ fn schema_ddl() -> &'static str {
         PRIMARY KEY (rule_a_id, rule_b_id)
     );
 
-    CREATE TABLE selection_groups (
+    CREATE TABLE IF NOT EXISTS selection_groups (
         id TEXT PRIMARY KEY,
         subject_id TEXT NOT NULL REFERENCES subjects(id),
         description TEXT NOT NULL,
         constraint_type TEXT NOT NULL,
         threshold INTEGER
     );
-    CREATE INDEX idx_selection_groups_subject ON selection_groups(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_selection_groups_subject ON selection_groups(subject_id);
 
-    CREATE TABLE selection_group_members (
+    CREATE TABLE IF NOT EXISTS selection_group_members (
         group_id TEXT NOT NULL REFERENCES selection_groups(id),
         rule_id TEXT NOT NULL REFERENCES rules(id),
         PRIMARY KEY (group_id, rule_id)
     );
 
-    CREATE VIRTUAL TABLE search_index USING fts5(
+    CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
         ref_id UNINDEXED,
         ref_type UNINDEXED,
         text
     );
 
-    CREATE TABLE rule_derivations (
+    CREATE TABLE IF NOT EXISTS rule_derivations (
         id TEXT PRIMARY KEY,
         subject_id TEXT NOT NULL REFERENCES subjects(id),
         label TEXT NOT NULL,
         summary TEXT NOT NULL
     );
-    CREATE INDEX idx_rule_derivations_subject ON rule_derivations(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_rule_derivations_subject ON rule_derivations(subject_id);
 
-    CREATE TABLE rule_derivation_sources (
+    CREATE TABLE IF NOT EXISTS rule_derivation_sources (
         derivation_id TEXT NOT NULL REFERENCES rule_derivations(id),
         rule_id TEXT NOT NULL REFERENCES rules(id),
         PRIMARY KEY (derivation_id, rule_id)
@@ -511,11 +517,34 @@ fn schema_ddl() -> &'static str {
     "
 }
 
+/// In-memory store -- nothing persists across process restarts. Used by
+/// default (no `KNOWLEDGE_DB_PATH` set) and by every test.
 pub fn open_store() -> rusqlite::Result<Connection> {
     let conn = Connection::open_in_memory()?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(schema_ddl())?;
     Ok(conn)
+}
+
+/// File-backed store at `path`, created if it doesn't exist yet. Schema
+/// DDL is idempotent (`IF NOT EXISTS`), so reopening an existing file
+/// across process restarts is safe and doesn't touch data already there
+/// -- callers should check `is_empty` before seeding/importing, since
+/// re-seeding a file that already has data would violate primary-key
+/// constraints on the fixed illustrative ids `seed_udra` uses.
+pub fn open_store_at(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch(schema_ddl())?;
+    Ok(conn)
+}
+
+/// Whether the store has no Subjects yet -- the signal callers use to
+/// decide whether to seed/import on startup (a freshly created file, or
+/// an in-memory store) versus leave already-persisted data alone.
+pub fn is_empty(conn: &Connection) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM subjects", [], |row| row.get(0))?;
+    Ok(count == 0)
 }
 
 const SOURCE_COLUMNS: &str = "id, name, kind, domain_tags, steward, citation, supersedes_source_id";
@@ -2846,5 +2875,40 @@ mod tests {
             "a derivation's own summary text should not be searchable -- only its source \
              Rules are, and none of them contain \"synthesized\""
         );
+    }
+
+    #[test]
+    fn is_empty_true_for_fresh_store_false_after_seeding() {
+        let conn = open_store().unwrap();
+        assert!(is_empty(&conn).unwrap());
+        seed_udra(&conn).unwrap();
+        assert!(!is_empty(&conn).unwrap());
+    }
+
+    #[test]
+    fn open_store_at_creates_file_and_persists_across_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty_knowledge_test_persist_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = open_store_at(&path).unwrap();
+            assert!(is_empty(&conn).unwrap());
+            seed_udra(&conn).unwrap();
+            assert!(!is_empty(&conn).unwrap());
+        }
+
+        // Reopen: schema DDL must be idempotent (no "table already
+        // exists" error), and the previously-seeded data must still be
+        // there -- this is the whole point of file-backed persistence.
+        {
+            let conn = open_store_at(&path).unwrap();
+            assert!(!is_empty(&conn).unwrap());
+            assert!(subject_by_id(&conn, "udra.DataProduct").unwrap().is_some());
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

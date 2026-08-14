@@ -1,8 +1,8 @@
 //! Rusty Knowledge — an MCP server (via `rmcp`, stdio transport) over the
 //! knowledge-model-v2 store (`Source`/`SourceAuthority`/`Subject`/`Rule`/
-//! `RuleRelation`/`SelectionGroup`/`RuleDerivation` -- see `store`'s module
-//! doc for the one remaining piece of the fuller seven-table design this
-//! doesn't implement).
+//! `RuleRelation`/`SelectionGroup`/`RuleDerivation` -- every table the
+//! fuller seven-table design specifies; see `store`'s module doc for the
+//! full account).
 //!
 //! `KNOWLEDGE_DB_PATH` set at startup opens a file-backed store instead of
 //! the default in-memory one (see `store::open_store_at`); either way,
@@ -1137,41 +1137,63 @@ impl KnowledgeServer {
     }
 }
 
+/// `KNOWLEDGE_DB_PATH` set -> file-backed store at that path (created if
+/// it doesn't exist; reopening an existing file is safe, since
+/// `open_store_at`'s schema DDL is idempotent). Unset -> in-memory,
+/// exactly the previous behavior.
+fn open_store() -> rusqlite::Result<Connection> {
+    match std::env::var("KNOWLEDGE_DB_PATH") {
+        Ok(path) => {
+            let conn = store::open_store_at(std::path::Path::new(&path))?;
+            eprintln!("Using file-backed store at {path:?}.");
+            Ok(conn)
+        }
+        Err(_) => store::open_store(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let conn = store::open_store()?;
+    let conn = open_store()?;
 
-    match std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
-        Ok(path) => {
-            match knowledge_mcp_import_v2::import_knowledge_mcp_db(
-                &conn,
-                std::path::Path::new(&path),
-            ) {
-                Ok(report) => {
-                    eprintln!(
-                        "Imported {path:?}: {} source(s), {} authority edge(s), {} subject(s), \
-                         {} rule(s), {} row(s) skipped.",
-                        report.sources_imported,
-                        report.source_authority_edges_imported,
-                        report.subjects_imported,
-                        report.rules_imported,
-                        report.rows_skipped,
-                    );
-                    for disclosure in &report.disclosures {
-                        eprintln!("  {disclosure}");
+    if store::is_empty(&conn)? {
+        match std::env::var("KNOWLEDGE_MCP_IMPORT_PATH") {
+            Ok(path) => {
+                match knowledge_mcp_import_v2::import_knowledge_mcp_db(
+                    &conn,
+                    std::path::Path::new(&path),
+                ) {
+                    Ok(report) => {
+                        eprintln!(
+                            "Imported {path:?}: {} source(s), {} authority edge(s), {} \
+                             subject(s), {} rule(s), {} row(s) skipped.",
+                            report.sources_imported,
+                            report.source_authority_edges_imported,
+                            report.subjects_imported,
+                            report.rules_imported,
+                            report.rows_skipped,
+                        );
+                        for disclosure in &report.disclosures {
+                            eprintln!("  {disclosure}");
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "Failed to import {path:?} ({err}); falling back to seeded UDRA data."
+                        );
+                        store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
                     }
                 }
-                Err(err) => {
-                    eprintln!(
-                        "Failed to import {path:?} ({err}); falling back to seeded UDRA data."
-                    );
-                    store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
-                }
+            }
+            Err(_) => {
+                store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
             }
         }
-        Err(_) => {
-            store::seed_udra(&conn).map_err(|err| anyhow::anyhow!(err))?;
-        }
+    } else {
+        eprintln!(
+            "Store already has data (file-backed persistence carried it over from a \
+             previous run); skipping seed/import."
+        );
     }
 
     eprintln!(
@@ -1598,5 +1620,39 @@ mod tests {
             limit: None,
         }));
         assert!(response.contains("Query is empty"));
+    }
+
+    #[test]
+    fn lookup_derived_summary_reports_seeded_derivation_as_non_authoritative() {
+        let server = test_server();
+        let response = server.lookup_derived_summary(Parameters(LookupDerivedSummaryParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataProduct".into(),
+        }));
+        assert!(response.contains("NON-AUTHORITATIVE"));
+        assert!(response.contains("Effective ownership & registration guidance"));
+        assert!(response.contains("rule.dm.001"));
+        assert!(response.contains("rule.army-udra.001"));
+        assert!(response.contains("rule.org.001"));
+    }
+
+    #[test]
+    fn lookup_derived_summary_no_derivations_says_so() {
+        let server = test_server();
+        let response = server.lookup_derived_summary(Parameters(LookupDerivedSummaryParams {
+            domain_tag: "udra".into(),
+            subject_ref: "DataContract".into(),
+        }));
+        assert!(response.contains("no recorded derived summaries"));
+    }
+
+    #[test]
+    fn lookup_derived_summary_unknown_subject_reports_not_found() {
+        let server = test_server();
+        let response = server.lookup_derived_summary(Parameters(LookupDerivedSummaryParams {
+            domain_tag: "udra".into(),
+            subject_ref: "NoSuchSubject".into(),
+        }));
+        assert!(response.contains("not found"));
     }
 }
