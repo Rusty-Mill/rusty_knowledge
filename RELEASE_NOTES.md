@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Vector/hybrid search for search_knowledge
-**2026-08-14**
+## PR #65 — Vector/hybrid search for search_knowledge
+**2026-08-14** · [#65](https://github.com/Rusty-Mill/rusty_knowledge/pull/65)
 
 - **Added:** `search_knowledge` now fuses lexical (FTS5 `bm25`, min-max
   normalized to `[0, 1]`) and vector (cosine similarity) signals in equal
