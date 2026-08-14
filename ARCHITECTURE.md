@@ -13,7 +13,7 @@ gate). This started as a vertical slice proving that model end-to-end with
 two MCP tools and is growing incrementally toward the previous model's full
 surface (tracked in
 [rusty_knowledge#55](https://github.com/Rusty-Mill/rusty_knowledge/issues/55)) —
-eight tools so far. See `src/store.rs`'s own module doc comment for the full
+13 tools so far. See `src/store.rs`'s own module doc comment for the full
 account of what forced this design and `src/main.rs`'s for the exact,
 currently-maintained tool list — it's kept current as tools land; this file
 summarizes it rather than duplicating it in detail.

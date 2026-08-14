@@ -5,6 +5,30 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #57 — Crosscut + validate_relationship tools ported (rusty_knowledge#55, part 2)
+**2026-08-14** · [#57](https://github.com/Rusty-Mill/rusty_knowledge/pull/57)
+
+- **Added:** `lookup_valid_relationships`, `crosscut_traceability`,
+  `crosscut_cross_domain`, `crosscut_valid_relationship_candidates`,
+  `validate_relationship` -- the remaining five "direct re-port, no
+  blocker" tools from #55. Tool surface goes from 8 to 13; only
+  `validate_element`, `validate_completeness` (blocked on model
+  capability), and `search_knowledge` (needs a fresh design decision)
+  remain.
+- New `store.rs` query functions: `valid_relationship_types`,
+  `traceability` (outgoing/incoming `traces_to` rules, `MUST`-only unless
+  `include_optional`), `cross_domain_relationships`,
+  `candidate_valid_relationships` (+ `ValidRelationshipCandidate`,
+  grouping relationship instances by `(from_type, to_type,
+  relationship_type)` with deterministic majority-cardinality tie-breaking
+  -- never auto-committed, always a suggestion for human review),
+  `validate_relationship`.
+- `seed_udra` gained a `data_mesh` domain and Subject plus two more rules
+  (a `traces_to` claim and a cross-domain `realizes` claim) -- needed to
+  make `crosscut_traceability`/`crosscut_cross_domain` demonstrable and
+  testable; previously seed data had zero of either.
+- README/ARCHITECTURE.md updated for the 13-tool surface.
+
 ## PR #56 — Six more tools ported onto the v2 model (rusty_knowledge#55, part 1)
 **2026-08-14** · [#56](https://github.com/Rusty-Mill/rusty_knowledge/pull/56)
 
