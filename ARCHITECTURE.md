@@ -44,15 +44,26 @@ exactly what does and doesn't translate, and the one inferred cross-domain
 fabricated).
 
 ## Boundaries
-No port/adapter abstraction exists — `main.rs`'s `KnowledgeServer` calls
-`store`'s functions directly, and `store.rs` has exactly one implementation
-(SQLite via `rusqlite`). Disclosed honestly rather than inventing an
-interface with a single implementer: a `Store` trait is worth introducing
-once a second backend actually needs one — none has, yet.
+`main.rs`'s `KnowledgeServer` depends on `store::Store`, a trait covering
+exactly the read-only query surface its 16 tools need (`resolve_subject`,
+`rules_for_subject`, `search_knowledge`, etc.) — `Arc<Mutex<dyn Store +
+Send>>`, not a concrete type. `store::SqliteStore` (a thin `Connection`
+newtype whose trait methods delegate to `store.rs`'s existing free
+functions) is the only implementation. Extracted because a caller
+explicitly asked for the abstraction, not because a second backend exists
+yet.
+
+Writes (`insert_*`) and bootstrap (`seed_udra`, `open_store`/
+`open_store_at`, `is_empty`) deliberately stay **outside** the trait: they
+run once at startup, before a `Store` is even constructed, operating on
+the raw `Connection` instead (see Data flow below). `knowledge_mcp_import_v2`
+also stays on the raw `Connection` rather than the trait, since one of its
+paths does a raw `dest.execute` that doesn't map onto a structured port at
+all.
 
 | Port | Adapter(s) | Notes |
 | ---- | ---------- | ----- |
-| *(none)* | `store.rs` — SQLite via `rusqlite`, in-memory or file-backed (`KNOWLEDGE_DB_PATH`) | single implementation; not behind a trait |
+| `store::Store` (read-only query surface `KnowledgeServer` needs) | `store::SqliteStore` — wraps a `rusqlite::Connection`, in-memory or file-backed (`KNOWLEDGE_DB_PATH`) | single implementation; writes/bootstrap stay on the raw `Connection`, outside the trait |
 
 There is no embedder boundary in this model -- the previous crate's
 `Embedder` trait (`rusty_embedder_core`, `NullEmbedder`/local/http backends)
@@ -148,6 +159,8 @@ Deliberately out of scope, not silently dropped:
   model, but deliberately lexical-only (FTS5, no vector component, no
   embedder pluggability); reintroducing a vector/hybrid layer is follow-up
   work for if a real case needs it, not assumed to happen automatically.
-- A `Store` trait / port-adapter abstraction for persistence — see
-  Boundaries above; introduce one when a second real implementation
-  actually needs it, not before.
+- A second `Store` implementation — the trait now exists (see Boundaries
+  above), but `SqliteStore` is still its only implementer; a real second
+  backend would be the trigger for anything further (e.g. reconsidering
+  which methods belong on the trait, or how bootstrap/writes should be
+  exposed to it), not assumed to happen automatically.
