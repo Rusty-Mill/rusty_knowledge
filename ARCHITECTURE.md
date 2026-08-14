@@ -168,16 +168,20 @@ deferred anymore.
 
 ## Non-goals
 Deliberately out of scope, not silently dropped:
-- A *live-verified* semantic embedder for `search_knowledge` —
-  `store::OllamaEmbedder` is a real, opt-in (`EMBEDDING_BACKEND=ollama`)
-  implementation calling a local (or otherwise self-hosted) Ollama
-  server's `/api/embed` endpoint, not a stub, but it has never been
-  exercised against a live server in this environment (no Ollama
-  installation is available here) — its tests cover request/response
-  shape against a local mock server only. A first live run against a real
-  Ollama instance is the only thing that actually confirms end-to-end
-  correctness; until then, treat it as implemented but unverified, not as
-  proven to work.
+- **Not** a non-goal anymore, but worth recording: `store::OllamaEmbedder`
+  has been live-verified against a real Ollama server (`all-minilm`,
+  installed and run in this development environment for exactly this
+  purpose) — a manual `search_knowledge` call through the actual MCP
+  binary returned real hybrid results labeled "Ollama local embedding --
+  a real trained semantic model", and
+  `ollama_embedder_live_semantic_similarity` (an `#[ignore]`d test in
+  `store.rs`, opt in with `OLLAMA_EMBEDDING_MODEL=all-minilm cargo test
+  --all-features -- --ignored ollama_embedder_live`) confirms a paraphrase
+  scores higher cosine similarity than an unrelated sentence — a property
+  `HashingEmbedder` cannot have. CI itself still doesn't exercise this
+  (no Ollama server runs there), so the ignored test is the repeatable way
+  to redo this verification, not a standing guarantee that every commit
+  re-proves it.
 - A second `Store` implementation — the trait now exists (see Boundaries
   above), but `SqliteStore` is still its only implementer; a real second
   backend would be the trigger for anything further (e.g. reconsidering

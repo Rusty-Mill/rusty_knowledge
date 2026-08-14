@@ -880,15 +880,16 @@ fn l2_normalize(vector: &mut [f32]) {
 /// locally, has no such requirement by default -- it's not a public
 /// service, so there's nothing to authenticate to.
 ///
-/// **Honesty note, not a hedge:** this has never been run against a
-/// live Ollama server in this codebase's own development or CI -- this
-/// environment has no Ollama installation to test against. The
-/// request/response *shape* is real and unit-tested against a local
-/// hand-rolled HTTP server (see the `tests` module), matching Ollama's
-/// documented `/api/embed` contract, but a first real run against an
-/// actual server is the only thing that actually confirms end-to-end
-/// correctness. Opt-in via `EMBEDDING_BACKEND=ollama` (see
-/// `active_embedder`) specifically so nothing changes for a caller who
+/// **Honesty note, not a hedge:** this *has* been run against a real,
+/// locally-installed Ollama server (`all-minilm`) during this crate's own
+/// development, both directly (`ollama_embedder_live_semantic_similarity`,
+/// an `#[ignore]`d test -- see the `tests` module) and end-to-end through
+/// the actual MCP binary's `search_knowledge` tool. That's real
+/// verification, not a permanent guarantee: CI doesn't run an Ollama
+/// server, so day-to-day test runs still only cover request/response
+/// *shape* against a local hand-rolled HTTP server. Opt-in via
+/// `EMBEDDING_BACKEND=ollama` (see `active_embedder`) specifically so
+/// nothing changes for a caller who
 /// doesn't set it -- `HashingEmbedder` remains the default, and a
 /// configuration or request failure falls back to it loudly (an
 /// `eprintln!`, never a silent substitution).
@@ -3586,6 +3587,37 @@ mod tests {
         let vector = embedder.embed("hello world");
         handle.join().unwrap();
         assert!(vector.is_empty());
+    }
+
+    /// The only test in this module that talks to a real Ollama server
+    /// instead of a mock -- everything above this confirms
+    /// `OllamaEmbedder` builds the right request and parses the right
+    /// response shape; this confirms the *content* is actually semantic,
+    /// which is the entire reason this type exists over `HashingEmbedder`.
+    /// Ignored by default since CI and most dev environments don't have
+    /// Ollama running -- opt in with:
+    /// `OLLAMA_EMBEDDING_MODEL=all-minilm cargo test --all-features -- --ignored ollama_embedder_live`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live Ollama server; see this test's doc comment"]
+    async fn ollama_embedder_live_semantic_similarity() {
+        let embedder = OllamaEmbedder::from_env()
+            .expect("OLLAMA_EMBEDDING_MODEL (and optionally OLLAMA_API_BASE_URL) must be set");
+        let cat = embedder.embed("The cat sat on the mat.");
+        let feline = embedder.embed("A feline rested on the rug.");
+        let earnings = embedder.embed("Quarterly earnings exceeded analyst expectations.");
+        assert!(
+            !cat.is_empty() && !feline.is_empty() && !earnings.is_empty(),
+            "embed() returned an empty vector -- the live request failed; check stderr"
+        );
+        let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let related = cosine(&cat, &feline);
+        let unrelated = cosine(&cat, &earnings);
+        assert!(
+            related > unrelated,
+            "expected the paraphrase to score more similar than the unrelated sentence: \
+             related={related} unrelated={unrelated} -- if this fails, the live backend isn't \
+             actually returning semantic embeddings"
+        );
     }
 
     #[test]
