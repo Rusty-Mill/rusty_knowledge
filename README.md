@@ -76,9 +76,10 @@ implemented.
   (`store::Embedder`) signals in equal weight, kept in sync incrementally at
   write time. The vector half defaults to `store::HashingEmbedder`, a local
   "hashing trick" bag-of-words technique — zero-dependency, zero-network,
-  not a trained semantic model — or, opt-in via `EMBEDDING_BACKEND=onyx`,
-  `store::OnyxEmbedder`, a real semantic model called over Onyx's cloud
-  embeddings API. Always declares its retrieval mode honestly via
+  not a trained semantic model — or, opt-in via `EMBEDDING_BACKEND=ollama`,
+  `store::OllamaEmbedder`, a real semantic model called over a local (or
+  otherwise self-hosted) Ollama server's `/api/embed` endpoint. Always
+  declares its retrieval mode honestly via
   `store::retrieval_mode_description`, reflecting whichever `Embedder` is
   actually active.
 - `lookup_derived_summary` — any `RuleDerivation` rollup summaries recorded
@@ -106,9 +107,9 @@ No Cargo features to opt into — the default build is everything there is.
 | --- | --- |
 | `KNOWLEDGE_DB_PATH` | Path to a SQLite file for a persistent, file-backed store, created if it doesn't exist. Unset (the default) uses an in-memory store that starts fresh every run. Seed/import only runs against an *empty* store — on a second run against the same file, previously-persisted data is left alone and seed/import is skipped. |
 | `KNOWLEDGE_MCP_IMPORT_PATH` | Path to a real `knowledge-mcp` SQLite file. Imports it via `knowledge_mcp_import_v2` instead of the small hand-seeded illustrative UDRA dataset (`store::seed_udra`) that's used otherwise. The two aren't run together — the reference data's real `udra` domain and the hand-seeded one use overlapping ids. See `knowledge_mcp_import_v2`'s module doc for exactly what does and doesn't translate, and the one inferred `SourceAuthority` edge it adds (disclosed, not silent). |
-| `EMBEDDING_BACKEND` | `onyx` opts `search_knowledge`'s vector component into `store::OnyxEmbedder` (a real semantic model, called via Onyx's cloud embeddings API). Unset (the default), or any other value, uses `store::HashingEmbedder` (syntactic, zero-network). A misconfigured `onyx` backend (see below) fails loudly and falls back to `HashingEmbedder` rather than silently doing nothing. |
-| `ONYX_API_KEY` / `ONYX_EMBEDDING_MODEL` | Required when `EMBEDDING_BACKEND=onyx`: the bearer token and model name for Onyx's embeddings endpoint. `OnyxEmbedder::from_env` errors clearly if either is missing. |
-| `ONYX_API_BASE_URL` | Optional, only relevant with `EMBEDDING_BACKEND=onyx`. Defaults to `https://ai.onyx.dev`. |
+| `EMBEDDING_BACKEND` | `ollama` opts `search_knowledge`'s vector component into `store::OllamaEmbedder` (a real semantic model, called via a local or self-hosted Ollama server's `/api/embed` endpoint). Unset (the default), or any other value, uses `store::HashingEmbedder` (syntactic, zero-network). A misconfigured `ollama` backend (see below) fails loudly and falls back to `HashingEmbedder` rather than silently doing nothing. |
+| `OLLAMA_EMBEDDING_MODEL` | Required when `EMBEDDING_BACKEND=ollama`: the model name to request (must already be pulled on the target Ollama server — Ollama has no documented default). `OllamaEmbedder::from_env` errors clearly if it's missing. No API key is needed — a local Ollama server has nothing to authenticate to by default. |
+| `OLLAMA_API_BASE_URL` | Optional, only relevant with `EMBEDDING_BACKEND=ollama`. Defaults to `http://localhost:11434`, Ollama's own default bind address. |
 
 Unset, the server starts in-memory with the hand-seeded illustrative UDRA
 dataset, fresh every run.
