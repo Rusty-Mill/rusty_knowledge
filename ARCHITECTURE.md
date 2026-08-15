@@ -166,6 +166,21 @@ The fuller seven-table design this model was built from (`Source`,
 `RuleDerivation`) is now fully implemented -- nothing from that design is
 deferred anymore.
 
+**Superseded rules are hidden by default** (rusty_knowledge#70). Every
+rule-returning query that answers "what's true today" (`rules_for_subject`,
+`statement_rules_for_subject`, `outgoing_relationships`,
+`valid_relationship_types`, `traceability`, `candidate_valid_relationships`,
+and `search_knowledge`'s results) excludes a rule once another rule's
+`supersedes_rule_id` points at it -- via a shared `NOT_SUPERSEDED_SQL`
+predicate in `store.rs`. This is a hide, not a delete: the superseded row
+is never removed or rewritten (same append-only audit trail
+`insert_rule`'s `RuleRelation`-staling already relied on), and stays
+reachable directly via `rule_by_id` -- e.g. as a `RuleDerivation` source,
+or for a caller who explicitly wants history. `Source.supersedes_source_id`
+and `Subject.supersedes_subject_id` remain inert metadata with no cascade
+of their own; extending this behavior to them is a separate decision, not
+assumed to follow automatically.
+
 ## Non-goals
 Deliberately out of scope, not silently dropped:
 - **Not** a non-goal anymore, but worth recording: `store::OllamaEmbedder`

@@ -1210,18 +1210,52 @@ pub fn rule_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<Rule>>
     .optional()
 }
 
-/// Every rule about `subject_id` -- either as its primary subject or as
-/// the target of a relationship claim (`related_subject_id`) -- alongside
-/// the `Source` that issued it. Deliberately not scoped to any one
-/// authority chain: a Subject can be the target of claims from Sources
-/// anywhere in the DAG, and a caller needs the full picture (what the
-/// standard says, what each layer under it adds) to make sense of it.
+/// A rule id that appears as some other rule's `supersedes_rule_id` is no
+/// longer current -- excluded, by default, from every query below that
+/// answers "what's true today" (`rules_for_subject`,
+/// `statement_rules_for_subject`, `outgoing_relationships`,
+/// `valid_relationship_types`, `traceability`,
+/// `candidate_valid_relationships`, and `search_knowledge`'s results).
+/// The superseded row itself is never deleted or rewritten -- still
+/// reachable directly via `rule_by_id`, still a legitimate
+/// `RuleDerivation` source -- it's just not surfaced as live alongside its
+/// replacement. See rusty_knowledge#70 for the full rationale; this
+/// matches `insert_rule`'s existing "flip stale `RuleRelation`s, never
+/// delete" behavior rather than introducing a second supersession model.
+const NOT_SUPERSEDED_SQL: &str =
+    "rules.id NOT IN (SELECT supersedes_rule_id FROM rules WHERE supersedes_rule_id IS NOT NULL)";
+
+/// Whether some other rule's `supersedes_rule_id` points at `rule_id`.
+/// Used where a caller already has a `Rule` in hand (e.g.
+/// `search_knowledge`, which resolves rules one at a time via
+/// `rule_by_id`) rather than filtering inside a `rules`-table query --
+/// see `NOT_SUPERSEDED_SQL` for the query-level equivalent.
+fn is_rule_superseded(conn: &Connection, rule_id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM rules WHERE supersedes_rule_id = ?1",
+        params![rule_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// Every *current* rule about `subject_id` -- either as its primary
+/// subject or as the target of a relationship claim
+/// (`related_subject_id`) -- alongside the `Source` that issued it.
+/// Deliberately not scoped to any one authority chain: a Subject can be
+/// the target of claims from Sources anywhere in the DAG, and a caller
+/// needs the full picture (what the standard says, what each layer under
+/// it adds) to make sense of it. Superseded rules are excluded by
+/// default -- see `NOT_SUPERSEDED_SQL`.
 pub fn rules_for_subject(
     conn: &Connection,
     subject_id: &str,
 ) -> rusqlite::Result<Vec<(Rule, Source)>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {cols} FROM rules WHERE subject_id = ?1 OR related_subject_id = ?1 ORDER BY id",
+        "SELECT {cols} FROM rules \
+         WHERE (subject_id = ?1 OR related_subject_id = ?1) AND {NOT_SUPERSEDED_SQL} \
+         ORDER BY id",
         cols = qualified_rule_columns()
     ))?;
     let rules: Vec<Rule> = stmt
@@ -1482,7 +1516,7 @@ pub fn statement_rules_for_subject(
             let mut stmt = conn.prepare(&format!(
                 "SELECT {cols} FROM rules \
                  WHERE subject_id = ?1 AND related_subject_id IS NULL AND binding_strength = ?2 \
-                 ORDER BY id"
+                 AND {NOT_SUPERSEDED_SQL} ORDER BY id"
             ))?;
             stmt.query_map(params![subject_id, bs.as_str()], rule_from_row)?
                 .collect::<rusqlite::Result<_>>()?
@@ -1490,7 +1524,8 @@ pub fn statement_rules_for_subject(
         None => {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {cols} FROM rules \
-                 WHERE subject_id = ?1 AND related_subject_id IS NULL ORDER BY id"
+                 WHERE subject_id = ?1 AND related_subject_id IS NULL AND {NOT_SUPERSEDED_SQL} \
+                 ORDER BY id"
             ))?;
             stmt.query_map(params![subject_id], rule_from_row)?
                 .collect::<rusqlite::Result<_>>()?
@@ -1512,7 +1547,7 @@ pub fn outgoing_relationships(
             let mut stmt = conn.prepare(&format!(
                 "SELECT {cols} FROM rules \
                  WHERE subject_id = ?1 AND related_subject_id IS NOT NULL \
-                 AND relationship_type = ?2 ORDER BY id"
+                 AND relationship_type = ?2 AND {NOT_SUPERSEDED_SQL} ORDER BY id"
             ))?;
             stmt.query_map(params![subject_id, rel_type], rule_from_row)?
                 .collect::<rusqlite::Result<_>>()?
@@ -1520,7 +1555,8 @@ pub fn outgoing_relationships(
         None => {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {cols} FROM rules \
-                 WHERE subject_id = ?1 AND related_subject_id IS NOT NULL ORDER BY id"
+                 WHERE subject_id = ?1 AND related_subject_id IS NOT NULL \
+                 AND {NOT_SUPERSEDED_SQL} ORDER BY id"
             ))?;
             stmt.query_map(params![subject_id], rule_from_row)?
                 .collect::<rusqlite::Result<_>>()?
@@ -1547,6 +1583,7 @@ pub fn valid_relationship_types(
          WHERE rules.related_subject_id IS NOT NULL \
            AND sa.domain_tag = ?1 AND sa.subject_type = ?2 \
            AND sb.domain_tag = ?1 AND sb.subject_type = ?3 \
+           AND {NOT_SUPERSEDED_SQL} \
          ORDER BY rules.id"
     ))?;
     let rules: Vec<Rule> = stmt
@@ -1576,7 +1613,7 @@ pub fn traceability(
     let mut outgoing_stmt = conn.prepare(&format!(
         "SELECT {cols} FROM rules \
          WHERE rules.subject_id = ?1 AND rules.relationship_type = 'traces_to' \
-         {strength_clause} ORDER BY rules.id"
+         {strength_clause} AND {NOT_SUPERSEDED_SQL} ORDER BY rules.id"
     ))?;
     let outgoing: Vec<Rule> = outgoing_stmt
         .query_map(params![subject_id], rule_from_row)?
@@ -1585,7 +1622,7 @@ pub fn traceability(
     let mut incoming_stmt = conn.prepare(&format!(
         "SELECT {cols} FROM rules \
          WHERE rules.related_subject_id = ?1 AND rules.relationship_type = 'traces_to' \
-         {strength_clause} ORDER BY rules.id"
+         {strength_clause} AND {NOT_SUPERSEDED_SQL} ORDER BY rules.id"
     ))?;
     let incoming: Vec<Rule> = incoming_stmt
         .query_map(params![subject_id], rule_from_row)?
@@ -1656,6 +1693,7 @@ pub fn candidate_valid_relationships(
          JOIN subjects sb ON sb.id = rules.related_subject_id \
          WHERE rules.related_subject_id IS NOT NULL \
            AND sa.domain_tag = ?1 AND sb.domain_tag = ?1 \
+           AND {NOT_SUPERSEDED_SQL} \
          ORDER BY rules.id"
     ))?;
     let rules: Vec<Rule> = stmt
@@ -2056,6 +2094,13 @@ pub fn search_knowledge(
                 panic!("stored search_index ref_type {other:?} is not \"rule\" or \"subject\"")
             }
         };
+        if ref_type == SearchRefType::Rule && is_rule_superseded(conn, &ref_id)? {
+            // Indexed when it was still current (index_for_search runs at
+            // insert time and is never retroactively cleaned up), but no
+            // longer live -- same "hide by default" rule as every other
+            // rule-returning query. See NOT_SUPERSEDED_SQL.
+            continue;
+        }
         let resolved_domain_tag = match ref_type {
             SearchRefType::Rule => {
                 let rule =
@@ -2886,6 +2931,125 @@ mod tests {
         assert!(source_ids.contains("src.data-mesh-principles"));
         assert!(source_ids.contains("src.army-udra"));
         assert!(source_ids.contains("src.org-udra-impl"));
+    }
+
+    /// `rusty_knowledge#70`: a rule that's been superseded should
+    /// disappear from every "what's true today" query, not sit alongside
+    /// its replacement forever.
+    fn superseding_rule(id: &str, supersedes: &str) -> Rule {
+        Rule {
+            id: id.into(),
+            source_id: "src.data-mesh-principles".into(),
+            subject_id: "udra.DataProduct".into(),
+            related_subject_id: None,
+            relationship_type: None,
+            cardinality: None,
+            statement: "A data product must have a clearly defined, accountable owner and steward."
+                .into(),
+            machine_check: None,
+            binding_strength: BindingStrength::Must,
+            supersedes_rule_id: Some(supersedes.into()),
+        }
+    }
+
+    #[test]
+    fn rules_for_subject_hides_a_superseded_rule_by_default() {
+        let conn = seeded();
+        let before = rules_for_subject(&conn, "udra.DataProduct").unwrap();
+        assert!(before.iter().any(|(r, _)| r.id == "rule.dm.001"));
+
+        insert_rule(&conn, &superseding_rule("rule.dm.001-v2", "rule.dm.001")).unwrap();
+
+        let after = rules_for_subject(&conn, "udra.DataProduct").unwrap();
+        assert!(
+            !after.iter().any(|(r, _)| r.id == "rule.dm.001"),
+            "superseded rule should be hidden by default: {after:?}"
+        );
+        assert!(after.iter().any(|(r, _)| r.id == "rule.dm.001-v2"));
+
+        // Never deleted or rewritten -- still reachable directly.
+        assert!(rule_by_id(&conn, "rule.dm.001").unwrap().is_some());
+    }
+
+    #[test]
+    fn statement_rules_for_subject_hides_a_superseded_rule_by_default() {
+        let conn = seeded();
+        insert_rule(&conn, &superseding_rule("rule.dm.001-v2", "rule.dm.001")).unwrap();
+
+        let rules = statement_rules_for_subject(&conn, "udra.DataProduct", None).unwrap();
+        assert!(!rules.iter().any(|(r, _)| r.id == "rule.dm.001"));
+        assert!(rules.iter().any(|(r, _)| r.id == "rule.dm.001-v2"));
+    }
+
+    #[test]
+    fn search_knowledge_excludes_a_superseded_rule_by_default() {
+        let conn = seeded();
+        let before =
+            search_knowledge(&conn, "clearly defined accountable owner", None, 10).unwrap();
+        assert!(before.iter().any(|r| r.ref_id == "rule.dm.001"));
+
+        insert_rule(&conn, &superseding_rule("rule.dm.001-v2", "rule.dm.001")).unwrap();
+
+        let after = search_knowledge(&conn, "clearly defined accountable owner", None, 10).unwrap();
+        assert!(
+            !after.iter().any(|r| r.ref_id == "rule.dm.001"),
+            "superseded rule should not appear in search results: {after:?}"
+        );
+        assert!(after.iter().any(|r| r.ref_id == "rule.dm.001-v2"));
+    }
+
+    #[test]
+    fn outgoing_relationships_hides_a_superseded_relationship_rule_by_default() {
+        let conn = seeded();
+        insert_rule(
+            &conn,
+            &Rule {
+                id: "rule.dm.002-v2".into(),
+                source_id: "src.data-mesh-principles".into(),
+                subject_id: "udra.DataProduct".into(),
+                related_subject_id: Some("udra.DataContract".into()),
+                relationship_type: Some("exposes".into()),
+                cardinality: Some("1..*".into()),
+                statement: "A data product exposes one or more versioned data contracts.".into(),
+                machine_check: None,
+                binding_strength: BindingStrength::Must,
+                supersedes_rule_id: Some("rule.dm.002".into()),
+            },
+        )
+        .unwrap();
+
+        let relationships = outgoing_relationships(&conn, "udra.DataProduct", None).unwrap();
+        assert!(!relationships.iter().any(|(r, _)| r.id == "rule.dm.002"));
+        assert!(relationships.iter().any(|(r, _)| r.id == "rule.dm.002-v2"));
+    }
+
+    #[test]
+    fn traceability_and_valid_relationship_types_hide_a_superseded_rule_by_default() {
+        let conn = seeded();
+        insert_rule(
+            &conn,
+            &Rule {
+                id: "rule.org.003-v2".into(),
+                source_id: "src.org-udra-impl".into(),
+                subject_id: "udra.DataContract".into(),
+                related_subject_id: Some("udra.DataProduct".into()),
+                relationship_type: Some("traces_to".into()),
+                cardinality: Some("1".into()),
+                statement: "A data contract must trace to exactly one data product.".into(),
+                machine_check: None,
+                binding_strength: BindingStrength::Must,
+                supersedes_rule_id: Some("rule.org.003".into()),
+            },
+        )
+        .unwrap();
+
+        let (outgoing, _incoming) = traceability(&conn, "udra.DataContract", false).unwrap();
+        assert!(!outgoing.iter().any(|(r, _)| r.id == "rule.org.003"));
+        assert!(outgoing.iter().any(|(r, _)| r.id == "rule.org.003-v2"));
+
+        let valid_types = valid_relationship_types(&conn, "udra", "concept", "concept").unwrap();
+        assert!(!valid_types.iter().any(|(r, _)| r.id == "rule.org.003"));
+        assert!(valid_types.iter().any(|(r, _)| r.id == "rule.org.003-v2"));
     }
 
     #[test]
