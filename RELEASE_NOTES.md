@@ -5,6 +5,34 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
+## PR #71 — Hide superseded rules from lookup results by default
+**2026-08-14** · [#71](https://github.com/Rusty-Mill/rusty_knowledge/pull/71)
+
+- **Fixed:** [#70](https://github.com/Rusty-Mill/rusty_knowledge/issues/70) --
+  `Rule.supersedes_rule_id` existed and cascaded to stale
+  `RuleRelation`s, but the superseded rule itself kept showing up
+  side-by-side with its replacement in `lookup_subject`, `lookup_rules`,
+  `lookup_relationships`, `lookup_valid_relationships`,
+  `crosscut_traceability`, `crosscut_valid_relationship_candidates`, and
+  `search_knowledge` -- nothing distinguished which statement was
+  current. Decision (explicit sign-off, not a guess): hide by default.
+- New `store::NOT_SUPERSEDED_SQL`, a shared predicate applied to every
+  rule-returning query that means "what's true today":
+  `rules_for_subject`, `statement_rules_for_subject`,
+  `outgoing_relationships`, `valid_relationship_types`, `traceability`,
+  `candidate_valid_relationships`, and (via a new
+  `store::is_rule_superseded` helper, since it resolves rules one at a
+  time rather than querying `rules` directly) `search_knowledge`.
+- **Not a delete:** the superseded row is never removed or rewritten --
+  same append-only audit trail `insert_rule`'s existing
+  `RuleRelation`-staling already relies on. `rule_by_id` still resolves
+  it directly (e.g. for a `RuleDerivation` source), it's just no longer
+  surfaced as live alongside its replacement.
+- Out of scope for this PR, left as inert metadata: `Source
+  .supersedes_source_id` and `Subject.supersedes_subject_id` get no
+  cascade of their own -- the issue explicitly scoped this to `Rule`
+  first, since that's the one update path that actually gets used today.
+
 ## PR #69 — Live-verify OllamaEmbedder against a real Ollama server
 **2026-08-14** · [#69](https://github.com/Rusty-Mill/rusty_knowledge/pull/69)
 
