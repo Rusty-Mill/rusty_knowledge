@@ -5,8 +5,8 @@ against `main`, reverse chronological, each linking to its PR.
 
 ---
 
-## PR TBD — Hide superseded rules from lookup results by default
-**2026-08-14** · PR TBD
+## PR #71 — Hide superseded rules from lookup results by default
+**2026-08-14** · [#71](https://github.com/Rusty-Mill/rusty_knowledge/pull/71)
 
 - **Fixed:** [#70](https://github.com/Rusty-Mill/rusty_knowledge/issues/70) --
   `Rule.supersedes_rule_id` existed and cascaded to stale
